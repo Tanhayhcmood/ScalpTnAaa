@@ -10,8 +10,9 @@ services:
     # Without this filter, every Python commit (live_trading/, telegram_panel/)
     # triggers an unnecessary Docker redeploy that restarts Wine/MT5 from
     # scratch — the primary cause of the repeated "Failed deploy" status.
-    paths:
-      - mtapi-bridge/**
+    buildFilter:
+      paths:
+        - mtapi-bridge/**
     envVars:
       - key: RENDER_EXTERNAL_URL
         value: "https://goldscalper-mtapi.onrender.com"
