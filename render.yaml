@@ -1,9 +1,10 @@
 services:
   # ─── mt5rest Docker bridge ─────────────────────────────────────────────────
   - type: web
-    name: ger-mtapi
+    name: goldscalper-mtapi
     repo: https://github.com/Tanhayhcmood/ScalpTnAaa
     region: oregon
+    autoDeployTrigger: commit
     runtime: docker
     dockerfilePath: ./mtapi-bridge/Dockerfile
     # The Dockerfile copies files from mtapi-bridge/; keep the Docker build
@@ -20,7 +21,7 @@ services:
         - mtapi-bridge/**
     envVars:
       - key: RENDER_EXTERNAL_URL
-        value: "https://ger-mtapi.onrender.com"
+        value: "https://goldscalper-mtapi-uuoc.onrender.com"
       - key: MT5_HOST
         value: "AMarkets-Demo"
       - key: MT5_PORT
@@ -45,6 +46,7 @@ services:
   - type: web
     name: goper-v4-robot
     region: oregon
+    autoDeployTrigger: commit
     runtime: python
     plan: free
     healthCheckPath: /health
@@ -52,9 +54,9 @@ services:
     startCommand: python live_trading/server.py
     envVars:
       - key: RENDER_EXTERNAL_URL
-        value: "https://goper-v4-robot.onrender.com"
+        value: "https://goldscalper-v4-robot-usta.onrender.com"
       - key: MTAPI_URL
-        value: "https://ger-mtapi.onrender.com"
+        value: "https://goldscalper-mtapi-uuoc.onrender.com"
       - key: MT5_HOST
         value: "AMarkets-Demo"
       - key: MT5_PORT
@@ -167,8 +169,9 @@ services:
 
   # ─── Telegram control panel ────────────────────────────────────────────────
   - type: web
-    name: anel
+    name: goldscalper-v4-panel
     region: oregon
+    autoDeployTrigger: commit
     runtime: python
     plan: free
     healthCheckPath: /health
@@ -176,7 +179,7 @@ services:
     startCommand: python telegram_panel/server.py
     envVars:
       - key: RENDER_EXTERNAL_URL
-        value: "https://anel.onrender.com"
+        value: "https://goldscalper-v4-panel-kzru.onrender.com"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_OWNER_ID
@@ -205,7 +208,7 @@ services:
         value: "/tmp/robot_state.json"
       # FIX #1: ROBOT_BASE_URL and ROBOT_COMMAND_TOKEN enable HTTP fallback.
       - key: ROBOT_BASE_URL
-        value: "https://goper-v4-robot.onrender.com"
+        value: "https://goldscalper-v4-robot-usta.onrender.com"
       - key: ROBOT_COMMAND_TOKEN
         sync: false
       - key: REDIS_URL
