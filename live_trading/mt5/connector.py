@@ -25,6 +25,7 @@ mt5rest endpoints used:
 
 import asyncio
 import math
+import os
 import time as _time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -205,6 +206,7 @@ async def connect(*args, **kwargs) -> bool:
     host     = MT5_HOST
     user     = MT5_USER.strip() if MT5_USER else ""
     password = MT5_PASSWORD.strip() if MT5_PASSWORD else ""
+    session_token = os.environ.get("MT5_TOKEN", "").strip()
 
     if not base:
         log.error(
@@ -212,25 +214,30 @@ async def connect(*args, **kwargs) -> bool:
             "Deploy the mt5rest Docker service and set MTAPI_URL to its URL."
         )
         return False
-    if not user or not password:
-        log.error("MT5_USER and MT5_PASSWORD must be set.")
+    if not session_token and (not user or not password):
+        log.error("MT5_USER and MT5_PASSWORD must be set unless MT5_TOKEN is configured.")
         return False
 
     _base_url = base
     sess = _get_session()
 
     try:
-        log.info(f"Connecting to MT5 via mt5rest at {base} ...")
+        endpoint = "ConnectByToken" if session_token else "ConnectEx"
+        request_params = (
+            {"id": session_token, "connectTimeoutSeconds": 60, "errorReplyStatusCode": 201}
+            if session_token else _connect_params(user, password, host)
+        )
+        log.info(f"Connecting to MT5 via mt5rest at {base}/{endpoint} ...")
         async with sess.get(
-            f"{base}/ConnectEx",
-            params=_connect_params(user, password, host),
+            f"{base}/{endpoint}",
+            params=request_params,
             timeout=aiohttp.ClientTimeout(total=SYNC_TIMEOUT),
         ) as resp:
             raw = await resp.text()
-            log.debug(f"ConnectEx response ({resp.status}): [response received]")
+            log.debug(f"{endpoint} response ({resp.status}): [response received]")
 
-            if resp.status != 200:
-                log.error(f"ConnectEx failed (status={resp.status}): {raw[:300]}")
+            if resp.status not in (200, 201):
+                log.error(f"{endpoint} failed (status={resp.status}): {raw[:300]}")
                 _connected = False
                 return False
 
