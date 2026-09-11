@@ -30,6 +30,8 @@ services:
         sync: false
       - key: MT5_PASSWORD
         sync: false
+      - key: UserKey
+        sync: false
 
   # ─── Redis — cross-service IPC (robot ↔ Telegram panel) ───────────────────
   # FIX: must be in the same region as the robot/panel web services (oregon).
