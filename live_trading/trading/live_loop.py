@@ -278,7 +278,7 @@ class GoldScalperLive:
 
         connected = await connect_with_retry(max_attempts=12, retry_delay=30.0)
         if not connected:
-            log.error("Could not connect to MT5 via mt5rest bridge after 5 attempts. "
+            log.error("Could not connect to MT5 via mt5rest bridge after all retry attempts. "
                       "Check MTAPI_URL, MT5_USER, and MT5_PASSWORD.")
             self._write_state("DISCONNECTED",
                               extra={"error": "mt5rest connection failed after retries"})

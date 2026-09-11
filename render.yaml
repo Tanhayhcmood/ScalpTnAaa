@@ -2,7 +2,7 @@ services:
   # ─── mt5rest Docker bridge ─────────────────────────────────────────────────
   - type: web
     name: ger-mtapi
-    repo: https://github.com/hesamnfwe324/ScalpTnAaa
+    repo: https://github.com/Tanhayhcmood/ScalpTnAaa
     region: oregon
     runtime: docker
     dockerfilePath: ./mtapi-bridge/Dockerfile

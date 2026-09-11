@@ -59,6 +59,8 @@ _CONNECT_GRACE_PERIOD: float = 150.0  # seconds — ROOT-CAUSE FIX: Wine cold-st
 # period expired mid-startup, causing ensure_connected() to detect a false
 # DISCONNECTED and trigger an immediate reconnect that aborted the in-progress
 # ConnectEx — producing the continuous 'Connection Lost' loop in the panel.
+_CONNECT_READY_POLL_INITIAL_S: float = 2.0
+_CONNECT_READY_POLL_MAX_S: float = 15.0
 
 # Prevents concurrent reconnect attempts when multiple coroutines detect a
 # stale connection at the same time (e.g. fetch_candles + ensure_connected
@@ -193,6 +195,63 @@ def _get_session() -> aiohttp.ClientSession:
     return _session
 
 
+def _connection_status_is_alive(data: object) -> bool:
+    """Return whether a ConnectionStatus response confirms a live broker socket."""
+    if not isinstance(data, dict):
+        return False
+    value = data.get("isConnected", data.get("connected"))
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "connected"}
+    return bool(value)
+
+
+async def _wait_for_broker_ready(
+    base_url: str,
+    conn_id: str,
+    *,
+    timeout_s: float = _CONNECT_GRACE_PERIOD,
+) -> bool:
+    """Wait until a newly-created MT5 session is actually broker-ready.
+
+    mt5rest can return a UUID before Wine/MT5 has finished opening the broker
+    socket.  Treating that UUID as connected makes the first AccountSummary or
+    PriceHistoryV2 call fail, which invalidates the session and starts a
+    reconnect storm.  Polling the same session until ConnectionStatus confirms
+    it is ready keeps the UUID stable during cold starts.
+    """
+    deadline = _time.monotonic() + timeout_s
+    delay = _CONNECT_READY_POLL_INITIAL_S
+    last_status = ""
+    while True:
+        try:
+            sess = _get_session()
+            async with sess.get(
+                f"{base_url}/ConnectionStatus",
+                params={"id": conn_id},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if _connection_status_is_alive(data):
+                    return True
+                last_status = (
+                    str(data)[:180]
+                    if resp.status < 500
+                    else f"HTTP {resp.status}"
+                )
+        except Exception as exc:
+            last_status = str(exc)[:180]
+
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            log.error(
+                "MT5 session was created but broker was not ready within "
+                f"{timeout_s:.0f}s (last status: {last_status})"
+            )
+            return False
+        await asyncio.sleep(min(delay, remaining))
+        delay = min(delay * 1.5, _CONNECT_READY_POLL_MAX_S)
+
+
 # ── Connection lifecycle ──────────────────────────────────────────────────────
 
 async def connect(*args, **kwargs) -> bool:
@@ -218,6 +277,8 @@ async def connect(*args, **kwargs) -> bool:
         log.error("MT5_USER and MT5_PASSWORD must be set unless MT5_TOKEN is configured.")
         return False
 
+    previous_conn_id = _conn_id
+    previous_connected = _connected
     _base_url = base
     sess = _get_session()
 
@@ -248,10 +309,42 @@ async def connect(*args, **kwargs) -> bool:
                 _connected = False
                 return False
 
+            # Do not publish the candidate globally until the broker socket is
+            # genuinely ready.  ConnectEx may return before Wine/MT5 finishes
+            # its broker login, and publishing the UUID here causes the first
+            # AccountSummary call to invalidate a perfectly usable session.
+            if not await _wait_for_broker_ready(base, conn_id):
+                try:
+                    async with sess.get(
+                        f"{base}/Disconnect",
+                        params={"id": conn_id},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ):
+                        pass
+                except Exception:
+                    pass
+                _connected = previous_connected
+                _conn_id = previous_conn_id
+                return False
+
             _conn_id   = conn_id
             _connected = True
             _last_connect_time = _time.monotonic()
             log.info(f"MT5 connected – broker: {host}  user: {user}  conn_id: {conn_id}")
+
+            # A proactive refresh replaces an old session only after the new
+            # one is ready, avoiding a gap in the trading loop.  Best-effort
+            # cleanup prevents stale sessions accumulating in the bridge.
+            if previous_conn_id and previous_conn_id != conn_id:
+                try:
+                    async with sess.get(
+                        f"{base}/Disconnect",
+                        params={"id": previous_conn_id},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ):
+                        pass
+                except Exception as exc:
+                    log.debug(f"Previous MT5 session cleanup skipped: {exc}")
             return True
 
     except Exception as exc:
