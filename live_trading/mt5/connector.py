@@ -94,6 +94,11 @@ def _connect_params(user: str, password: str, host: str) -> dict[str, object]:
         "password": password,
         "server": host,
         "connectTimeoutSeconds": 60,
+        # Never allow a broker-login error to come back as HTTP 201.  The
+        # client treats 200/201 as a successful connection response; returning
+        # an error payload with 201 makes that JSON object become conn_id and
+        # starts a reconnect/scan loop with a session that does not exist.
+        "errorReplyStatusCode": 400,
         # The panel's trade history is backed by the same MT5 session. Ask
         # mt5rest to download it during ConnectEx so closed trades are
         # available immediately after reconnects.
@@ -285,7 +290,7 @@ async def connect(*args, **kwargs) -> bool:
     try:
         endpoint = "ConnectByToken" if session_token else "ConnectEx"
         request_params = (
-            {"id": session_token, "connectTimeoutSeconds": 60, "errorReplyStatusCode": 201}
+            {"id": session_token, "connectTimeoutSeconds": 60, "errorReplyStatusCode": 400}
             if session_token else _connect_params(user, password, host)
         )
         log.info(f"Connecting to MT5 via mt5rest at {base}/{endpoint} ...")

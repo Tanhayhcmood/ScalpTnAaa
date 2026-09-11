@@ -8,6 +8,7 @@ def test_connect_ex_boolean_flags_are_query_string_values():
 
     assert params["downloadOrderHistory"] == "true"
     assert params["reconnectOnSymbolUpdate"] == "true"
+    assert params["errorReplyStatusCode"] == 400
     assert all(not isinstance(params[name], bool) for name in (
         "downloadOrderHistory",
         "reconnectOnSymbolUpdate",
