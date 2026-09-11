@@ -12,8 +12,6 @@ Required env vars:
     MT5_PASSWORD  – MT5 account password
 
 mt5rest endpoints used:
-    GET  /ConnectEx        – authenticate by broker server name
-    GET  /Connect          – authenticate by broker IP and port
     GET  /ConnectEx        – authenticate with broker, returns UUID conn id
     GET  /Disconnect       – close connection
     GET  /ConnectionStatus – check live connection
@@ -26,7 +24,6 @@ mt5rest endpoints used:
 """
 
 import asyncio
-import ipaddress
 import math
 import time as _time
 from datetime import datetime, timezone, timedelta
@@ -81,29 +78,14 @@ _MT5_KEEPALIVE_INTERVAL_S:    float = 180.0    # 3 min  — keep broker session 
 _MT5_SESSION_REFRESH_AGE_S:   float = 14400.0  # 4 hours — proactively refresh conn_id
 
 
-def _host_is_ip(host: str) -> bool:
-    try:
-        ipaddress.ip_address(host.strip())
-        return True
-    except ValueError:
-        return False
-
-
 def _connect_params(user: str, password: str, host: str) -> dict[str, object]:
-    """Build parameters for the documented MT5 connection endpoint.
+    """Build query parameters accepted by mt5rest's ConnectEx endpoint.
 
-    mt5rest's ConnectEx resolves a broker server name. When a broker endpoint
-    is configured as an IP address, use the documented Connect endpoint so the
-    configured MT5_PORT is honored and no server-name lookup is attempted.
+    aiohttp encodes query parameters through ``str()`` for most values, but
+    mt5rest validates the values before routing and rejects Python booleans
+    with HTTP 500. Keep the flags as explicit lowercase query-string values
+    so the request is valid for both the current bridge and older versions.
     """
-    if _host_is_ip(host):
-        return {
-            "user": user,
-            "password": password,
-            "host": host,
-            "port": MT5_PORT,
-            "connectTimeoutSeconds": 60,
-        }
     return {
         "user": user,
         "password": password,
@@ -238,25 +220,24 @@ async def connect(*args, **kwargs) -> bool:
     sess = _get_session()
 
     try:
-        endpoint = "Connect" if _host_is_ip(host) else "ConnectEx"
-        log.info(f"Connecting to MT5 via mt5rest at {base}/{endpoint} ...")
+        log.info(f"Connecting to MT5 via mt5rest at {base} ...")
         async with sess.get(
-            f"{base}/{endpoint}",
+            f"{base}/ConnectEx",
             params=_connect_params(user, password, host),
             timeout=aiohttp.ClientTimeout(total=SYNC_TIMEOUT),
         ) as resp:
             raw = await resp.text()
-            log.debug(f"{endpoint} response ({resp.status}): [response received]")
+            log.debug(f"ConnectEx response ({resp.status}): [response received]")
 
             if resp.status != 200:
-                log.error(f"{endpoint} failed (status={resp.status}): {raw[:300]}")
+                log.error(f"ConnectEx failed (status={resp.status}): {raw[:300]}")
                 _connected = False
                 return False
 
             # Response is a plain UUID string (may be quoted JSON string or raw)
             conn_id = raw.strip().strip('"')
             if not conn_id or len(conn_id) < 10:
-                log.error(f"Connection endpoint returned unexpected value: {raw[:200]}")
+                log.error(f"ConnectEx returned unexpected value: {raw[:200]}")
                 _connected = False
                 return False
 
