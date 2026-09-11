@@ -21,7 +21,7 @@ services:
         - mtapi-bridge/**
     envVars:
       - key: RENDER_EXTERNAL_URL
-        value: "https://mt5.mtapi.io"
+        value: "https://goldscalper-mtapi-uuoc.onrender.com"
       - key: MT5_HOST
         value: "AMarkets-Demo"
       - key: MT5_PORT
