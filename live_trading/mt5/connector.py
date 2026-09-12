@@ -1,3 +1,4 @@
+import asyncio
 import time as _time
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -905,7 +906,7 @@ async def get_current_quote(symbol: str) -> dict:
         try:
             sess = _get_session()
             async with sess.get(
-                f"{_base_url}/GetQuote",
+                f"{_base_url}/Quote",
                 params={"id": _conn_id, "symbol": symbol},
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
