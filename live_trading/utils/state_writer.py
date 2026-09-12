@@ -6,7 +6,7 @@ import json
 import os
 from datetime import datetime, timezone
 from typing import List, Optional
-from live_trading.signals.decision_engine import DecisionResult
+from live_trading.signals.decision_engine import DecisionResult, describe_strategy
 from live_trading.logger import get_logger
 
 # Import env-configured paths from config so that STATE_FILE, MT5_SNAPSHOT,
@@ -162,6 +162,18 @@ def write_robot_state(
                 "rr":     decision.trade_params.risk_reward_ratio,
                 "risk_usd": decision.trade_params.risk_amount,
             } if decision.trade_params else None,
+            # Per-candle structured telemetry for the panel and post-trade
+            # analysis. This is derived from the same DecisionResult and does
+            # not introduce a second signal path.
+            # A few panel/unit-test callers provide a deliberately minimal
+            # signal-shaped object instead of a full DecisionResult. Keep
+            # those legacy payloads serializable while real decisions receive
+            # the complete structured telemetry.
+            "telemetry": (
+                describe_strategy(decision)
+                if hasattr(decision, "pa") and hasattr(decision, "quality_filter")
+                else None
+            ),
         }
 
     # Derive connection/MT5 status from the ACTUAL connector state.

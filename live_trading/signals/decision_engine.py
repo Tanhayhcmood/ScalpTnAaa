@@ -501,6 +501,14 @@ def describe_strategy(decision: "DecisionResult") -> dict:
         confirmations = []
         confirmation_count = 0
 
+    trend_vote = (
+        "BUY" if decision.trend.trend == "BULLISH"
+        else "SELL" if decision.trend.trend == "BEARISH"
+        else "NEUTRAL"
+    )
+    pa = decision.pa
+    components = decision.components
+
     return {
         "direction":           decision.direction,
         "grade":               decision.grade,
@@ -513,4 +521,64 @@ def describe_strategy(decision: "DecisionResult") -> dict:
         # Top signal-level reasons behind the confidence score (e.g. "BOS
         # confirmed", "Strong EMA alignment (50/100/200)", "Spring confirmed").
         "signals":             list(decision.reasoning[:6]),
+        # Structured per-candle telemetry.  Keep the four decision stages
+        # separate so the panel/log consumer can identify where a setup was
+        # weakened or blocked without re-running strategy code.
+        "consensus": {
+            "candidate": decision.direction,
+            "engines": {
+                "smc": decision.smc.smc_signal,
+                "trend": trend_vote,
+                "price_action": pa.pa_signal,
+                "wyckoff": decision.wyckoff.wyckoff_signal,
+            },
+            "confirmed": confirmation_count,
+            "total": 4,
+            "allowed": bool(ef.allowed) if ef is not None else False,
+        },
+        "confidence_stage": {
+            "total": round(components.total, 1),
+            "grade": decision.grade,
+            "components": {
+                "smc": round(components.smc_score, 2),
+                "trend": round(components.trend_score, 2),
+                "price_action": round(components.pa_score, 2),
+                "wyckoff": round(components.wyckoff_score, 2),
+                "liquidity": round(components.liquidity_score, 2),
+                "volatility": round(components.volatility_score, 2),
+                "divergence": round(components.divergence_score, 2),
+                "dxy": round(components.dxy_score, 2),
+            },
+        },
+        "quality_stage": {
+            "allowed": bool(decision.quality_filter.allowed),
+            "session": decision.quality_filter.session_quality,
+            "adx": round(decision.quality_filter.adx, 2),
+            "low_momentum": bool(decision.quality_filter.is_low_momentum),
+            "low_probability": bool(decision.quality_filter.is_low_probability),
+            "fake_breakout": bool(decision.quality_filter.is_fake_breakout),
+            "blocked_reasons": list(decision.quality_filter.blocked_reasons),
+        },
+        "price_action": {
+            "signal": pa.pa_signal,
+            "score": round(pa.pa_score, 3),
+            "engulfing": {
+                "bullish": bool(pa.bullish_engulf),
+                "bearish": bool(pa.bearish_engulf),
+            },
+            "breakout": {
+                "bullish": bool(pa.valid_bull_breakout),
+                "bearish": bool(pa.valid_bear_breakout),
+                "fake_bullish": bool(pa.fake_bull_breakout),
+                "fake_bearish": bool(pa.fake_bear_breakout),
+            },
+            "inside_bar": {
+                "detected": bool(pa.inside_bar_detected),
+                "depth": int(pa.inside_bar_depth),
+                "bullish_breakout": bool(pa.bullish_inside_breakout),
+                "bearish_breakout": bool(pa.bearish_inside_breakout),
+                "breakout_level": pa.inside_bar_breakout_level,
+                "strength_atr": round(pa.inside_bar_breakout_strength, 3),
+            },
+        },
     }

@@ -58,6 +58,10 @@ class PriceActionResult:
     # keep older panel/test constructors source-compatible.
     bullish_inside_breakout: bool = False
     bearish_inside_breakout: bool = False
+    inside_bar_detected: bool = False
+    inside_bar_depth: int = 0
+    inside_bar_breakout_level: float | None = None
+    inside_bar_breakout_strength: float = 0.0
 
 
 def _calc_atr(candles: List[OHLCV], period: int) -> float:
@@ -178,6 +182,72 @@ def _detect_supply_demand(candles: List[OHLCV], cfg: PaConfig, atr: float):
     return demand_zones[-3:], supply_zones[-3:]
 
 
+def _detect_inside_bar_breakout(
+    candles: List[OHLCV], cfg: PaConfig, atr: float
+) -> tuple[bool, int, bool, bool, float | None, float]:
+    """Detect a closed breakout from a single or nested inside-bar structure.
+
+    The previous implementation compared the breakout close with the
+    *inside* candle's high/low.  That can fire while price is still inside the
+    mother candle, which is not a breakout of the setup.  The breakout must
+    close beyond the outermost mother candle and meet the same body-quality
+    requirements used by the normal breakout detector.
+
+    Returns:
+        detected, nesting depth, bullish, bearish, broken level, strength
+    """
+    n = len(candles)
+    if n < 3 or atr <= 0:
+        return False, 0, False, False, None, 0.0
+
+    breakout = candles[-1]
+    inside_index = n - 2
+    mother_index = n - 3
+    outer_mother = None
+    depth = 0
+
+    # Walk backwards so a sequence such as A (mother), B (inside), C
+    # (nested inside), D (breakout) uses A's boundaries rather than C's.
+    while inside_index >= 1 and mother_index >= 0:
+        inside = candles[inside_index]
+        mother = candles[mother_index]
+        if not (
+            inside.high <= mother.high
+            and inside.low >= mother.low
+            and _range(inside) > 0
+            and _range(mother) > 0
+        ):
+            break
+        depth += 1
+        outer_mother = mother
+        inside_index -= 1
+        mother_index -= 1
+
+    if outer_mother is None:
+        return False, 0, False, False, None, 0.0
+
+    minimum_body = max(cfg.breakout_min_body, atr * 0.25)
+    body = _body(breakout)
+    quality = _body_ratio(breakout) >= cfg.breakout_body_ratio
+    bullish = (
+        _is_bull(breakout)
+        and breakout.close > outer_mother.high
+        and body >= minimum_body
+        and quality
+    )
+    bearish = (
+        _is_bear(breakout)
+        and breakout.close < outer_mother.low
+        and body >= minimum_body
+        and quality
+    )
+    broken_level = (
+        outer_mother.high if bullish else outer_mother.low if bearish else None
+    )
+    strength = round(body / atr, 3) if (bullish or bearish) else 0.0
+    return True, depth, bullish, bearish, broken_level, strength
+
+
 def _detect_breakout_pullback(
     candles, support_lvls, resistance_lvls, demand_zones, supply_zones,
     cfg: PaConfig, atr: float
@@ -222,25 +292,20 @@ def _detect_breakout_pullback(
                          for z in supply_zones)
         if near_res or near_sup_z: bear_pb = True
 
-    # Inside-bar breakouts are common continuation setups on XAUUSD.  They
-    # were previously invisible unless the mother candle also created a
-    # clustered S/R level, which made the PA engine needlessly sparse.
-    mother = candles[n - 3] if n >= 3 else None
-    inside = candles[n - 2] if n >= 2 else None
-    bull_inside = (
-        mother is not None and inside is not None
-        and inside.high <= mother.high and inside.low >= mother.low
-        and _is_bull(curr) and curr.close > inside.high
-        and _body(curr) >= atr * 0.25
-    )
-    bear_inside = (
-        mother is not None and inside is not None
-        and inside.high <= mother.high and inside.low >= mother.low
-        and _is_bear(curr) and curr.close < inside.low
-        and _body(curr) >= atr * 0.25
-    )
+    (
+        inside_detected,
+        inside_depth,
+        bull_inside,
+        bear_inside,
+        inside_level,
+        inside_strength,
+    ) = _detect_inside_bar_breakout(candles, cfg, atr)
 
-    return vbull, vbear, fbull, fbear, bull_pb, bear_pb, bull_inside, bear_inside
+    return (
+        vbull, vbear, fbull, fbear, bull_pb, bear_pb,
+        bull_inside, bear_inside,
+        inside_detected, inside_depth, inside_level, inside_strength,
+    )
 
 
 def _compute_pa_signal(
@@ -370,7 +435,8 @@ def analyze_price_action(candles: List[OHLCV], timeframe: str = "M5") -> PriceAc
 
     (
         vbull, vbear, fbull, fbear, bull_pb, bear_pb,
-        bull_inside, bear_inside,
+        bull_inside, bear_inside, inside_detected, inside_depth,
+        inside_level, inside_strength,
     ) = _detect_breakout_pullback(
         candles, support_lvls, resistance_lvls, demand_zones, supply_zones, cfg, atr)
 
@@ -394,4 +460,8 @@ def analyze_price_action(candles: List[OHLCV], timeframe: str = "M5") -> PriceAc
         pa_score=score,
         bullish_inside_breakout=bull_inside,
         bearish_inside_breakout=bear_inside,
+        inside_bar_detected=inside_detected,
+        inside_bar_depth=inside_depth,
+        inside_bar_breakout_level=inside_level,
+        inside_bar_breakout_strength=inside_strength,
     )

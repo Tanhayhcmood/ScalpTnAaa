@@ -205,6 +205,11 @@ class GoldScalperLive:
         self._last_entry_direction: str = ""
         self.trade_history: List[dict] = []
         self.last_decision: Optional[DecisionResult] = None
+        # Structured telemetry for the most recently evaluated closed candle.
+        # It is mirrored into robot_state.json and emitted as one JSON log
+        # record per scan, so Render logs can be analysed without parsing
+        # human-readable messages.
+        self._last_candle_telemetry: dict = {}
         # This is deliberately independent from DecisionResult.allowed.
         # The decision engine reports signal eligibility; this state records
         # the result of every live entry gate before an order is sent.
@@ -1003,6 +1008,28 @@ class GoldScalperLive:
 
         # 6. Write MT5 snapshot for Telegram panel
         last_c = candles[-1]
+        _strategy_telemetry = describe_strategy(decision)
+        _strategy_telemetry.update({
+            "candle_time": last_c.time,
+            "timeframe": tf,
+            "mtf": {
+                "enabled": bool(MTF_ENABLED),
+                "timeframe": MTF_TIMEFRAME,
+                "direction": htf_bias.direction if htf_bias else "NEUTRAL",
+                "trend": htf_bias.trend if htf_bias else "NEUTRAL",
+                "smc": htf_bias.smc_signal if htf_bias else "NEUTRAL",
+                "regime": htf_bias.regime if htf_bias else "RANGE",
+                "strength": htf_bias.strength if htf_bias else "WEAK",
+                "data_available": htf_bias is not None,
+                "data_reason": htf_data_reason or "",
+                "gate": "PENDING",
+            },
+        })
+        self._last_candle_telemetry = _strategy_telemetry
+        log.info(
+            "CANDLE_TELEMETRY %s",
+            json.dumps(_strategy_telemetry, sort_keys=True, default=str),
+        )
         # Compute ATR in price units using a 5-bar average True Range.
         # A single-candle TR (trs[-1]) makes the displayed ATR jump on every
         # wick, misleading the panel operator.  Using the same 5-bar window
@@ -1178,6 +1205,10 @@ class GoldScalperLive:
                 min_timeframes=OPTION_TWO_MIN_TIMEFRAMES,
                 allow_range_regime=decision.regime == "RANGE",
             )
+            self._last_candle_telemetry.setdefault("mtf", {})["gate"] = (
+                "ALLOWED" if _mtf_ok else "BLOCKED"
+            )
+            self._last_candle_telemetry["mtf"]["gate_reason"] = _mtf_reason
             if not _mtf_ok:
                 self._set_trade_permission(False, "MTF_BLOCKED", [_mtf_reason])
                 log.info(f"⛔  {_mtf_reason}")
@@ -1197,6 +1228,8 @@ class GoldScalperLive:
                 }
                 self._write_state("SCANNING", acc_info, decision, pos, extra=_mtf_extra)
                 return
+        else:
+            self._last_candle_telemetry.setdefault("mtf", {})["gate"] = "DISABLED"
 
         # 7c. Gate: post-SL cooldown in choppy/range regimes
         # If the last trade was in the same direction and closed (or will close)
@@ -2026,6 +2059,8 @@ class GoldScalperLive:
             }
         if extra:
             merged_extra.update(extra)
+        if self._last_candle_telemetry:
+            merged_extra["candle_telemetry"] = dict(self._last_candle_telemetry)
 
         write_robot_state(
             status           = status,

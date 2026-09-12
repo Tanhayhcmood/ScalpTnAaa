@@ -108,6 +108,11 @@ def _calc_pa_score(pa: PriceActionResult, candidate: str):
         if pa.bullish_engulf:              pts += 4; reasons.append("Bullish Engulf")
         elif pa.bullish_pin_bar:           pts += 3; reasons.append("Bullish Pin Bar")
         elif pa.strong_bullish:            pts += 2; reasons.append("Strong Bull candle")
+        if pa.bullish_inside_breakout:
+            pts += 3; reasons.append(
+                f"Bullish Inside-Bar Breakout"
+                f"{' ×' + str(pa.inside_bar_depth) if pa.inside_bar_depth > 1 else ''}"
+            )
         if pa.valid_bull_breakout:         pts += 2; reasons.append("Valid Breakout")
         if pa.bullish_pullback:            pts += 1; reasons.append("Pullback to demand")
         if pa.near_demand_zone or pa.near_support: pts += 1; reasons.append("Near demand/support")
@@ -116,6 +121,11 @@ def _calc_pa_score(pa: PriceActionResult, candidate: str):
         if pa.bearish_engulf:              pts += 4; reasons.append("Bearish Engulf")
         elif pa.bearish_pin_bar:           pts += 3; reasons.append("Bearish Pin Bar")
         elif pa.strong_bearish:            pts += 2; reasons.append("Strong Bear candle")
+        if pa.bearish_inside_breakout:
+            pts += 3; reasons.append(
+                f"Bearish Inside-Bar Breakout"
+                f"{' ×' + str(pa.inside_bar_depth) if pa.inside_bar_depth > 1 else ''}"
+            )
         if pa.valid_bear_breakout:         pts += 2; reasons.append("Valid Breakout")
         if pa.bearish_pullback:            pts += 1; reasons.append("Pullback to supply")
         if pa.near_supply_zone or pa.near_resistance: pts += 1; reasons.append("Near supply/resistance")

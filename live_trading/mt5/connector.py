@@ -70,6 +70,61 @@ _TF_MAP = {
 }
 
 
+def _parse_candle_time(value: object) -> datetime:
+    """Normalize broker candle timestamps to timezone-aware UTC datetimes."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (int, float)):
+        parsed = datetime.fromtimestamp(float(value), tz=timezone.utc)
+    else:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("empty candle timestamp")
+        try:
+            parsed = datetime.fromtimestamp(float(text), tz=timezone.utc)
+        except ValueError:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _completed_candles(
+    candles: List[OHLCV] | List[tuple[object, OHLCV]],
+    timeframe_minutes: int,
+    now: Optional[datetime] = None,
+) -> List[OHLCV]:
+    """Sort, de-duplicate, and retain only fully closed broker candles."""
+    now_utc = _parse_candle_time(now or datetime.now(timezone.utc))
+    close_delta = timedelta(minutes=max(1, timeframe_minutes))
+    completed: list[tuple[datetime, OHLCV]] = []
+    seen: set[datetime] = set()
+
+    for item in candles:
+        if isinstance(item, tuple):
+            raw_time, candle = item
+        else:
+            candle = item
+            raw_time = candle.time
+        try:
+            candle_time = _parse_candle_time(raw_time)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if candle_time + close_delta > now_utc or candle_time in seen:
+            continue
+        seen.add(candle_time)
+        completed.append((candle_time, candle))
+
+    completed.sort(key=lambda entry: entry[0])
+    return [candle for _, candle in completed]
+
+
+def _h1_request_minutes(count: int) -> int:
+    """Leave enough H1 lookback for weekends and broker market gaps."""
+    return max(1, count) * 60 + 3 * 24 * 60
+
+
 def _get_session() -> aiohttp.ClientSession:
     global _session
     if _session is None or _session.closed:
@@ -488,10 +543,15 @@ async def fetch_candles(
 
         tf_min = _TF_MAP.get(timeframe, 5)
 
-        # Request slightly more bars than needed to account for the current open bar
-        request_count = count + 5
         now      = datetime.now(timezone.utc)
-        from_dt  = now - timedelta(minutes=tf_min * request_count)
+        # H1 needs calendar-day slack because weekends/market closures mean
+        # count bars can span substantially more than count hours.
+        lookback_minutes = (
+            _h1_request_minutes(count)
+            if tf_min == 60
+            else tf_min * (count + 5)
+        )
+        from_dt  = now - timedelta(minutes=lookback_minutes)
 
         from_str = from_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         to_str   = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -541,24 +601,10 @@ async def fetch_candles(
                         volume=float(bar.get("tickVolume", bar.get("volume", 0))),
                     ))
 
-                # Sort and deduplicate by timestamp before removing the open bar.
-                # The bridge can return overlapping pages with duplicate candles;
-                # feeding those into indicators shifts the entire signal window.
-                candles.sort(key=lambda candle: candle.time)
-                deduplicated: List[OHLCV] = []
-                seen_times: set[str] = set()
-                for candle in candles:
-                    if candle.time in seen_times:
-                        continue
-                    seen_times.add(candle.time)
-                    deduplicated.append(candle)
-                candles = deduplicated
-
-                # Drop the last bar (may be the still-open current bar)
-                if candles:
-                    candles = candles[:-1]
-
-                # Return only the last `count` completed bars
+                # Use timestamps rather than blindly dropping the last row:
+                # H1 responses can be sparse across weekends, and the final
+                # row is not guaranteed to be the currently open candle.
+                candles = _completed_candles(candles, tf_min, now=now)
                 return candles[-count:] if len(candles) > count else candles
 
         except Exception as exc:

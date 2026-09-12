@@ -69,3 +69,49 @@ def test_inside_bar_breakout_is_recognized_without_a_clustered_sr_level():
 
     assert result.bullish_inside_breakout
     assert result.pa_signal == "BUY"
+    assert result.inside_bar_detected
+    assert result.inside_bar_depth == 1
+    assert result.inside_bar_breakout_level == 2500.40
+
+
+def test_inside_bar_does_not_break_until_price_closes_beyond_mother_range():
+    candles = _base_candles()
+    candles[-3] = OHLCV(
+        candles[-3].time, 2499.70, 2500.40, 2499.40, 2499.85, 100.0
+    )
+    candles[-2] = OHLCV(
+        candles[-2].time, 2499.82, 2500.10, 2499.65, 2499.90, 100.0
+    )
+    # This clears the inside candle's high, but remains inside the mother
+    # candle. It must not be treated as an inside-bar breakout.
+    candles[-1] = OHLCV(
+        candles[-1].time, 2499.90, 2500.28, 2499.85, 2500.20, 130.0
+    )
+
+    result = analyze_price_action(candles)
+
+    assert result.inside_bar_detected
+    assert not result.bullish_inside_breakout
+    assert result.pa_signal != "BUY"
+
+
+def test_nested_inside_bar_breakout_uses_outer_mother_boundary():
+    candles = _base_candles()
+    candles[-4] = OHLCV(
+        candles[-4].time, 2499.60, 2500.50, 2499.30, 2499.90, 100.0
+    )
+    candles[-3] = OHLCV(
+        candles[-3].time, 2499.82, 2500.30, 2499.55, 2500.00, 100.0
+    )
+    candles[-2] = OHLCV(
+        candles[-2].time, 2499.92, 2500.18, 2499.70, 2500.04, 100.0
+    )
+    candles[-1] = OHLCV(
+        candles[-1].time, 2500.04, 2500.72, 2499.98, 2500.62, 140.0
+    )
+
+    result = analyze_price_action(candles)
+
+    assert result.bullish_inside_breakout
+    assert result.inside_bar_depth == 2
+    assert result.inside_bar_breakout_level == 2500.50
