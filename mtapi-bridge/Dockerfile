@@ -32,7 +32,7 @@ RUN apt-get update -qq \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Stage 2: final mt5rest image with Render PORT proxy ───────────────────────
-FROM timurila/mt5rest:26.07.22-06.37
+FROM timurila/mt5rest:26.09.03-07.19
 
 # mt5rest/.NET watches its JSON configuration files for reloads. Render's
 # shared container limit can exhaust inotify instances during Wine/.NET
