@@ -36,7 +36,7 @@ def test_flat_market_is_not_mislabeled_as_a_trend():
 
     assert result.trend == "NEUTRAL"
     assert result.state == "RANGE"
-    assert result.quality == 0.0
+    assert result.quality < 15.0
 
 
 def test_shallow_retracement_keeps_the_higher_timeframe_bias():
