@@ -287,6 +287,55 @@ async def connect(*args, **kwargs) -> bool:
     _base_url = base
     sess = _get_session()
 
+    # Prefer HTTP Basic Auth for the current mt5rest bridge. If an older bridge
+    # rejects it, the existing query-param flow below remains as a compatibility fallback.
+    if not session_token:
+        try:
+            log.info(f"Connecting to MT5 via mt5rest at {base} (Basic Auth) ...")
+            async with sess.get(
+                f"{base}/ConnectEx",
+                params={
+                    "server": host,
+                    "connectTimeoutSeconds": 60,
+                    "errorReplyStatusCode": 400,
+                },
+                auth=aiohttp.BasicAuth(user, password),
+                timeout=aiohttp.ClientTimeout(total=SYNC_TIMEOUT),
+            ) as resp:
+                raw = await resp.text()
+                if resp.status in (200, 201):
+                    candidate_id = raw.strip().strip('"')
+                    if candidate_id and len(candidate_id) >= 10:
+                        if await _wait_for_broker_ready(base, candidate_id):
+                            _conn_id = candidate_id
+                            _connected = True
+                            _last_connect_time = _time.monotonic()
+                            if previous_conn_id and previous_conn_id != candidate_id:
+                                try:
+                                    async with sess.get(
+                                        f"{base}/Disconnect",
+                                        params={"id": previous_conn_id},
+                                        timeout=aiohttp.ClientTimeout(total=10),
+                                    ):
+                                        pass
+                                except Exception as exc:
+                                    log.debug(f"Previous MT5 session cleanup skipped: {exc}")
+                            log.info(f"MT5 connected (Basic Auth) – broker: {host}  user: {user}  conn_id: {candidate_id}")
+                            return True
+                        try:
+                            async with sess.get(
+                                f"{base}/Disconnect",
+                                params={"id": candidate_id},
+                                timeout=aiohttp.ClientTimeout(total=10),
+                            ):
+                                pass
+                        except Exception:
+                            pass
+                    else:
+                        log.warning(f"ConnectEx (Basic Auth) returned unexpected value: {raw[:200]}")
+                log.warning(f"ConnectEx (Basic Auth) returned HTTP {resp.status}; trying compatibility fallback")
+        except Exception as exc:
+            log.warning(f"ConnectEx (Basic Auth) attempt failed; trying compatibility fallback: {exc}")
     try:
         endpoint = "ConnectByToken" if session_token else "ConnectEx"
         request_params = (
