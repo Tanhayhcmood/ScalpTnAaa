@@ -965,3 +965,132 @@ def get_conn_id() -> Optional[str]:
 def is_connected() -> bool:
     return _connected
 
+async def check_symbol_available(symbol: str) -> bool:
+    """Verify that MTAPI exposes the configured symbol for this account."""
+    target = symbol.strip().upper()
+    if not target:
+        log.error("MTAPI symbol check failed: SYMBOL is empty")
+        return False
+
+    for attempt in range(2):
+        if not _conn_id:
+            if not await ensure_connected():
+                return False
+        try:
+            async with _get_session().get(
+                f"{_base_url}/SymbolList",
+                params={"id": _conn_id},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status >= 400:
+                    raise RuntimeError(
+                        f"HTTP {resp.status}: "
+                        f"{data.get('message', str(data)[:160]) if isinstance(data, dict) else str(data)[:160]}"
+                    )
+
+                if isinstance(data, list):
+                    names = [str(item) for item in data]
+                elif isinstance(data, dict):
+                    names = [str(item) for item in data.keys()]
+                else:
+                    raise RuntimeError(f"unexpected response type {type(data).__name__}")
+
+                available = {name.upper() for name in names}
+                if target in available:
+                    log.info(f"{symbol} availability: AVAILABLE via MTAPI")
+                    return True
+
+                related = [name for name in names if "XAU" in name.upper()]
+                log.error(
+                    f"{symbol} availability: NOT AVAILABLE via MTAPI"
+                    + (f"; related symbols: {related[:10]}" if related else "")
+                )
+                return False
+        except Exception as exc:
+            if attempt == 0:
+                log.warning(f"MTAPI symbol check failed — reconnecting: {exc}")
+                _invalidate_connection()
+                continue
+            log.error(f"MTAPI symbol check failed after reconnect: {exc}")
+            return False
+    return False
+
+
+async def get_closed_position_history(position_id: str) -> Optional[dict]:
+    """Return the completed MT5 history record for one position ticket.
+
+    An empty result is deliberately returned as ``None``.  A position can
+    temporarily disappear from ``OpenedOrders`` while the bridge is syncing;
+    callers must not treat that as a completed trade until this endpoint
+    returns a record that contains close data.
+    """
+    if not position_id:
+        return None
+
+    for attempt in range(2):
+        if not _conn_id:
+            if not await ensure_connected():
+                raise RuntimeError(
+                    "get_closed_position_history: not connected to MTAPI"
+                )
+        try:
+            async with _get_session().get(
+                f"{_base_url}/HistoryPositions",
+                params={"id": _conn_id, "tickets": int(position_id)},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if attempt == 0 and isinstance(data, dict) and "stackTrace" in data:
+                    log.warning(
+                        "HistoryPositions error (stale conn_id?) — "
+                        "reconnecting and retrying."
+                    )
+                    _invalidate_connection()
+                    continue
+                if resp.status >= 400:
+                    message = (
+                        data.get("message", f"HTTP {resp.status}")
+                        if isinstance(data, dict)
+                        else f"HTTP {resp.status}"
+                    )
+                    raise RuntimeError(
+                        f"MTAPI HistoryPositions error: {message}"
+                    )
+
+                if isinstance(data, dict):
+                    candidates = data.get("orders", [])
+                elif isinstance(data, list):
+                    candidates = data
+                else:
+                    candidates = []
+
+                wanted = str(position_id)
+                for record in candidates:
+                    if not isinstance(record, dict):
+                        continue
+                    ticket = record.get(
+                        "ticket",
+                        record.get("ticketNumber", record.get("positionTicket")),
+                    )
+                    if ticket is not None and str(ticket) == wanted:
+                        return record
+                return None
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            if attempt == 0:
+                log.warning(
+                    f"get_closed_position_history error (attempt 1) — "
+                    f"reconnecting: {exc}"
+                )
+                _invalidate_connection()
+                continue
+            log.error(f"get_closed_position_history failed: {exc}")
+            raise RuntimeError(
+                f"get_closed_position_history failed: {exc}"
+            ) from exc
+    raise RuntimeError(
+        "get_closed_position_history: failed after reconnect attempt"
+    )
+
