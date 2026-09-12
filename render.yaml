@@ -89,7 +89,7 @@ services:
       # may authorize direction after confidence, quality, regime, sizing, and
       # risk gates pass. No individual strategy is mandatory.
       - key: MIN_CONFIRMATIONS
-        value: "2"
+        value: "1"
       # Dedicated RANGE playbook from the operator runbook:
       # edge + fresh same-direction sweep + closed-candle reversal +
       # the two-strategy consensus floor.
