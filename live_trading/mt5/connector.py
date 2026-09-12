@@ -112,15 +112,19 @@ async def connect(*args, **kwargs) -> bool:
         log.info(f"Connecting to MT5 via mt5rest at {base} ...")
         async with sess.get(
             f"{base}/ConnectEx",
-            params={
-                "user":     user,
-                "password": password,
-                "server":   host,
-                "id":       str(uuid.uuid4()),
-                "connectTimeoutSeconds": 60,
-                "connectToNearestByPing": "true",
-                "connectTimeoutClusterMemberSeconds": 60,
-            },
+    connect_params = {
+        "user":     user,
+        "password": password,
+        "server":   host,
+        "connectTimeoutSeconds": 60,
+        "connectToNearestByPing": "true",
+        "connectTimeoutClusterMemberSeconds": 60,
+    }
+    # The 14-day mt5.mtapi.io trial returns its own connection id.
+    # MTAPI Cloud requires a client-generated GUID; only send it there.
+    if "mt5full" in base.lower():
+        connect_params["id"] = str(uuid.uuid4())
+            params=connect_params,
             timeout=aiohttp.ClientTimeout(total=SYNC_TIMEOUT),
         ) as resp:
             raw = await resp.text()
@@ -906,7 +910,7 @@ async def get_current_quote(symbol: str) -> dict:
         try:
             sess = _get_session()
             async with sess.get(
-                f"{_base_url}/Quote",
+                f"{_base_url}/{'Quote' if 'mt5full' in _base_url.lower() else 'GetQuote'}",
                 params={"id": _conn_id, "symbol": symbol},
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
