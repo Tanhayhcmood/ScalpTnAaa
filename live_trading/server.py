@@ -256,6 +256,13 @@ async def _status(req: web.Request):
             "last_heartbeat": None,
             "_data_fresh": False,
             "_data_age_seconds": -1,
+            "diagnostics": {
+                "mtapi_url_configured": bool(os.environ.get("MTAPI_URL")),
+                "mt5_host": os.environ.get("MT5_HOST", ""),
+                "mt5_port": os.environ.get("MT5_PORT", ""),
+                "mt5_user_configured": bool(os.environ.get("MT5_USER")),
+                "mt5_password_configured": bool(os.environ.get("MT5_PASSWORD")),
+            },
         }),
         content_type="application/json",
     )
