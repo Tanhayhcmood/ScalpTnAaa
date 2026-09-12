@@ -35,8 +35,9 @@ from live_trading.config import (
 # 1.3 = profitable in expectancy even at 45% win rate (1.3 × 0.45 > 0.55).
 CONF_MARGINAL_RR = 1.3
 
-# Regimes where PA/Wyckoff naturally fire less often. Their existing adaptive
-# one-step tightening is preserved; RANGE gets the explicit option-4 floor.
+# All four engines have equal weight. The production entry floor is the
+# operator-selected N-of-4 consensus; no regime silently raises it to make
+# one strategy mandatory. RANGE keeps its separate structural safeguards.
 _CHOPPY_REGIMES = {"ACCUMULATION", "DISTRIBUTION", "HIGH_VOLATILITY"}
 
 
@@ -46,18 +47,14 @@ def _effective_min_confirmations(
     counter_trend: bool,
     range_min_confirmations: int = RANGE_MIN_CONFIRMATIONS,
 ) -> int:
-    """Return the final N-of-4 gate without weakening the RANGE floor."""
+    """Return the operator-selected N-of-4 floor.
+
+    Counter-trend and choppy-market handling remain covered by the existing
+    confidence, quality, regime, MTF, and risk gates; they do not silently
+    turn the requested two-strategy consensus into a three-vote requirement.
+    """
     if regime == "RANGE":
-        # Option 4 is a floor, not a replacement: a stricter operator setting
-        # remains stricter. Counter-trend remains an additional requirement.
-        range_floor = max(base_min_confirmations, range_min_confirmations)
-        if counter_trend:
-            return max(range_floor, min(base_min_confirmations + 1, 4))
-        return range_floor
-    if counter_trend:
-        return min(base_min_confirmations + 1, 4)
-    if regime in _CHOPPY_REGIMES:
-        return min(base_min_confirmations + 1, 4)
+        return max(base_min_confirmations, range_min_confirmations)
     return base_min_confirmations
 
 
@@ -65,26 +62,17 @@ def _range_confirmation_gate(
     entry_filter: EntryFilterResult,
     min_confirmations: int,
 ) -> tuple[bool, str]:
-    """Apply the RANGE-specific two-vote confirmation rule.
+    """Apply the RANGE confirmation floor without changing vote semantics.
 
-    RANGE entries always have an SMC direction because the candidate direction
-    comes from SMC.  The second confirmation must be either Price Action or
-    Wyckoff; a matching EMA trend alone is not sufficient in a choppy market.
-    This intentionally overrides the global three-engine option-1 gate for
-    RANGE only.  The separate edge, fresh sweep, reversal, R:R, and session
-    limits remain mandatory.
+    RANGE keeps its separate edge, fresh sweep, reversal, R:R, and session
+    limits. Its signal vote still follows the same equal-weight N-of-4
+    consensus as ordinary entries.
     """
     if entry_filter.confirmation_count < min_confirmations:
         return (
             False,
             f"RANGE entry blocked: {entry_filter.confirmation_count}/"
             f"{min_confirmations} confirmations",
-        )
-    if not (entry_filter.price_action or entry_filter.wyckoff):
-        return (
-            False,
-            "RANGE entry blocked: second confirmation must be "
-            "Price Action or Wyckoff",
         )
     return True, ""
 
@@ -118,14 +106,26 @@ class DecisionResult:
     range_context:   Optional[RangeContext]      = None
 
 
-def _candidate_direction(smc: SmcResult) -> str:
-    # Use the newest event across both lists. Prioritising the last CHoCH
-    # unconditionally can resurrect an old reversal against a newer BOS.
-    latest_structure = get_latest_structure_event(smc)
-    if latest_structure is not None:
-        return latest_structure.type
-    if smc.trend == "BULLISH": return "BUY"
-    if smc.trend == "BEARISH": return "SELL"
+def _candidate_direction(
+    smc: SmcResult,
+    wyckoff: WyckoffResult,
+    pa: PriceActionResult,
+    trend: TrendResult,
+) -> str:
+    """Return the unique direction with the most strategy votes."""
+    votes = (
+        smc.smc_signal,
+        "BUY" if trend.trend == "BULLISH" else
+        "SELL" if trend.trend == "BEARISH" else "NEUTRAL",
+        pa.pa_signal,
+        wyckoff.wyckoff_signal,
+    )
+    buy_count = sum(vote == "BUY" for vote in votes)
+    sell_count = sum(vote == "SELL" for vote in votes)
+    if buy_count > sell_count:
+        return "BUY"
+    if sell_count > buy_count:
+        return "SELL"
     return "NEUTRAL"
 
 
@@ -159,7 +159,7 @@ def run_decision_engine(
     candles:           List[OHLCV],
     account_balance:   float,
     risk_percent:      float = 1.0,
-    min_confirmations: int   = 1,
+    min_confirmations: int   = 2,
     use_atr_high_vol:  bool  = False,
     dxy_signal:        str   = "NEUTRAL",
     require_price_action: bool = False,
@@ -177,9 +177,9 @@ def run_decision_engine(
     pa      = analyze_price_action(candles)
     trend   = analyze_trend(candles)
 
-    candidate = _candidate_direction(smc)
+    candidate = _candidate_direction(smc, wyckoff, pa, trend)
     if candidate == "NEUTRAL":
-        return _make_neutral(smc, wyckoff, pa, trend, ["No SMC signal"])
+        return _make_neutral(smc, wyckoff, pa, trend, ["No two-strategy consensus"])
 
     # Soft EMA gate — counter-trend trades are allowed but need 3 confirmations
     trend_dir = ("BUY" if trend.trend == "BULLISH" else
@@ -195,13 +195,13 @@ def run_decision_engine(
         _counter_trend,
     )
 
-    # Entry filter — minimum N-of-4 vote gate (SMC always required).
+    # Entry filter — equal-weight N-of-4 consensus; no engine is mandatory.
     # RANGE has a narrower rule than ordinary regimes: SMC plus either
     # Price Action or Wyckoff is sufficient; the global option-1 gate must
     # not turn that dedicated two-confirmation playbook into a three-vote gate.
     is_range_regime = regime.regime == "RANGE"
     ef = apply_entry_filter(
-        smc_signal      = candidate,
+        smc_signal      = smc.smc_signal,
         ema_trend       = trend.trend,
         pa_signal       = pa.pa_signal,
         wyckoff_signal  = wyckoff.wyckoff_signal,
