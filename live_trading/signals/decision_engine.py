@@ -66,13 +66,23 @@ def _range_confirmation_gate(
 
     RANGE keeps its separate edge, fresh sweep, reversal, R:R, and session
     limits. Its signal vote still follows the same equal-weight N-of-4
-    consensus as ordinary entries.
+    consensus as ordinary entries, but the dedicated range playbook requires
+    SMC plus either Price Action or Wyckoff.  Trend alone is not a valid
+    second confirmation for a range reversal.
     """
     if entry_filter.confirmation_count < min_confirmations:
         return (
             False,
             f"RANGE entry blocked: {entry_filter.confirmation_count}/"
             f"{min_confirmations} confirmations",
+        )
+    if not entry_filter.smc or not (
+        entry_filter.price_action or entry_filter.wyckoff
+    ):
+        return (
+            False,
+            "RANGE entry blocked: requires SMC plus Price Action or Wyckoff "
+            "confirmation",
         )
     return True, ""
 
