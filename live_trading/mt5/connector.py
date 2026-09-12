@@ -138,7 +138,7 @@ async def connect(*args, **kwargs) -> bool:
                 "password": password,
                 "server":   host,
                 "connectTimeoutSeconds": 60,
-                "connectToNearestByPing": True,
+                "connectToNearestByPing": "true",
                 "connectTimeoutClusterMemberSeconds": 60,
             },
             timeout=aiohttp.ClientTimeout(total=SYNC_TIMEOUT),
