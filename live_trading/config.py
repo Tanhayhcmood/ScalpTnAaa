@@ -161,10 +161,11 @@ RISK_PERCENT      = _float("RISK_PERCENT",      1.0,  lo=0.01, hi=10.0)
 # both live entry modes.
 NORMAL_MIN_CONFIDENCE = _float("NORMAL_MIN_CONFIDENCE", 47.0, lo=0.0, hi=100.0)
 RANGE_MIN_CONFIDENCE  = _float("RANGE_MIN_CONFIDENCE",  47.0, lo=0.0, hi=100.0)
-# MIN_CONFIRMATIONS=2: SMC (always) + any 1 of (Trend / PA / Wyckoff)
-# for ordinary regimes. RANGE has its own stricter floor below so choppy
-# conditions cannot enter on only two agreeing engines.
-MIN_CONFIRMATIONS = _int("MIN_CONFIRMATIONS",   2,    lo=1,    hi=10)
+# MIN_CONFIRMATIONS=1: one aligned engine may qualify the ordinary entry gate.
+# Confidence, quality, MTF, regime, R:R, and risk gates remain active.
+# RANGE has its own stricter floor below so choppy conditions cannot enter on
+# only one agreeing engine.
+MIN_CONFIRMATIONS = _int("MIN_CONFIRMATIONS",   1,    lo=1,    hi=10)
 # Dedicated RANGE playbook: the edge/sweep/reversal gate is mandatory and the
 # four-engine vote must still meet this minimum. Keep it separate from the
 # global floor so non-RANGE behavior remains unchanged.
@@ -246,7 +247,9 @@ TRADE_TIMEFRAMES  = _trade_timeframes("TRADE_TIMEFRAMES", "M20,M15,M10,5m")
 COMMENT = "GSPv4"
 
 # ── Loop Timing ──────────────────────────────────────────────────────────────
-BAR_CHECK_INTERVAL = 15       # seconds between candle-close checks
+# Poll frequently enough to notice a newly closed M5 candle promptly.  This
+# only checks bar timestamps; signal evaluation still uses closed candles.
+BAR_CHECK_INTERVAL = _int("BAR_CHECK_INTERVAL", 5, lo=1, hi=60)
 RECONNECT_DELAY    = 30       # seconds before reconnect attempt
 SYNC_TIMEOUT       = 120      # seconds to wait for initial connect
 
