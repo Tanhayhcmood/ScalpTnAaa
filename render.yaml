@@ -47,7 +47,7 @@ services:
       - key: RENDER_EXTERNAL_URL
         value: "https://goldscalper-v4-robot.onrender.com"
       - key: MTAPI_URL
-        value: "https://mt5full13.mtapi.io"
+        value: "https://mt5full3.mtapi.io"
       - key: MTAPI_API_KEY
         sync: false
       - key: MT5_HOST

@@ -1,6 +1,5 @@
-
-import asyncio
 import time as _time
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -85,7 +84,7 @@ def _get_session() -> aiohttp.ClientSession:
 
 async def connect(*args, **kwargs) -> bool:
     """
-    Connect to MT5 via the mt5rest HTTP bridge using GET /ConnectEx.
+    Connect to MT5 via the MTAPI Cloud REST API using GET /ConnectEx.
     Returns the connection UUID which is stored in _conn_id.
     """
     global _connected, _base_url, _conn_id, _last_connect_time
@@ -116,6 +115,7 @@ async def connect(*args, **kwargs) -> bool:
                 "user":     user,
                 "password": password,
                 "server":   host,
+                "id":       str(uuid.uuid4()),
                 "connectTimeoutSeconds": 60,
                 "connectToNearestByPing": "true",
                 "connectTimeoutClusterMemberSeconds": 60,
@@ -885,7 +885,7 @@ def mt5_pos_to_dict(pos: dict) -> dict:
 
 
 async def get_current_quote(symbol: str) -> dict:
-    """Fetch the current bid/ask price via GET /GetQuote.
+    """Fetch the current bid/ask price via GET /Quote.
 
     Used by the staircase trailing-stop engine, which needs a live price
     between M5 candle closes (candles only give the price as of the last
@@ -919,12 +919,12 @@ async def get_current_quote(symbol: str) -> dict:
 
                 if attempt == 0:
                     log.warning(
-                        f"GetQuote unexpected response (stale conn_id?) "
+                        f"Quote unexpected response (stale conn_id?) "
                         f"— reconnecting and retrying. Response: {str(data)[:200]}"
                     )
                     _invalidate_connection()
                     continue
-                log.warning(f"GetQuote failed after reconnect: {str(data)[:200]}")
+                log.warning(f"Quote failed after reconnect: {str(data)[:200]}")
                 return {}
         except Exception as exc:
             if attempt == 0:
