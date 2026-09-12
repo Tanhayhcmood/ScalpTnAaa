@@ -31,6 +31,7 @@ from typing import List, Optional
 
 from live_trading.config import (
     SYMBOL, TIMEFRAME, CANDLE_WINDOW, RISK_PERCENT,
+    MT5_HOST, MT5_USER,
     MAX_OPEN_TRADES, COMMENT,
     BAR_CHECK_INTERVAL, RECONNECT_DELAY, SYNC_TIMEOUT,
     MIN_CONFIRMATIONS, REQUIRE_PRICE_ACTION,
@@ -62,6 +63,7 @@ from live_trading.mt5.connector import (
     connect_with_retry, keepalive_mtapi,
     start_connection_watchdog, start_mt5_session_keepalive,
     fetch_candles, get_account_balance, get_account_info,
+    check_symbol_available,
     get_open_positions, get_last_completed_bar_time,
     get_current_quote, get_closed_position_history, mt5_pos_to_dict,
 )
@@ -262,7 +264,7 @@ class GoldScalperLive:
 
     async def start(self) -> bool:
         log.info("=" * 60)
-        log.info("  GoldScalperPro v4 — LIVE TRADING ENGINE (mt5rest)")
+        log.info("  GoldScalperPro v4 — LIVE TRADING ENGINE (MTAPI)")
         log.info(f"  Symbol: {SYMBOL}  |  Trade TFs: {chr(44).join(TRADE_TIMEFRAMES)} (highest first)")
         log.info(f"  Risk: {RISK_PERCENT}%  |  Max positions: {MAX_OPEN_TRADES}")
         log.info(f"  Min confirmations: {MIN_CONFIRMATIONS}")
@@ -278,13 +280,38 @@ class GoldScalperLive:
 
         connected = await connect_with_retry(max_attempts=12, retry_delay=30.0)
         if not connected:
-            log.error("Could not connect to MT5 via mt5rest bridge after all retry attempts. "
-                      "Check MTAPI_URL, MT5_USER, and MT5_PASSWORD.")
+            log.error(
+                "MTAPI connection failure after all retry attempts. "
+                "Check MTAPI_URL, MT5_HOST, MT5_PORT, MT5_USER, and MT5_PASSWORD."
+            )
             self._write_state("DISCONNECTED",
-                              extra={"error": "mt5rest connection failed after retries"})
+                              extra={"error": "MTAPI connection failed after retries"})
             return False  # non-False return signals failure to main.py for sys.exit(1)
 
-        # ── MTAPI keepalive task — prevents Render free-tier sleep ─────────────
+        # ── Read-only broker checks — no order is placed here ──────────────────
+        if not await check_symbol_available(SYMBOL):
+            self._write_state(
+                "DISCONNECTED",
+                extra={"error": f"{SYMBOL} is not available through MTAPI"},
+            )
+            return False
+
+        quote = await get_current_quote(SYMBOL)
+        if quote:
+            log.info(
+                f"{SYMBOL} market data: AVAILABLE "
+                f"(bid={quote['bid']}, ask={quote['ask']})"
+            )
+        else:
+            # A closed market can have no current quote even when the symbol
+            # and its historical data are available. Do not block a deployment
+            # solely because the broker is outside trading hours.
+            log.warning(
+                f"{SYMBOL} market data: symbol is available but no live quote "
+                "was returned; the market may be closed"
+            )
+
+        # ── MTAPI keepalive task ───────────────────────────────────────────────
         # Store the handle so we can cancel it when the engine stops; without
         # this, the task becomes orphaned on every supervisor-driven restart and
         # multiple background pings accumulate across restarts.
@@ -320,9 +347,18 @@ class GoldScalperLive:
             acc_info = await get_account_info()
             if acc_info:
                 self._last_acc_info = acc_info
+                log.info(
+                    "MT5 account connection status: CONNECTED "
+                    f"(account={str(acc_info.get('login') or MT5_USER)[:3]}***, "
+                    f"host={acc_info.get('server') or MT5_HOST}, "
+                    f"balance={float(acc_info.get('balance', 0.0)):.2f}, "
+                    f"equity={float(acc_info.get('equity', 0.0)):.2f})"
+                )
                 _live_login  = str(acc_info.get("login",  ""))
                 _live_server = str(acc_info.get("server", ""))
                 self.guardian.set_account_identity(_live_login, _live_server)
+            else:
+                log.warning("MT5 account connection status: CONNECTED but account summary unavailable")
 
             _guardian_restored = False
             try:
@@ -1192,7 +1228,7 @@ class GoldScalperLive:
             self._set_trade_permission(
                 True,
                 "ORDER_PLACED",
-                ["Order accepted by the MT5 bridge"],
+                ["Order accepted by MTAPI"],
             )
             # Block all further _on_new_bar calls in this tick from opening
             # another position (covers the multi-TF same-bar-boundary race).
@@ -1639,7 +1675,7 @@ class GoldScalperLive:
             clear_command("restart_engine")
 
         # "restart_mt5" — sent by Telegram panel Restart MT5 button.
-        # Disconnects from the mt5rest bridge so the main loop reconnects
+        # Disconnects from MTAPI so the main loop reconnects
         # immediately (reconnect_attempts reset so no exponential backoff delay).
         if cmds.get("restart_mt5"):
             log.info(

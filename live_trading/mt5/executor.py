@@ -1,7 +1,7 @@
 """
-mt5rest Order Executor – GoldScalperPro v4
+MTAPI Order Executor – GoldScalperPro v4
 
-Places and closes MT5 orders via the mt5rest bridge HTTP API.
+Places and closes MT5 orders via the official MTAPI REST API.
 
 Endpoints used:
     GET /OrderSendSafe   – place a market order
@@ -45,7 +45,7 @@ def _normalise_lot(lot: float,
 
 
 def _is_error(data: dict) -> bool:
-    """mt5rest returns {message, code, stackTrace} on errors."""
+    """MTAPI returns {message, code, stackTrace} on errors."""
     return isinstance(data, dict) and "code" in data and "stackTrace" in data
 
 
@@ -63,7 +63,7 @@ async def place_market_order(
     base    = get_connection()
     conn_id = get_conn_id()
     if not base or not conn_id:
-        return TradeResult(False, None, "Not connected to mt5rest bridge")
+        return TradeResult(False, None, "Not connected to MTAPI")
 
     normalized_direction = direction.upper().strip()
     if normalized_direction not in {"BUY", "SELL"}:
@@ -101,14 +101,14 @@ async def place_market_order(
 
             if _is_error(data):
                 msg = data.get("message", f"code={data.get('code','?')}")
-                log.error(f"OrderSendSafe error: {msg}")
+                log.error(f"MTAPI order execution result: FAILED — {msg}")
                 return TradeResult(False, None, msg)
 
             ticket = data.get("ticket") if isinstance(data, dict) else None
             if ticket is not None and resp.status == 200:
                 pos_id = str(ticket)
                 log.info(
-                    f"Trade opened  ticket={pos_id}  "
+                    f"MTAPI order execution result: SUCCESS — ticket={pos_id}  "
                     f"{normalized_direction} {lot} lots  SL={sl}  TP={tp}"
                 )
                 return TradeResult(True, pos_id, "OK", pos_id)
@@ -128,7 +128,7 @@ async def close_position(position_id: str, deviation: int = 30, **kwargs) -> Tra
     base    = get_connection()
     conn_id = get_conn_id()
     if not base or not conn_id:
-        return TradeResult(False, None, "Not connected to mt5rest bridge")
+        return TradeResult(False, None, "Not connected to MTAPI")
 
     try:
         sess = _get_session()
@@ -145,11 +145,11 @@ async def close_position(position_id: str, deviation: int = 30, **kwargs) -> Tra
 
             if _is_error(data):
                 msg = data.get("message", f"code={data.get('code','?')}")
-                log.error(f"OrderCloseSafe error: {msg}")
+                log.error(f"MTAPI close execution result: FAILED — {msg}")
                 return TradeResult(False, None, msg)
 
             if resp.status == 200:
-                log.info(f"Position {position_id} closed")
+                log.info(f"MTAPI close execution result: SUCCESS — position {position_id} closed")
                 return TradeResult(True, position_id, "Closed")
 
             msg = f"Unexpected response (status={resp.status}): {str(data)[:200]}"
@@ -169,7 +169,7 @@ async def modify_position(
     base    = get_connection()
     conn_id = get_conn_id()
     if not base or not conn_id:
-        return TradeResult(False, None, "Not connected to mt5rest bridge")
+        return TradeResult(False, None, "Not connected to MTAPI")
 
     try:
         sess = _get_session()
@@ -187,11 +187,14 @@ async def modify_position(
 
             if _is_error(data):
                 msg = data.get("message", f"code={data.get('code','?')}")
-                log.error(f"OrderModifySafe error: {msg}")
+                log.error(f"MTAPI modify execution result: FAILED — {msg}")
                 return TradeResult(False, None, msg)
 
             if resp.status == 200:
-                log.info(f"Position {position_id} modified  SL={sl}  TP={tp}")
+                log.info(
+                    f"MTAPI modify execution result: SUCCESS — "
+                    f"position {position_id}  SL={sl}  TP={tp}"
+                )
                 return TradeResult(True, position_id, "Modified")
 
             msg = f"Unexpected response (status={resp.status}): {str(data)[:200]}"

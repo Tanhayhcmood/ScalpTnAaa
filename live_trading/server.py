@@ -53,8 +53,9 @@ _HEARTBEAT_MAX_AGE_SECONDS = 180
 
 # Self-ping keepalive: ping /health every 8 minutes so Render free-tier
 # services never spin down.  10 min < Render's 15-min inactivity threshold.
-# Also pings the mt5rest Docker bridge (ger-mtapi) so it stays alive
-# even during robot crash/restart cycles when the live loop keepalive is paused.
+# The live loop keeps the MTAPI broker session alive through
+# /ConnectionStatus. The hosted MTAPI service does not expose the old
+# self-hosted bridge's /Ping endpoint.
 _KEEPALIVE_INTERVAL_SECONDS = 360  # 6 minutes — safer margin: 3 pings before Render 15-min sleep
 
 
@@ -524,18 +525,12 @@ async def _run_health_server():
 
 
 async def _keepalive():
-    """External-ping /health and mtapi /Ping every 8 min to prevent Render free-tier sleep.
+    """External-ping /health every 6 min to prevent Render free-tier sleep.
 
     Render spins down free-tier web services after 15 minutes of inactivity.
     The inactivity timer is reset only by EXTERNAL HTTP requests routed through
     Render's edge — localhost / 127.0.0.1 requests bypass the edge entirely and
     do NOT reset the timer.
-
-    FIX: Also pings the mt5rest Docker bridge (ger-mtapi) so it stays
-    alive even during robot crash/restart cycles when the live-loop's own
-    keepalive task is not running.  Without this the bridge goes to sleep during
-    the supervisor's backoff window, causing 60-90s wakeup delays on every retry
-    and a continuous Connection Lost / Connection Restored loop in the panel.
 
     We read RENDER_EXTERNAL_URL (set in render.yaml) for the external URL.
     Fallback: localhost (only effective when running locally, not on Render).
@@ -543,11 +538,10 @@ async def _keepalive():
     await asyncio.sleep(30)
     import aiohttp
     external_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
-    mtapi_url    = os.environ.get("MTAPI_URL", "").rstrip("/")
 
     own_url = f"{external_url}/health" if external_url else f"http://127.0.0.1:{PORT}/health"
     print(
-        f"[keepalive] robot={own_url}  mtapi={mtapi_url or '(not set)'}  "
+        f"[keepalive] robot={own_url}  "
         f"interval={_KEEPALIVE_INTERVAL_SECONDS}s",
         flush=True,
     )
@@ -565,41 +559,6 @@ async def _keepalive():
                     print(f"[keepalive] robot /health → {resp.status}", flush=True)
             except Exception as exc:
                 print(f"[keepalive] robot /health failed: {exc}", flush=True)
-
-            # 2. Ping mtapi /Ping to keep the mt5rest Docker bridge alive.
-            # Retry up to 3 times with 30 s between attempts: if the first ping
-            # hits the Docker container while Wine is initialising (returning a
-            # non-200), the retry gives it time to finish startup rather than
-            # silently failing and leaving the service on the edge of sleeping.
-            if mtapi_url:
-                ping_url = f"{mtapi_url}/Ping"
-                _mtapi_ok = False
-                for _attempt in range(1, 4):
-                    try:
-                        async with session.get(
-                            ping_url, timeout=aiohttp.ClientTimeout(total=30)
-                        ) as resp:
-                            print(
-                                f"[keepalive] mtapi /Ping (attempt {_attempt}) → {resp.status}",
-                                flush=True,
-                            )
-                            if resp.status == 200:
-                                _mtapi_ok = True
-                                break
-                    except Exception as exc:
-                        print(
-                            f"[keepalive] mtapi /Ping (attempt {_attempt}) failed: {exc}",
-                            flush=True,
-                        )
-                    if _attempt < 3:
-                        await asyncio.sleep(30)
-                if not _mtapi_ok:
-                    print(
-                        "[keepalive] mtapi /Ping failed all 3 attempts — "
-                        "bridge may be cold-starting (Wine); next cycle in "
-                        f"{_KEEPALIVE_INTERVAL_SECONDS}s",
-                        flush=True,
-                    )
 
             await asyncio.sleep(_KEEPALIVE_INTERVAL_SECONDS)
     finally:

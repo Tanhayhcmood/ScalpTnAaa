@@ -1,15 +1,14 @@
 """
-GoldScalperPro v4 – Live Trading Entry Point (mt5rest / Linux-compatible)
+ GoldScalperPro v4 – Live Trading Entry Point (MTAPI / Linux-compatible)
 
-Direct MT5 connection via the mt5rest Docker bridge – no MetaAPI cloud needed.
+Direct MT5 connection via the official MTAPI REST API.
 
 Usage:
     python -m live_trading.main
 
 Required environment variables:
-    MTAPI_URL      – URL of your mt5rest Docker service on Render
-                     (e.g. https://ger-mtapi.onrender.com)
-    MT5_HOST       – broker server name (e.g. AMarkets-Demo)
+    MTAPI_URL      – normally https://mt5.mtapi.io
+    MT5_HOST       – broker host/IP
     MT5_USER       – MT5 account login number
     MT5_PASSWORD   – MT5 account password
 
@@ -45,19 +44,19 @@ log = get_logger()
 
 async def _main() -> None:
     missing = []
-    if not MTAPI_URL:
-        missing.append("MTAPI_URL")
     if not MT5_USER:
         missing.append("MT5_USER")
     if not MT5_PASSWORD:
         missing.append("MT5_PASSWORD")
+    if not MT5_HOST:
+        missing.append("MT5_HOST")
 
     if missing:
         for var in missing:
             log.error(f"Environment variable {var} is not set.")
         log.error(
             "Set the missing variables in the Render dashboard -> Environment. "
-            "MTAPI_URL must point to the mt5rest Docker service URL."
+            "MTAPI_URL defaults to the official MTAPI service."
         )
         sys.exit(1)
 
@@ -65,7 +64,7 @@ async def _main() -> None:
     # Mask account number: show only first 3 chars to avoid leaking credentials in logs.
     _masked_user = (MT5_USER[:3] + "***") if len(MT5_USER) > 3 else "***"
     log.info(f"MT5 user   : {_masked_user}")
-    log.info(f"mt5rest URL: {MTAPI_URL}")
+    log.info(f"MTAPI URL: {MTAPI_URL}")
 
     engine = GoldScalperLive()
     connected = await engine.start()

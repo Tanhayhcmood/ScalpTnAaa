@@ -1,18 +1,16 @@
-"""Regression tests for mt5rest ConnectEx query parameters."""
+"""Regression tests for the official MTAPI Connect query parameters."""
 
 
-def test_connect_ex_boolean_flags_are_query_string_values():
+def test_connect_params_use_official_connect_fields():
     from live_trading.mt5.connector import _connect_params
 
-    params = _connect_params("123", "secret", "AMarkets-Demo")
+    params = _connect_params("123", "secret", "broker.example", 443)
 
-    assert params["downloadOrderHistory"] == "true"
-    assert params["reconnectOnSymbolUpdate"] == "true"
+    assert params["user"] == "123"
+    assert params["password"] == "secret"
+    assert params["host"] == "broker.example"
+    assert params["port"] == 443
     assert params["errorReplyStatusCode"] == 400
-    assert all(not isinstance(params[name], bool) for name in (
-        "downloadOrderHistory",
-        "reconnectOnSymbolUpdate",
-    ))
 
 
 def test_connection_status_accepts_boolean_and_string_true_values():

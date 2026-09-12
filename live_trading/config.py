@@ -5,7 +5,7 @@ All settings are read from environment variables so they can be changed
 on Render without touching code.
 
 Required:
-    MTAPI_URL     – URL of the mt5rest Docker service on Render
+    MTAPI_URL     – official MTAPI REST API URL (normally https://mt5.mtapi.io)
     MT5_HOST      – broker server name (e.g. AMarkets-Demo)
     MT5_USER      – MT5 account login number
     MT5_PASSWORD  – MT5 account password
@@ -133,8 +133,8 @@ def _timeframe(name: str, default: str) -> str:
     return val
 
 
-# ── MT5 bridge URL ────────────────────────────────────────────────────────────
-MTAPI_URL     = os.getenv("MTAPI_URL",     "")
+# ── Official MTAPI URL ────────────────────────────────────────────────────────
+MTAPI_URL     = os.getenv("MTAPI_URL",     "https://mt5.mtapi.io").rstrip("/")
 
 # ── MT5 Broker Credentials ───────────────────────────────────────────────────
 MT5_HOST      = os.getenv("MT5_HOST",     "AMarkets-Demo")

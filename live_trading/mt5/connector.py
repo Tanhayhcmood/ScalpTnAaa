@@ -1,18 +1,18 @@
 """
-mt5rest HTTP Connector – GoldScalperPro v4
+MTAPI MT5 REST Connector – GoldScalperPro v4
 
-Direct MT5 connection via the mt5rest Docker bridge (no MetaAPI cloud).
-Runs fully self-hosted on Render.
+Connects directly to the official MTAPI hosted REST API.  The token returned
+by ``/Connect`` is held in memory and passed as ``id`` to every later request.
 
 Required env vars:
-    MTAPI_URL     – URL of the mt5rest Docker service
-                    e.g. https://ger-mtapi.onrender.com
-    MT5_HOST      – broker server name  (e.g. AMarkets-Demo)
+    MTAPI_URL     – normally https://mt5.mtapi.io
+    MT5_HOST      – broker host/IP accepted by MTAPI
+    MT5_PORT      – broker port, normally 443
     MT5_USER      – MT5 account login number
     MT5_PASSWORD  – MT5 account password
 
-mt5rest endpoints used:
-    GET  /ConnectEx        – authenticate with broker, returns UUID conn id
+MTAPI endpoints used:
+    GET  /Connect          – authenticate with broker, returns session token
     GET  /Disconnect       – close connection
     GET  /ConnectionStatus – check live connection
     GET  /AccountSummary   – balance, equity, margin
@@ -20,12 +20,11 @@ mt5rest endpoints used:
     GET  /HistoryPositions – completed positions by ticket
     GET  /PriceHistoryV2   – OHLCV candles (ISO datetime range)
     GET  /GetQuote         – current bid/ask price
-    GET  /Ping             – liveness probe
+    GET  /SymbolList       – verify the configured instrument is available
 """
 
 import asyncio
 import math
-import os
 import time as _time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -46,19 +45,16 @@ log = get_logger()
 _session:    Optional[aiohttp.ClientSession] = None
 _connected:  bool = False
 _base_url:   str  = ""
-_conn_id:    str  = ""   # UUID returned by ConnectEx; passed to every call
+_conn_id:    str  = ""   # Token returned by Connect; passed to every call
 _last_connect_time: float = 0.0   # monotonic timestamp of last successful connect()
 
-# After a fresh ConnectEx the mt5rest bridge may take a few seconds to report
+# After a fresh Connect the MTAPI service may take a few seconds to report
 # isConnected=true on ConnectionStatus.  During this window ensure_connected()
 # would wrongly declare DISCONNECTED and trigger an immediate reconnect loop.
 # The grace period suppresses that false failure.
 _CONNECT_GRACE_PERIOD: float = 150.0  # seconds — ROOT-CAUSE FIX: Wine cold-start on Render free tier
 # takes 60-90 s, plus 30-60 s for the service to wake from sleep, totalling up
-# to 150 s before isConnected=true is reliable.  90 s was too short: the grace
-# period expired mid-startup, causing ensure_connected() to detect a false
-# DISCONNECTED and trigger an immediate reconnect that aborted the in-progress
-# ConnectEx — producing the continuous 'Connection Lost' loop in the panel.
+# to 150 s before isConnected=true is reliable.
 _CONNECT_READY_POLL_INITIAL_S: float = 2.0
 _CONNECT_READY_POLL_MAX_S: float = 15.0
 
@@ -73,37 +69,28 @@ _reconnect_lock: asyncio.Lock | None = None
 # be cancelled cleanly on shutdown.
 _watchdog_task: asyncio.Task | None = None
 
-# MT5 broker-session keepalive: pings /ConnectionStatus with the actual conn_id
+# MT5 broker-session keepalive: pings /ConnectionStatus with the actual token
 # every _MT5_KEEPALIVE_INTERVAL_S seconds so the broker socket stays open.
-# Completely separate from the HTTP-bridge /Ping in server.py.
+# Separate from the robot health endpoint in server.py.
 _MT5_KEEPALIVE_TASK: asyncio.Task | None = None
 _MT5_KEEPALIVE_INTERVAL_S:    float = 180.0    # 3 min  — keep broker session alive
 _MT5_SESSION_REFRESH_AGE_S:   float = 14400.0  # 4 hours — proactively refresh conn_id
 
 
-def _connect_params(user: str, password: str, host: str) -> dict[str, object]:
-    """Build query parameters accepted by mt5rest's ConnectEx endpoint.
-
-    aiohttp encodes query parameters through ``str()`` for most values, but
-    mt5rest validates the values before routing and rejects Python booleans
-    with HTTP 500. Keep the flags as explicit lowercase query-string values
-    so the request is valid for both the current bridge and older versions.
-    """
+def _connect_params(
+    user: str,
+    password: str,
+    host: str,
+    port: int = 443,
+) -> dict[str, object]:
+    """Build query parameters for the official MTAPI ``/Connect`` endpoint."""
     return {
         "user": user,
         "password": password,
-        "server": host,
+        "host": host,
+        "port": port,
         "connectTimeoutSeconds": 60,
-        # Never allow a broker-login error to come back as HTTP 201.  The
-        # client treats 200/201 as a successful connection response; returning
-        # an error payload with 201 makes that JSON object become conn_id and
-        # starts a reconnect/scan loop with a session that does not exist.
         "errorReplyStatusCode": 400,
-        # The panel's trade history is backed by the same MT5 session. Ask
-        # mt5rest to download it during ConnectEx so closed trades are
-        # available immediately after reconnects.
-        "downloadOrderHistory": "true",
-        "reconnectOnSymbolUpdate": "true",
     }
 
 
@@ -115,7 +102,7 @@ def _get_reconnect_lock() -> asyncio.Lock:
     return _reconnect_lock
 
 
-# ── Timeframe map  (label → mt5rest integer minutes) ─────────────────────────
+# ── Timeframe map  (label → MTAPI integer minutes) ────────────────────────────
 _TF_MAP = {
     "1m":  1,   "5m":  5,   "10m": 10,  "15m": 15,  "20m": 20,  "30m": 30,
     "1h":  60,  "4h":  240, "1d":  1440,
@@ -125,7 +112,7 @@ _TF_MAP = {
 
 
 def _parse_candle_time(value: object) -> Optional[datetime]:
-    """Parse a mt5rest candle timestamp into an aware UTC datetime."""
+    """Parse an MTAPI candle timestamp into an aware UTC datetime."""
     raw = str(value).strip()
     if not raw:
         return None
@@ -165,7 +152,7 @@ def _completed_candles(
 ) -> List[OHLCV]:
     """Keep chronologically ordered, completed candles.
 
-    The mt5rest ``time`` field is the candle open time. For H1, checking the
+    The MTAPI ``time`` field is the candle open time. For H1, checking the
     calculated close time avoids dropping a valid last candle just because the
     bridge returned only closed history, while also preventing an in-progress
     candle from entering the EMA calculation.
@@ -218,7 +205,7 @@ async def _wait_for_broker_ready(
 ) -> bool:
     """Wait until a newly-created MT5 session is actually broker-ready.
 
-    mt5rest can return a UUID before Wine/MT5 has finished opening the broker
+    MTAPI can return a token before the broker session has finished opening
     socket.  Treating that UUID as connected makes the first AccountSummary or
     PriceHistoryV2 call fail, which invalidates the session and starts a
     reconnect storm.  Polling the same session until ConnectionStatus confirms
@@ -261,8 +248,9 @@ async def _wait_for_broker_ready(
 
 async def connect(*args, **kwargs) -> bool:
     """
-    Connect to MT5 via the mt5rest HTTP bridge using GET /ConnectEx.
-    Returns the connection UUID which is stored in _conn_id.
+    Connect to MT5 through the official MTAPI REST API using GET /Connect.
+    The returned session token is stored in memory and reused for subsequent
+    requests.  No token or password is written to logs.
     """
     global _connected, _base_url, _conn_id, _last_connect_time
 
@@ -270,103 +258,45 @@ async def connect(*args, **kwargs) -> bool:
     host     = MT5_HOST
     user     = MT5_USER.strip() if MT5_USER else ""
     password = MT5_PASSWORD.strip() if MT5_PASSWORD else ""
-    session_token = os.environ.get("MT5_TOKEN", "").strip()
 
     if not base:
-        log.error(
-            "MTAPI_URL is not set. "
-            "Deploy the mt5rest Docker service and set MTAPI_URL to its URL."
-        )
+        log.error("MTAPI_URL is not set. Set it to https://mt5.mtapi.io.")
         return False
-    if not session_token and (not user or not password):
-        log.error("MT5_USER and MT5_PASSWORD must be set unless MT5_TOKEN is configured.")
+    if not user or not password or not host:
+        log.error("MT5_USER, MT5_PASSWORD, and MT5_HOST must be set for MTAPI /Connect.")
         return False
 
     previous_conn_id = _conn_id
     previous_connected = _connected
     _base_url = base
     sess = _get_session()
-
-    # Prefer HTTP Basic Auth for the current mt5rest bridge. If an older bridge
-    # rejects it, the existing query-param flow below remains as a compatibility fallback.
-    if not session_token:
-        try:
-            log.info(f"Connecting to MT5 via mt5rest at {base} (Basic Auth) ...")
-            async with sess.get(
-                f"{base}/ConnectEx",
-                params={
-                    "server": host,
-                    "connectTimeoutSeconds": 60,
-                    "errorReplyStatusCode": 400,
-                },
-                auth=aiohttp.BasicAuth(user, password),
-                timeout=aiohttp.ClientTimeout(total=SYNC_TIMEOUT),
-            ) as resp:
-                raw = await resp.text()
-                if resp.status in (200, 201):
-                    candidate_id = raw.strip().strip('"')
-                    if candidate_id and len(candidate_id) >= 10:
-                        if await _wait_for_broker_ready(base, candidate_id):
-                            _conn_id = candidate_id
-                            _connected = True
-                            _last_connect_time = _time.monotonic()
-                            if previous_conn_id and previous_conn_id != candidate_id:
-                                try:
-                                    async with sess.get(
-                                        f"{base}/Disconnect",
-                                        params={"id": previous_conn_id},
-                                        timeout=aiohttp.ClientTimeout(total=10),
-                                    ):
-                                        pass
-                                except Exception as exc:
-                                    log.debug(f"Previous MT5 session cleanup skipped: {exc}")
-                            log.info(f"MT5 connected (Basic Auth) – broker: {host}  user: {user}  conn_id: {candidate_id}")
-                            return True
-                        try:
-                            async with sess.get(
-                                f"{base}/Disconnect",
-                                params={"id": candidate_id},
-                                timeout=aiohttp.ClientTimeout(total=10),
-                            ):
-                                pass
-                        except Exception:
-                            pass
-                    else:
-                        log.warning(f"ConnectEx (Basic Auth) returned unexpected value: {raw[:200]}")
-                log.warning(f"ConnectEx (Basic Auth) returned HTTP {resp.status}; trying compatibility fallback")
-        except Exception as exc:
-            log.warning(f"ConnectEx (Basic Auth) attempt failed; trying compatibility fallback: {exc}")
     try:
-        endpoint = "ConnectByToken" if session_token else "ConnectEx"
-        request_params = (
-            {"id": session_token, "connectTimeoutSeconds": 60, "errorReplyStatusCode": 400}
-            if session_token else _connect_params(user, password, host)
+        log.info(
+            f"MTAPI connection attempt: {base}/Connect "
+            f"(host={host}, port={MT5_PORT}, account={user[:3]}***)"
         )
-        log.info(f"Connecting to MT5 via mt5rest at {base}/{endpoint} ...")
         async with sess.get(
-            f"{base}/{endpoint}",
-            params=request_params,
+            f"{base}/Connect",
+            params=_connect_params(user, password, host, MT5_PORT),
             timeout=aiohttp.ClientTimeout(total=SYNC_TIMEOUT),
         ) as resp:
             raw = await resp.text()
-            log.debug(f"{endpoint} response ({resp.status}): [response received]")
+            log.debug(f"MTAPI /Connect response ({resp.status}): [response received]")
 
-            if resp.status not in (200, 201):
-                log.error(f"{endpoint} failed (status={resp.status}): {raw[:300]}")
+            if resp.status != 200:
+                log.error(f"MTAPI /Connect failed (status={resp.status}): {raw[:300]}")
                 _connected = False
                 return False
 
-            # Response is a plain UUID string (may be quoted JSON string or raw)
+            # Response is a plain token string (may be a quoted JSON string).
             conn_id = raw.strip().strip('"')
             if not conn_id or len(conn_id) < 10:
-                log.error(f"ConnectEx returned unexpected value: {raw[:200]}")
+                log.error(f"MTAPI /Connect returned an unexpected token: {raw[:200]}")
                 _connected = False
                 return False
 
-            # Do not publish the candidate globally until the broker socket is
-            # genuinely ready.  ConnectEx may return before Wine/MT5 finishes
-            # its broker login, and publishing the UUID here causes the first
-            # AccountSummary call to invalidate a perfectly usable session.
+            # Do not publish the candidate globally until MTAPI confirms that
+            # the broker socket is genuinely ready.
             if not await _wait_for_broker_ready(base, conn_id):
                 try:
                     async with sess.get(
@@ -384,11 +314,13 @@ async def connect(*args, **kwargs) -> bool:
             _conn_id   = conn_id
             _connected = True
             _last_connect_time = _time.monotonic()
-            log.info(f"MT5 connected – broker: {host}  user: {user}  conn_id: {conn_id}")
+            log.info(
+                f"MTAPI connection success: MT5 account connected "
+                f"(host={host}, port={MT5_PORT}, account={user[:3]}***)"
+            )
 
             # A proactive refresh replaces an old session only after the new
-            # one is ready, avoiding a gap in the trading loop.  Best-effort
-            # cleanup prevents stale sessions accumulating in the bridge.
+            # one is ready. Best-effort cleanup prevents stale sessions.
             if previous_conn_id and previous_conn_id != conn_id:
                 try:
                     async with sess.get(
@@ -402,13 +334,13 @@ async def connect(*args, **kwargs) -> bool:
             return True
 
     except Exception as exc:
-        log.error(f"MT5 connect error: {exc}")
+        log.error(f"MTAPI connection failure: {exc}")
         _connected = False
         return False
 
 
 async def disconnect() -> None:
-    """Close the bridge connection and always release the HTTP session."""
+    """Close the MTAPI connection and always release the HTTP session."""
     global _connected, _session, _conn_id, _base_url
 
     conn_id = _conn_id
@@ -443,33 +375,34 @@ async def disconnect() -> None:
 
 async def keepalive_mtapi() -> bool:
     """
-    Ping the mt5rest bridge to prevent Render free-tier sleep (every ~10 min).
-    Returns True if the bridge responded, False otherwise.
+    Ping the active MTAPI broker session with ConnectionStatus.
+    Returns True if the session is alive, False otherwise.
     """
-    base = MTAPI_URL.rstrip("/") if MTAPI_URL else ""
-    if not base:
+    if not _base_url or not _conn_id:
         return False
     try:
         sess = _get_session()
         async with sess.get(
-            f"{base}/Ping",
+            f"{_base_url}/ConnectionStatus",
+            params={"id": _conn_id},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
-            ok = resp.status == 200
+            data = await resp.json(content_type=None)
+            ok = resp.status == 200 and _connection_status_is_alive(data)
             if ok:
-                log.debug("MTAPI keepalive ping OK")
+                log.debug("MTAPI broker-session keepalive OK")
             else:
-                log.warning(f"MTAPI keepalive ping returned {resp.status}")
+                log.warning(f"MTAPI broker-session keepalive returned {resp.status}")
             return ok
     except Exception as exc:
-        log.warning(f"MTAPI keepalive ping failed: {exc}")
+        log.warning(f"MTAPI broker-session keepalive failed: {exc}")
         return False
 
 
 async def connect_with_retry(max_attempts: int = 5, retry_delay: float = 60.0) -> bool:
     """
     Connect to MT5, retrying up to max_attempts times.
-    On Render free tier the mt5rest bridge may be sleeping and need 60-90s to cold-start.
+    MTAPI may need time to complete the broker login.
     """
     for attempt in range(1, max_attempts + 1):
         log.info(f"MT5 connect attempt {attempt}/{max_attempts} ...")
@@ -479,17 +412,16 @@ async def connect_with_retry(max_attempts: int = 5, retry_delay: float = 60.0) -
         if attempt < max_attempts:
             log.warning(
                 f"MT5 connect failed (attempt {attempt}). "
-                f"Waiting {retry_delay}s for mt5rest bridge to wake up ..."
+                f"Waiting {retry_delay}s before the next MTAPI connection attempt ..."
             )
             await asyncio.sleep(retry_delay)
     log.error(f"MT5 connect failed after {max_attempts} attempts.")
     return False
 def _invalidate_connection() -> None:
-    """Mark the current conn_id as stale so the next API call triggers a fresh ConnectEx.
+    """Mark the current session token as stale so the next API call triggers /Connect.
 
     Called whenever an API endpoint returns an error-shaped response that indicates
-    the conn_id is no longer recognised by the mt5rest bridge (e.g. after a bridge
-    restart or broker-side session timeout on Render free tier).
+    the token is no longer recognised by MTAPI or the broker session timed out.
     """
     global _connected, _conn_id
     log.warning("MT5 conn_id is stale — invalidating connection (will reconnect on retry)")
@@ -510,7 +442,7 @@ async def ensure_connected(*args, **kwargs) -> bool:
     """
     global _connected
 
-    # Grace period: right after a fresh ConnectEx the mt5rest bridge takes a
+    # Grace period: right after a fresh /Connect the MTAPI service takes a
     # few seconds to report isConnected=true on ConnectionStatus.  Trusting the
     # module flag during this window prevents a false DISCONNECTED that would
     # otherwise trigger an immediate reconnect loop on every startup.
@@ -528,7 +460,7 @@ async def ensure_connected(*args, **kwargs) -> bool:
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 data = await resp.json(content_type=None)
-                if isinstance(data, dict) and data.get("isConnected"):
+                if _connection_status_is_alive(data):
                     _connected = True
                     return True
         except Exception:
@@ -538,7 +470,7 @@ async def ensure_connected(*args, **kwargs) -> bool:
     lock = _get_reconnect_lock()
     if lock.locked():
         # Another coroutine is already reconnecting — wait for it and return
-        # its result rather than firing a second parallel ConnectEx.
+        # its result rather than firing a second parallel /Connect.
         log.debug("MT5 reconnect already in progress — waiting for result …")
         async with lock:
             return _connected  # populated by the coroutine that held the lock
@@ -591,7 +523,7 @@ async def start_connection_watchdog(interval_seconds: float = 30.0) -> None:
                         timeout=aiohttp.ClientTimeout(total=8),
                     ) as resp:
                         data = await resp.json(content_type=None)
-                        if isinstance(data, dict) and data.get("isConnected"):
+                        if _connection_status_is_alive(data):
                             _watchdog_consec_failures = 0  # reset on success
                         else:
                             _watchdog_consec_failures += 1
@@ -634,19 +566,17 @@ async def start_mt5_session_keepalive(
     """
     MT5 Broker-Session Keepalive — GoldScalperPro v4.
 
-    The MTAPI /Ping (called from server.py) keeps the HTTP bridge process
-    alive on Render free-tier, but does NOT send any traffic to the MT5
-    broker socket.  After extended inactivity the broker can terminate the
-    session, invalidating the conn_id and triggering a "Connection Lost"
-    alert even though the HTTP bridge itself is healthy.
+    The robot health endpoint is separate from the MT5 broker session. After
+    extended inactivity the broker can terminate the session, invalidating the
+    token and triggering a "Connection Lost" alert even though the API is up.
 
     This task fixes that by:
-      1. Every `interval_s` seconds: calling /ConnectionStatus with the
-         real conn_id, which flushes traffic through the MT5 broker socket
+       1. Every `interval_s` seconds: calling /ConnectionStatus with the
+          real token, which flushes traffic through the MT5 broker socket
          and resets any broker-side inactivity timer.
-      2. Proactive conn_id refresh: if the session is older than
-         `refresh_age_s` (default 4 h), calls ConnectEx to get a fresh
-         UUID before the broker can expire it.
+       2. Proactive session refresh: if the session is older than
+          `refresh_age_s` (default 4 h), calls /Connect to get a fresh token
+          before the broker can expire it.
       3. If the session is already dead: calls ensure_connected() to restore
          it silently, before the trading loop's next bar attempt would fail.
 
@@ -700,7 +630,7 @@ async def start_mt5_session_keepalive(
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     data = await resp.json(content_type=None)
-                    is_alive = isinstance(data, dict) and data.get("isConnected")
+                    is_alive = _connection_status_is_alive(data)
                     if is_alive:
                         log.debug("[mt5_keepalive] ✅ Broker session alive")
                     else:
@@ -720,10 +650,62 @@ async def start_mt5_session_keepalive(
 
 # ── Market data ───────────────────────────────────────────────────────────────
 
+async def check_symbol_available(symbol: str) -> bool:
+    """Verify that MTAPI exposes the configured symbol for this account."""
+    target = symbol.strip().upper()
+    if not target:
+        log.error("MTAPI symbol check failed: SYMBOL is empty")
+        return False
+
+    for attempt in range(2):
+        if not _conn_id:
+            if not await ensure_connected():
+                return False
+        try:
+            async with _get_session().get(
+                f"{_base_url}/SymbolList",
+                params={"id": _conn_id},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status >= 400:
+                    raise RuntimeError(
+                        f"HTTP {resp.status}: "
+                        f"{data.get('message', str(data)[:160]) if isinstance(data, dict) else str(data)[:160]}"
+                    )
+
+                if isinstance(data, list):
+                    names = [str(item) for item in data]
+                elif isinstance(data, dict):
+                    names = [str(item) for item in data.keys()]
+                else:
+                    raise RuntimeError(f"unexpected response type {type(data).__name__}")
+
+                available = {name.upper() for name in names}
+                if target in available:
+                    log.info(f"{symbol} availability: AVAILABLE via MTAPI")
+                    return True
+
+                related = [name for name in names if "XAU" in name.upper()]
+                log.error(
+                    f"{symbol} availability: NOT AVAILABLE via MTAPI"
+                    + (f"; related symbols: {related[:10]}" if related else "")
+                )
+                return False
+        except Exception as exc:
+            if attempt == 0:
+                log.warning(f"MTAPI symbol check failed — reconnecting: {exc}")
+                _invalidate_connection()
+                continue
+            log.error(f"MTAPI symbol check failed after reconnect: {exc}")
+            return False
+    return False
+
+
 async def fetch_candles(
     symbol: str, timeframe: str, count: int = 300
 ) -> List[OHLCV]:
-    """Fetch OHLCV candles via GET /PriceHistoryV2 (ISO datetime range).
+    """Fetch OHLCV candles via MTAPI GET /PriceHistoryV2 (ISO datetime range).
 
     FIX: retries once with a fresh ConnectEx on stale-conn_id errors.
     """
@@ -817,7 +799,7 @@ async def fetch_candles(
 
 
 async def get_account_info() -> dict:
-    """Fetch account balance/equity/margin from mt5rest /AccountSummary.
+    """Fetch account balance/equity/margin from MTAPI /AccountSummary.
 
     FIX: retries once with a fresh ConnectEx when the bridge returns an
     error-shaped response (stale conn_id after bridge restart or broker
@@ -827,7 +809,7 @@ async def get_account_info() -> dict:
     for attempt in range(2):  # attempt 0 = normal; attempt 1 = after reconnect
         if not _conn_id:
             if not await ensure_connected():
-                log.error("get_account_info: not connected to mt5rest bridge")
+                log.error("get_account_info: not connected to MTAPI")
                 return {}
         try:
             sess = _get_session()
@@ -846,12 +828,13 @@ async def get_account_info() -> dict:
                         "marginLevel": float(data.get("marginLevel", 0.0)),
                         "currency":    data.get("currency", "USD"),
                         "leverage":    int(data.get("leverage") or 0),
-                        # Identity fields — present in most mt5rest AccountSummary responses.
-                        # These allow the Telegram panel to display broker/login even when the
-                        # local SQLite DB was wiped (e.g. Render free-tier /tmp reset).
-                        "broker":      str(data.get("broker") or data.get("company") or ""),
-                        "server":      str(data.get("server") or ""),
-                        "login":       str(data.get("login") or data.get("account") or ""),
+                        # The official AccountSummary does not always echo account
+                        # identity fields, so use the configured connection values
+                        # as safe fallbacks for the panel and guardian identity.
+                        "broker":      str(data.get("broker") or data.get("company") or MT5_HOST),
+                        "server":      str(data.get("server") or MT5_HOST),
+                        "login":       str(data.get("login") or data.get("account") or MT5_USER),
+                        "synced":      bool(data.get("synced", True)),
                         "name":        str(data.get("name") or ""),
                     }
                 # Error response — likely a stale conn_id (bridge restart / broker timeout).
@@ -886,7 +869,7 @@ async def get_open_positions(
     known_positions: Optional[Dict[str, dict]] = None,
     return_diagnostics: bool = False,
 ):
-    """Fetch open positions from mt5rest.
+    """Fetch open positions from MTAPI.
 
     Raises RuntimeError when mt5rest returns an error response (dict with
     code/stackTrace) so callers treat a bridge error as a connection failure
@@ -912,7 +895,7 @@ async def get_open_positions(
     for attempt in range(2):
         if not _conn_id:
             if not await ensure_connected():
-                raise RuntimeError("get_open_positions: not connected to mt5rest bridge")
+                raise RuntimeError("get_open_positions: not connected to MTAPI")
         try:
             params: dict = {"id": _conn_id}
             if symbol:
@@ -963,7 +946,7 @@ async def get_closed_position_history(position_id: str) -> Optional[dict]:
         if not _conn_id:
             if not await ensure_connected():
                 raise RuntimeError(
-                    "get_closed_position_history: not connected to mt5rest bridge"
+                    "get_closed_position_history: not connected to MTAPI"
                 )
         try:
             async with _get_session().get(
@@ -986,7 +969,7 @@ async def get_closed_position_history(position_id: str) -> Optional[dict]:
                         else f"HTTP {resp.status}"
                     )
                     raise RuntimeError(
-                        f"mt5rest HistoryPositions error: {message}"
+                        f"MTAPI HistoryPositions error: {message}"
                     )
 
                 if isinstance(data, dict):
@@ -1042,14 +1025,14 @@ def _parse_open_positions_response(
             if isinstance(data, dict)
             else f"HTTP {status}"
         )
-        raise RuntimeError(f"mt5rest OpenedOrders error (HTTP {status}): {message}")
+        raise RuntimeError(f"MTAPI OpenedOrders error (HTTP {status}): {message}")
     if isinstance(data, list):
         return _dedupe_positions(data, known_positions)
     if isinstance(data, dict):
         message = data.get("message", "unexpected object response")
     else:
         message = f"unexpected response type: {type(data).__name__}"
-    raise RuntimeError(f"mt5rest OpenedOrders error: {message}")
+    raise RuntimeError(f"MTAPI OpenedOrders error: {message}")
 
 
 # mt5rest exposes both `lots` (the canonical lot value) and `volume` (an
