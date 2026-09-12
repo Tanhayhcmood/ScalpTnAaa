@@ -170,11 +170,12 @@ def run_decision_engine(
     range_edge_atr_distance: float = 0.25,
     range_risk_percent: Optional[float] = None,
     range_entry_filters_enabled: bool = RANGE_ENTRY_FILTERS_ENABLED,
+    timeframe: str = "M5",
 ) -> DecisionResult:
 
     smc     = analyze_smc_structure(candles)
     wyckoff = analyze_wyckoff(candles)
-    pa      = analyze_price_action(candles)
+    pa      = analyze_price_action(candles, timeframe=timeframe)
     trend   = analyze_trend(candles)
 
     candidate = _candidate_direction(smc, wyckoff, pa, trend)
@@ -310,7 +311,10 @@ def run_decision_engine(
     # Feed the newest BOS/CHoCH bar through the existing quality-filter slot
     # so both event types share the same freshness gate.
     quality  = apply_quality_filter(candles, candidate, conf_result.confidence,
-                                    last_structure_bar, regime.adx, regime.atr_ratio)
+                                    last_structure_bar, regime.adx, regime.atr_ratio,
+                                    allow_without_smc=(
+                                        pa.pa_signal == candidate and ef.price_action
+                                    ))
     if not quality.allowed:
         return DecisionResult(
             allowed=False, direction=candidate,  # type: ignore

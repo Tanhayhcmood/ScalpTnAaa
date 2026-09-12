@@ -135,6 +135,7 @@ def apply_quality_filter(
     atr_ratio: Optional[float] = None,
     news_blocked: bool = False,
     news_reason: str = "",
+    allow_without_smc: bool = False,
 ) -> QualityFilterResult:
     blocked = QualityFilterResult(
         allowed=False, blocked_reasons=[],
@@ -147,10 +148,13 @@ def apply_quality_filter(
     if len(candles) < 30:
         blocked.blocked_reasons = ["Insufficient candle data (< 30)"]
         return blocked
-    if smc_signal == "NEUTRAL":
+    # The ordinary entry filter is N-of-4, but a legacy hard gate used to
+    # discard PA+Trend/Wyckoff setups whenever SMC was neutral.  Only the
+    # decision engine can explicitly open this path, and only when PA itself
+    # is one of the aligned confirmations.
+    if smc_signal == "NEUTRAL" and not allow_without_smc:
         blocked.blocked_reasons = ["No SMC direction signal"]
         return blocked
-
     reasons = []
     last_candle = candles[-1]
 

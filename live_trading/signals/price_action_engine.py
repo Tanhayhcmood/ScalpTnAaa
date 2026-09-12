@@ -2,7 +2,7 @@
 Price Action Engine — Patterns, S/R Levels, Breakouts
 Ported from priceActionEngine.ts — confirmation only.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Literal
 from live_trading.signals.gold_engine import OHLCV
 
@@ -54,6 +54,10 @@ class PriceActionResult:
     bearish_pullback: bool
     pa_signal: Literal["BUY", "SELL", "NEUTRAL"]
     pa_score: float
+    # Additional continuation pattern flags are additive telemetry.  Defaults
+    # keep older panel/test constructors source-compatible.
+    bullish_inside_breakout: bool = False
+    bearish_inside_breakout: bool = False
 
 
 def _calc_atr(candles: List[OHLCV], period: int) -> float:
@@ -115,10 +119,10 @@ def _detect_patterns(candles: List[OHLCV], cfg: PaConfig, atr: float):
     return bull_engulf, bear_engulf, bull_pin, bear_pin, strong_bull, strong_bear
 
 
-def _detect_sr_levels(candles: List[OHLCV], cfg: PaConfig):
+def _detect_sr_levels(candles: List[OHLCV], cfg: PaConfig, tolerance: float | None = None):
     sl = candles[-cfg.level_lookback:]
     n  = len(sl)
-    tol = cfg.level_tolerance
+    tol = cfg.level_tolerance if tolerance is None else tolerance
 
     swing_highs, swing_lows = [], []
     for i in range(2, n - 2):
@@ -218,12 +222,31 @@ def _detect_breakout_pullback(
                          for z in supply_zones)
         if near_res or near_sup_z: bear_pb = True
 
-    return vbull, vbear, fbull, fbear, bull_pb, bear_pb
+    # Inside-bar breakouts are common continuation setups on XAUUSD.  They
+    # were previously invisible unless the mother candle also created a
+    # clustered S/R level, which made the PA engine needlessly sparse.
+    mother = candles[n - 3] if n >= 3 else None
+    inside = candles[n - 2] if n >= 2 else None
+    bull_inside = (
+        mother is not None and inside is not None
+        and inside.high <= mother.high and inside.low >= mother.low
+        and _is_bull(curr) and curr.close > inside.high
+        and _body(curr) >= atr * 0.25
+    )
+    bear_inside = (
+        mother is not None and inside is not None
+        and inside.high <= mother.high and inside.low >= mother.low
+        and _is_bear(curr) and curr.close < inside.low
+        and _body(curr) >= atr * 0.25
+    )
+
+    return vbull, vbear, fbull, fbear, bull_pb, bear_pb, bull_inside, bear_inside
 
 
 def _compute_pa_signal(
     bull_engulf, bear_engulf, bull_pin, bear_pin, strong_bull, strong_bear,
     vbull, vbear, fbull, fbear, bull_pb, bear_pb,
+    bull_inside, bear_inside,
     near_demand, near_supply, near_support, near_resist,
 ):
     buy = sell = 0.0
@@ -238,6 +261,8 @@ def _compute_pa_signal(
     if vbear:       sell += 1.0
     if bull_pb:     buy  += 0.8
     if bear_pb:     sell += 0.8
+    if bull_inside: buy  += 1.2
+    if bear_inside: sell += 1.2
     if near_demand or near_support: buy  += 0.5
     if near_supply or near_resist:  sell += 0.5
     if fbull: buy  -= 1.5
@@ -246,13 +271,37 @@ def _compute_pa_signal(
     buy  = max(0.0, buy)
     sell = max(0.0, sell)
 
-    max_possible = 5.3
+    # 5.3 was the old pre-inside-bar ceiling.  Keep the score informative,
+    # but do not use an impossible "all patterns must agree" denominator as a
+    # hard gate.  A valid engulfing/breakout is itself actionable evidence.
+    max_possible = 6.5
     dominant = max(buy, sell)
     score = round(dominant / max_possible, 2)
 
-    if buy > sell and score >= 0.30:   signal = "BUY"
-    elif sell > buy and score >= 0.30: signal = "SELL"
-    else:                               signal = "NEUTRAL"
+    # Context alone never creates a signal.  A directional trigger is needed:
+    # engulfing, valid breakout, inside-bar breakout, a pullback into a level,
+    # or a rejection/strong candle that is actually at a relevant level.
+    buy_trigger = (
+        bull_engulf or vbull or bull_inside or bull_pb
+        or (bull_pin and (near_support or near_demand))
+        or (strong_bull and (near_support or near_demand))
+    )
+    sell_trigger = (
+        bear_engulf or vbear or bear_inside or bear_pb
+        or (bear_pin and (near_resist or near_supply))
+        or (strong_bear and (near_resist or near_supply))
+    )
+
+    # A one-point breakout/pullback trigger is allowed at ~15% of the
+    # diagnostic ceiling; this is intentionally lower than the old 30% score
+    # threshold, which made a standalone valid engulfing (1.5/5.3 = 28%) and
+    # many legitimate continuation setups NEUTRAL.
+    if buy > sell and buy_trigger and buy >= 1.0 and score >= 0.15:
+        signal = "BUY"
+    elif sell > buy and sell_trigger and sell >= 1.0 and score >= 0.15:
+        signal = "SELL"
+    else:
+        signal = "NEUTRAL"
     return signal, min(1.0, score)
 
 
@@ -269,8 +318,29 @@ _NEUTRAL_PA = PriceActionResult(
 )
 
 
-def analyze_price_action(candles: List[OHLCV]) -> PriceActionResult:
-    cfg = CFG_M5
+def _config_for_timeframe(timeframe: str) -> PaConfig:
+    """Use a wider structural window on the higher entry timeframes.
+
+    The live loop scans M20/M15/M10/M5, but the old Python port always used
+    the M5 30-bar level window.  Pattern math is timeframe-agnostic; level
+    context is not.  Higher timeframes need more bars and a slightly wider
+    gold-price tolerance to avoid losing valid PA setups simply because the
+    level was formed outside the short M5 window.
+    """
+    tf = str(timeframe or "M5").upper()
+    if tf in {"M10", "10M"}:
+        return replace(CFG_M5, level_lookback=40, level_tolerance=0.45)
+    if tf in {"M15", "15M"}:
+        return replace(CFG_M5, level_lookback=45, level_tolerance=0.55)
+    if tf in {"M20", "20M"}:
+        return replace(CFG_M5, level_lookback=50, level_tolerance=0.65)
+    if tf in {"M30", "30M"}:
+        return replace(CFG_M5, level_lookback=55, level_tolerance=0.75)
+    return CFG_M5
+
+
+def analyze_price_action(candles: List[OHLCV], timeframe: str = "M5") -> PriceActionResult:
+    cfg = _config_for_timeframe(timeframe)
     if len(candles) < cfg.level_lookback + cfg.atr_period + 5:
         return _NEUTRAL_PA
 
@@ -279,22 +349,35 @@ def analyze_price_action(candles: List[OHLCV]) -> PriceActionResult:
         return _NEUTRAL_PA
 
     be, bae, bp, bap, sb, sbe = _detect_patterns(candles, cfg, atr)
-    support_lvls, resistance_lvls = _detect_sr_levels(candles, cfg)
+    # Gold's intraday range changes materially across sessions.  A static
+    # tolerance is too narrow during London/NY volatility, so allow a modest
+    # ATR-relative expansion while keeping it bounded by the profile.
+    adaptive_tolerance = max(
+        cfg.level_tolerance,
+        min(0.90, atr * 0.30),
+    )
+    support_lvls, resistance_lvls = _detect_sr_levels(
+        candles, cfg, tolerance=adaptive_tolerance
+    )
     demand_zones, supply_zones    = _detect_supply_demand(candles, cfg, atr)
 
     cp  = candles[-1].close
-    tol = cfg.level_tolerance
+    tol = adaptive_tolerance
     near_sup  = any(abs(cp - l) <= tol for l in support_lvls)
     near_res  = any(abs(cp - l) <= tol for l in resistance_lvls)
     near_dem  = any(z["bottom"] - tol <= cp <= z["top"] + tol for z in demand_zones)
     near_supl = any(z["bottom"] - tol <= cp <= z["top"] + tol for z in supply_zones)
 
-    vbull, vbear, fbull, fbear, bull_pb, bear_pb = _detect_breakout_pullback(
+    (
+        vbull, vbear, fbull, fbear, bull_pb, bear_pb,
+        bull_inside, bear_inside,
+    ) = _detect_breakout_pullback(
         candles, support_lvls, resistance_lvls, demand_zones, supply_zones, cfg, atr)
 
     signal, score = _compute_pa_signal(
         be, bae, bp, bap, sb, sbe,
         vbull, vbear, fbull, fbear, bull_pb, bear_pb,
+        bull_inside, bear_inside,
         near_dem, near_supl, near_sup, near_res,
     )
 
@@ -309,4 +392,6 @@ def analyze_price_action(candles: List[OHLCV]) -> PriceActionResult:
         bullish_pullback=bull_pb, bearish_pullback=bear_pb,
         pa_signal=signal,  # type: ignore
         pa_score=score,
+        bullish_inside_breakout=bull_inside,
+        bearish_inside_breakout=bear_inside,
     )
