@@ -517,64 +517,95 @@ class GoldScalperLive:
         M15, then M10, then M5.  If M20 opens a position, the M15/M10/M5
         handlers in the same tick will see it via get_open_positions() and
         skip entry, preventing duplicate positions.
-        Never raises — individual TF errors are logged and skipped."""
+        Never raises — individual TF errors are logged and skipped.
+
+        The four MTAPI reads are independent, so they run as one concurrent
+        batch.  This keeps the poll interval the same for the provider while
+        reducing detection latency from the sum of four network round trips to
+        roughly the slowest single request."""
         results: list[tuple[str, datetime]] = []
-        for tf in TRADE_TIMEFRAMES:
+
+        async def _read_bar_time(tf: str) -> tuple[str, Optional[datetime]]:
             try:
-                bt = await get_last_completed_bar_time(SYMBOL, tf)
-                if bt is None:
-                    continue
-                # ── Staleness guard ──────────────────────────────────────────
-                # Right after MT5 connects, PriceHistoryV2 returns cached
-                # historical data (sometimes years old) until the terminal
-                # finishes syncing from the broker.  Processing a 2022 bar in
-                # 2026 context would crash the signal pipeline or open a trade
-                # with completely wrong ATR/SL/TP values.  Skip any bar that is
-                # more than 2 hours old relative to UTC wall-clock time.
-                # Normalize to naive UTC immediately.  get_last_completed_bar_time()
-                # may return timezone-aware datetimes (when the mt5rest response
-                # includes a "Z" suffix) on some timeframes and naive on others.
-                # Storing a mix into _last_bar_times causes max() inside
-                # _write_state() to raise:
-                #   TypeError: can't compare offset-naive and offset-aware datetimes
-                # which silently crashes every _write_state() call (WAITING, ERROR,
-                # STOPPED) — leaving the state file permanently frozen at RUNNING.
-                _bt_naive = bt.replace(tzinfo=None) if bt.tzinfo else bt
-                _stale_cutoff = datetime.utcnow() - timedelta(hours=2)
-                if _bt_naive < _stale_cutoff:
-                    # Still update last_bar_times (as naive) so we don't re-log
-                    self._last_bar_times[tf] = _bt_naive
-                    log.debug(
-                        f"[{tf}] Bar {bt.isoformat()} is stale "
-                        f"(>{int((datetime.utcnow() - _bt_naive).total_seconds()/3600)}h old) "
-                        f"— waiting for MT5 historical data sync"
-                    )
-                    continue
-                prev = self._last_bar_times.get(tf)
-                if prev is None or _bt_naive > prev:
-                    self._last_bar_times[tf] = _bt_naive
-                    results.append((tf, _bt_naive))
+                return tf, await get_last_completed_bar_time(SYMBOL, tf)
             except Exception as _bar_err:
                 log.warning(f"[{tf}] Bar time check failed: {_bar_err}")
+                return tf, None
+
+        # gather() preserves input order, so the existing highest-to-lowest
+        # timeframe processing order remains unchanged after the concurrent IO.
+        bar_reads = await asyncio.gather(
+            *(_read_bar_time(tf) for tf in TRADE_TIMEFRAMES)
+        )
+        for tf, bt in bar_reads:
+            if bt is None:
+                continue
+            # ── Staleness guard ──────────────────────────────────────────────
+            # Right after MT5 connects, PriceHistoryV2 returns cached
+            # historical data (sometimes years old) until the terminal
+            # finishes syncing from the broker.  Processing a 2022 bar in
+            # 2026 context would crash the signal pipeline or open a trade
+            # with completely wrong ATR/SL/TP values.  Skip any bar that is
+            # more than 2 hours old relative to UTC wall-clock time.
+            # Normalize to naive UTC immediately.  get_last_completed_bar_time()
+            # may return timezone-aware datetimes (when the mt5rest response
+            # includes a "Z" suffix) on some timeframes and naive on others.
+            # Storing a mix into _last_bar_times causes max() inside
+            # _write_state() to raise:
+            #   TypeError: can't compare offset-naive and offset-aware datetimes
+            # which silently crashes every _write_state() call (WAITING, ERROR,
+            # STOPPED) — leaving the state file permanently frozen at RUNNING.
+            _bt_naive = bt.replace(tzinfo=None) if bt.tzinfo else bt
+            _stale_cutoff = datetime.utcnow() - timedelta(hours=2)
+            if _bt_naive < _stale_cutoff:
+                # Still update last_bar_times (as naive) so we don't re-log
+                self._last_bar_times[tf] = _bt_naive
+                log.debug(
+                    f"[{tf}] Bar {bt.isoformat()} is stale "
+                    f"(>{int((datetime.utcnow() - _bt_naive).total_seconds()/3600)}h old) "
+                    f"— waiting for MT5 historical data sync"
+                )
+                continue
+            prev = self._last_bar_times.get(tf)
+            if prev is None or _bt_naive > prev:
+                self._last_bar_times[tf] = _bt_naive
+                results.append((tf, _bt_naive))
         return results
 
     # ── Per-bar handler ───────────────────────────────────────────────────────
 
     async def _on_new_bar(self, bar_time: datetime, tf: str = TIMEFRAME) -> None:
-        # 1. Fetch candles for this timeframe (M5 / M10 / M15 / M20)
-        candles = await fetch_candles(SYMBOL, tf, CANDLE_WINDOW)
+        # 1. Fetch the entry timeframe and HTF bias data concurrently.  These
+        # requests are independent and this overlaps their network latency
+        # without changing the amount of data requested from MTAPI.
+        htf_candles = []
+        if MTF_ENABLED:
+            primary_result, htf_result = await asyncio.gather(
+                fetch_candles(SYMBOL, tf, CANDLE_WINDOW),
+                fetch_candles(SYMBOL, MTF_TIMEFRAME, MTF_CANDLE_WINDOW),
+                return_exceptions=True,
+            )
+            if isinstance(primary_result, Exception):
+                log.warning(f"[{tf}] Candle fetch failed — skipping bar: {primary_result}")
+                return
+            candles = primary_result
+            if isinstance(htf_result, Exception):
+                log.warning(f"MTF fetch/analysis error (fail-safe, skipping): {htf_result}")
+            else:
+                htf_candles = htf_result
+        else:
+            candles = await fetch_candles(SYMBOL, tf, CANDLE_WINDOW)
+
         if len(candles) < 50:
             log.warning(f"Only {len(candles)} candles returned — skipping bar")
             return
 
-        # 1b. Fetch HTF candles for Multi-Timeframe filter (fail-safe: skipped on error)
-        # HTF bias is computed here — before account / guardian checks — so the
-        # fetch latency overlaps with the (slower) account info call that follows.
+        # 1b. Compute HTF bias before account / guardian checks.  The fetch
+        # latency is already overlapped with the entry-timeframe request.
         # compute_mtf_bias() never raises; a bad fetch simply yields htf_bias=None.
         htf_bias: Optional[MtfBias] = None
         if MTF_ENABLED:
             try:
-                htf_candles = await fetch_candles(SYMBOL, MTF_TIMEFRAME, MTF_CANDLE_WINDOW)
                 if len(htf_candles) >= 50:
                     htf_bias = compute_mtf_bias(htf_candles)
                     log.info(

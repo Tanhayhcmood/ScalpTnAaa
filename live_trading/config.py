@@ -218,7 +218,10 @@ TRADE_TIMEFRAMES  = _trade_timeframes("TRADE_TIMEFRAMES", "M20,M15,M10,5m")
 COMMENT = "GSPv4"
 
 # ── Loop Timing ──────────────────────────────────────────────────────────────
-BAR_CHECK_INTERVAL = 15       # seconds between candle-close checks
+# Five seconds is the safety floor for MTAPI polling.  Ten seconds keeps
+# reaction latency low without turning the four-timeframe bar check into a
+# high-frequency request loop.
+BAR_CHECK_INTERVAL = _int("BAR_CHECK_INTERVAL", 10, lo=5, hi=60)
 RECONNECT_DELAY    = 30       # seconds before reconnect attempt
 SYNC_TIMEOUT       = 120      # seconds to wait for initial connect
 

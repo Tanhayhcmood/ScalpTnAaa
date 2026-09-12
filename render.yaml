@@ -74,6 +74,10 @@ services:
         value: "24"
       - key: RISK_PERCENT
         value: "1.0"
+      # Poll all configured timeframes every 10 seconds.  The implementation
+      # batches these independent reads concurrently to keep MTAPI load low.
+      - key: BAR_CHECK_INTERVAL
+        value: "10"
       # STABLE v4.0.4 values -- these are the actual settings the bot has been
       # running with in production (verified against the live Render service
       # on 2026-08-10). Earlier revisions of this file had leftover
