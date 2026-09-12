@@ -184,6 +184,14 @@ class GoldScalperLive:
         self._last_bar_times: dict[str, Optional[datetime]] = {
             tf: None for tf in TRADE_TIMEFRAMES
         }
+        # Latest completed bar time observed for non-trade context timeframes
+        # (currently H1).  It lets the MTF analysis cache refresh exactly once
+        # per new HTF bar instead of once per M5/M10/M15/M20 entry event.
+        self._latest_completed_bar_times: dict[str, Optional[datetime]] = {}
+        self._mtf_cache_bar_time: Optional[datetime] = None
+        self._mtf_cache_bias: Optional[MtfBias] = None
+        self._mtf_cache_reason: str = ""
+        self._mtf_cache_failure_at: float = 0.0
         # Guard against opening multiple trades in the same tick when several
         # timeframes close simultaneously (e.g. M20+M10+M5 all fire at :20).
         # Without this, _on_new_bar() is called N times in one iteration of
@@ -655,9 +663,26 @@ class GoldScalperLive:
         skip entry, preventing duplicate positions.
         Never raises — individual TF errors are logged and skipped."""
         results: list[tuple[str, datetime]] = []
-        for tf in TRADE_TIMEFRAMES:
+        poll_timeframes = list(TRADE_TIMEFRAMES)
+        if MTF_ENABLED and MTF_TIMEFRAME not in poll_timeframes:
+            # Poll the HTF timestamp alongside entry timeframes so the cache
+            # knows when a new H1 context is available, without fetching the
+            # full H1 candle window on every lower-timeframe bar.
+            poll_timeframes.append(MTF_TIMEFRAME)
+
+        async def _poll(tf: str):
             try:
-                bt = await get_last_completed_bar_time(SYMBOL, tf)
+                return tf, await get_last_completed_bar_time(SYMBOL, tf), None
+            except Exception as exc:
+                return tf, None, exc
+
+        polled = await asyncio.gather(*(_poll(tf) for tf in poll_timeframes))
+        trade_timeframes = set(TRADE_TIMEFRAMES)
+        for tf, bt, poll_error in polled:
+            try:
+                if poll_error is not None:
+                    log.warning(f"[{tf}] Bar time check failed: {poll_error}")
+                    continue
                 if bt is None:
                     continue
                 # ── Staleness guard ──────────────────────────────────────────
@@ -679,12 +704,18 @@ class GoldScalperLive:
                 _stale_cutoff = datetime.utcnow() - timedelta(hours=2)
                 if _bt_naive < _stale_cutoff:
                     # Still update last_bar_times (as naive) so we don't re-log
-                    self._last_bar_times[tf] = _bt_naive
+                    if tf in trade_timeframes:
+                        self._last_bar_times[tf] = _bt_naive
                     log.debug(
                         f"[{tf}] Bar {bt.isoformat()} is stale "
                         f"(>{int((datetime.utcnow() - _bt_naive).total_seconds()/3600)}h old) "
                         f"— waiting for MT5 historical data sync"
                     )
+                    continue
+                if tf == MTF_TIMEFRAME:
+                    self._latest_completed_bar_times[tf] = _bt_naive
+                if tf not in trade_timeframes:
+                    self._latest_completed_bar_times[tf] = _bt_naive
                     continue
                 prev = self._last_bar_times.get(tf)
                 if prev is None or _bt_naive > prev:
@@ -696,70 +727,124 @@ class GoldScalperLive:
 
     # ── Per-bar handler ───────────────────────────────────────────────────────
 
+    def _mtf_cache_needs_refresh(self) -> bool:
+        """Return whether the cached HTF bias is absent or belongs to an old bar."""
+        if not MTF_ENABLED:
+            return False
+        current_bar = self._latest_completed_bar_times.get(MTF_TIMEFRAME)
+        if self._mtf_cache_bias is not None and current_bar == self._mtf_cache_bar_time:
+            return False
+        # Retry a failed HTF fetch periodically, but do not hammer the bridge
+        # once per lower-timeframe bar during a transient outage.
+        if (
+            self._mtf_cache_bias is None
+            and current_bar == self._mtf_cache_bar_time
+            and asyncio.get_event_loop().time() - self._mtf_cache_failure_at < 30.0
+        ):
+            return False
+        return True
+
+    async def _refresh_mtf_cache(self) -> tuple[Optional[MtfBias], str]:
+        """Fetch and validate HTF candles once for the current HTF bar."""
+        cache_bar = self._latest_completed_bar_times.get(MTF_TIMEFRAME)
+        try:
+            htf_candles = await fetch_candles(
+                SYMBOL, MTF_TIMEFRAME, MTF_CANDLE_WINDOW
+            )
+            if len(htf_candles) < 50:
+                reason = f"HTF candles insufficient ({len(htf_candles)})"
+                self._mtf_cache_bias = None
+                self._mtf_cache_reason = reason
+                self._mtf_cache_bar_time = cache_bar
+                self._mtf_cache_failure_at = asyncio.get_event_loop().time()
+                return None, reason
+
+            htf_bias: Optional[MtfBias] = None
+            if MTF_TIMEFRAME in {"H1", "1h"}:
+                h1_check = validate_h1_candles(htf_candles)
+                if not h1_check.valid:
+                    reason = h1_check.reason
+                    self._mtf_cache_bias = None
+                    self._mtf_cache_reason = reason
+                    self._mtf_cache_bar_time = cache_bar
+                    self._mtf_cache_failure_at = asyncio.get_event_loop().time()
+                    return None, reason
+                candidate_bias = compute_mtf_bias(htf_candles)
+                if not h1_check.matches_ema(
+                    candidate_bias.ema50,
+                    candidate_bias.ema100,
+                    candidate_bias.ema200,
+                ):
+                    reason = (
+                        "H1 validation failed: EMA values changed between "
+                        "validation and HTF analysis"
+                    )
+                    self._mtf_cache_bias = None
+                    self._mtf_cache_reason = reason
+                    self._mtf_cache_bar_time = cache_bar
+                    self._mtf_cache_failure_at = asyncio.get_event_loop().time()
+                    return None, reason
+                candidate_bias.reasoning.insert(0, h1_check.summary)
+                htf_bias = candidate_bias
+            else:
+                htf_bias = compute_mtf_bias(htf_candles)
+
+            self._mtf_cache_bias = htf_bias
+            self._mtf_cache_reason = ""
+            self._mtf_cache_bar_time = cache_bar
+            self._mtf_cache_failure_at = 0.0
+            return htf_bias, ""
+        except Exception as exc:
+            reason = f"MTF fetch/analysis error (fail-safe): {exc}"
+            self._mtf_cache_bias = None
+            self._mtf_cache_reason = reason
+            self._mtf_cache_bar_time = cache_bar
+            self._mtf_cache_failure_at = asyncio.get_event_loop().time()
+            return None, reason
+
     async def _on_new_bar(self, bar_time: datetime, tf: str = TIMEFRAME) -> None:
         self._set_trade_permission(
             False,
             "EVALUATING",
             [f"Evaluating live entry gates for {tf}"],
         )
+        # Fetch independent network inputs concurrently.  The account request
+        # remains mandatory; this only removes avoidable wait time between
+        # independent bridge calls.
+        candles_task = asyncio.create_task(
+            fetch_candles(SYMBOL, tf, CANDLE_WINDOW)
+        )
+        account_task = asyncio.create_task(get_account_info())
+        mtf_task = (
+            asyncio.create_task(self._refresh_mtf_cache())
+            if self._mtf_cache_needs_refresh()
+            else None
+        )
+        if mtf_task is not None:
+            candles, acc_info, mtf_result = await asyncio.gather(
+                candles_task, account_task, mtf_task
+            )
+            htf_bias, htf_data_reason = mtf_result
+        else:
+            candles, acc_info = await asyncio.gather(candles_task, account_task)
+            htf_bias = self._mtf_cache_bias if MTF_ENABLED else None
+            htf_data_reason = self._mtf_cache_reason if MTF_ENABLED else ""
+
         # 1. Fetch candles for this timeframe (M5 / M10 / M15 / M20)
-        candles = await fetch_candles(SYMBOL, tf, CANDLE_WINDOW)
         if len(candles) < 50:
             log.warning(f"Only {len(candles)} candles returned — skipping bar")
             return
 
-        # 1b. Fetch HTF candles for Multi-Timeframe filter (fail-safe: skipped on error)
-        # HTF bias is computed here — before account / guardian checks — so the
-        # fetch latency overlaps with the (slower) account info call that follows.
-        # compute_mtf_bias() never raises; a bad fetch simply yields htf_bias=None.
-        htf_bias: Optional[MtfBias] = None
-        htf_data_reason = ""
-        if MTF_ENABLED:
-            try:
-                htf_candles = await fetch_candles(SYMBOL, MTF_TIMEFRAME, MTF_CANDLE_WINDOW)
-                if len(htf_candles) >= 50:
-                    # Option 1: H1 data and EMA integrity.  Keep this guard
-                    # scoped to H1 so no other timeframe strategy is changed.
-                    if MTF_TIMEFRAME in {"H1", "1h"}:
-                        h1_check = validate_h1_candles(htf_candles)
-                        if not h1_check.valid:
-                            htf_data_reason = h1_check.reason
-                            log.warning(f"[{tf}] {htf_data_reason} — blocking entry")
-                        else:
-                            candidate_bias = compute_mtf_bias(htf_candles)
-                            if not h1_check.matches_ema(
-                                candidate_bias.ema50,
-                                candidate_bias.ema100,
-                                candidate_bias.ema200,
-                            ):
-                                htf_data_reason = (
-                                    "H1 validation failed: EMA values changed between "
-                                    "validation and HTF analysis"
-                                )
-                                log.error(f"[{tf}] {htf_data_reason} — blocking entry")
-                            else:
-                                candidate_bias.reasoning.insert(0, h1_check.summary)
-                                htf_bias = candidate_bias
-                    else:
-                        htf_bias = compute_mtf_bias(htf_candles)
-
-                    if htf_bias is not None:
-                        log.info(
-                            f"[{tf}] HTF ({MTF_TIMEFRAME}) bias: {htf_bias.direction}  "
-                            f"trend={htf_bias.trend}  smc={htf_bias.smc_signal}  "
-                            f"regime={htf_bias.regime}  strength={htf_bias.strength}"
-                        )
-                else:
-                    htf_data_reason = (
-                        f"HTF candles insufficient ({len(htf_candles)})"
-                    )
-                    log.warning(f"{htf_data_reason} — blocking entry")
-            except Exception as _mtf_exc:
-                htf_data_reason = f"MTF fetch/analysis error (fail-safe): {_mtf_exc}"
-                log.warning(f"{htf_data_reason} — blocking entry")
+        if htf_bias is not None:
+            log.info(
+                f"[{tf}] HTF ({MTF_TIMEFRAME}) bias: {htf_bias.direction}  "
+                f"trend={htf_bias.trend}  smc={htf_bias.smc_signal}  "
+                f"regime={htf_bias.regime}  strength={htf_bias.strength}"
+            )
+        elif MTF_ENABLED and htf_data_reason:
+            log.warning(f"[{tf}] {htf_data_reason} — blocking entry")
 
         # 2. Account info (live, required for Guardian)
-        acc_info = await get_account_info()
         # Never continue with fabricated account values.  A failed account
         # request must block trading rather than make the risk guard appear
         # healthy and allow an order with stale/default data.
