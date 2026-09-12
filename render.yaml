@@ -51,7 +51,8 @@ services:
       - key: MTAPI_API_KEY
         sync: false
       - key: MT5_HOST
-        value: "AMarkets-Demo"
+        # Keep this aligned with the robot's direct /Connect host/port path.
+        value: "52.18.32.194"
       - key: MT5_PORT
         value: "443"
       - key: MT5_USER

@@ -1,6 +1,5 @@
 import asyncio
 import time as _time
-import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -20,10 +19,10 @@ log = get_logger()
 _session:    Optional[aiohttp.ClientSession] = None
 _connected:  bool = False
 _base_url:   str  = ""
-_conn_id:    str  = ""   # UUID returned by ConnectEx; passed to every call
+_conn_id:    str  = ""   # Token returned by Connect; passed to every call
 _last_connect_time: float = 0.0   # monotonic timestamp of last successful connect()
 
-# After a fresh ConnectEx the mt5rest bridge may take a few seconds to report
+# After a fresh Connect the mt5rest bridge may take a few seconds to report
 # isConnected=true on ConnectionStatus.  During this window ensure_connected()
 # would wrongly declare DISCONNECTED and trigger an immediate reconnect loop.
 # The grace period suppresses that false failure.
@@ -32,7 +31,7 @@ _CONNECT_GRACE_PERIOD: float = 150.0  # seconds — ROOT-CAUSE FIX: Wine cold-st
 # to 150 s before isConnected=true is reliable.  90 s was too short: the grace
 # period expired mid-startup, causing ensure_connected() to detect a false
 # DISCONNECTED and trigger an immediate reconnect that aborted the in-progress
-# ConnectEx — producing the continuous 'Connection Lost' loop in the panel.
+# Connect — producing the continuous 'Connection Lost' loop in the panel.
 
 # Prevents concurrent reconnect attempts when multiple coroutines detect a
 # stale connection at the same time (e.g. fetch_candles + ensure_connected
@@ -85,13 +84,23 @@ def _get_session() -> aiohttp.ClientSession:
 
 async def connect(*args, **kwargs) -> bool:
     """
-    Connect to MT5 via the MTAPI Cloud REST API using GET /ConnectEx.
+    Connect to MT5 via the MTAPI Cloud REST API using GET /Connect.
+
+    MTAPI exposes two different connection methods:
+      - /ConnectEx resolves a broker server *name* through MTAPI's cluster.
+      - /Connect connects directly to a broker host and port.
+
+    The temporary mt5.mtapi.io account currently routes the AMarkets demo
+    name to an endpoint that closes the socket.  The direct host/port method
+    is the reliable path for this deployment and also makes MT5_PORT
+    effective instead of silently ignoring it.
+
     Returns the connection UUID which is stored in _conn_id.
     """
     global _connected, _base_url, _conn_id, _last_connect_time
 
     base     = MTAPI_URL.rstrip("/") if MTAPI_URL else ""
-    host     = MT5_HOST
+    host     = MT5_HOST.strip() if MT5_HOST else ""
     user     = MT5_USER.strip() if MT5_USER else ""
     password = MT5_PASSWORD.strip() if MT5_PASSWORD else ""
 
@@ -113,40 +122,35 @@ async def connect(*args, **kwargs) -> bool:
         connect_params = {
             "user":     user,
             "password": password,
-            "server":   host,
+            "host":     host,
+            "port":     MT5_PORT,
             "connectTimeoutSeconds": 60,
-            "connectToNearestByPing": "true",
-            "connectTimeoutClusterMemberSeconds": 60,
         }
-        # The 14-day mt5.mtapi.io trial returns its own connection id.
-        # MTAPI Cloud requires a client-generated GUID; only send it there.
-        if "mt5full" in base.lower():
-            connect_params["id"] = str(uuid.uuid4())
 
         async with sess.get(
-            f"{base}/ConnectEx",
+            f"{base}/Connect",
             params=connect_params,
             timeout=aiohttp.ClientTimeout(total=SYNC_TIMEOUT),
         ) as resp:
             raw = await resp.text()
-            log.debug(f"ConnectEx response ({resp.status}): [response received]")
+            log.debug(f"Connect response ({resp.status}): [response received]")
 
             if resp.status != 200:
-                log.error(f"ConnectEx failed (status={resp.status}): {raw[:300]}")
+                log.error(f"Connect failed (status={resp.status}): {raw[:300]}")
                 _connected = False
                 return False
 
             # Response is a plain UUID string (may be quoted JSON string or raw)
             conn_id = raw.strip().strip('"')
             if not conn_id or len(conn_id) < 10:
-                log.error(f"ConnectEx returned unexpected value: {raw[:200]}")
+                log.error(f"Connect returned unexpected value: {raw[:200]}")
                 _connected = False
                 return False
 
             _conn_id   = conn_id
             _connected = True
             _last_connect_time = _time.monotonic()
-            log.info(f"MT5 connected – broker: {host}  user: {user}  conn_id: {conn_id}")
+            log.info(f"MT5 connected – broker endpoint: {host}:{MT5_PORT}  user: {user}  conn_id: {conn_id}")
             return True
 
     except Exception as exc:
@@ -233,7 +237,7 @@ async def connect_with_retry(max_attempts: int = 5, retry_delay: float = 60.0) -
     log.error(f"MT5 connect failed after {max_attempts} attempts.")
     return False
 def _invalidate_connection() -> None:
-    """Mark the current conn_id as stale so the next API call triggers a fresh ConnectEx.
+    """Mark the current conn_id as stale so the next API call triggers a fresh Connect.
 
     Called whenever an API endpoint returns an error-shaped response that indicates
     the conn_id is no longer recognised by the mt5rest bridge (e.g. after a bridge
@@ -258,7 +262,7 @@ async def ensure_connected(*args, **kwargs) -> bool:
     """
     global _connected
 
-    # Grace period: right after a fresh ConnectEx the mt5rest bridge takes a
+    # Grace period: right after a fresh Connect the mt5rest bridge takes a
     # few seconds to report isConnected=true on ConnectionStatus.  Trusting the
     # module flag during this window prevents a false DISCONNECTED that would
     # otherwise trigger an immediate reconnect loop on every startup.
@@ -286,7 +290,7 @@ async def ensure_connected(*args, **kwargs) -> bool:
     lock = _get_reconnect_lock()
     if lock.locked():
         # Another coroutine is already reconnecting — wait for it and return
-        # its result rather than firing a second parallel ConnectEx.
+        # its result rather than firing a second parallel Connect.
         log.debug("MT5 reconnect already in progress — waiting for result …")
         async with lock:
             return _connected  # populated by the coroutine that held the lock
@@ -393,7 +397,7 @@ async def start_mt5_session_keepalive(
          real conn_id, which flushes traffic through the MT5 broker socket
          and resets any broker-side inactivity timer.
       2. Proactive conn_id refresh: if the session is older than
-         `refresh_age_s` (default 4 h), calls ConnectEx to get a fresh
+         `refresh_age_s` (default 4 h), calls Connect to get a fresh
          UUID before the broker can expire it.
       3. If the session is already dead: calls ensure_connected() to restore
          it silently, before the trading loop's next bar attempt would fail.
@@ -473,7 +477,7 @@ async def fetch_candles(
 ) -> List[OHLCV]:
     """Fetch OHLCV candles via GET /PriceHistoryV2 (ISO datetime range).
 
-    FIX: retries once with a fresh ConnectEx on stale-conn_id errors.
+     FIX: retries once with a fresh Connect on stale-conn_id errors.
     """
     for attempt in range(2):
         if not _conn_id:
@@ -604,7 +608,7 @@ async def get_account_info() -> dict:
                         "name":        str(data.get("name") or ""),
                     }
                 # Error response — likely a stale conn_id (bridge restart / broker timeout).
-                # Invalidate the connection and retry once with a fresh ConnectEx.
+                # Invalidate the connection and retry once with a fresh Connect.
                 if attempt == 0:
                     log.warning(
                         f"AccountSummary returned unexpected response "
@@ -656,7 +660,7 @@ async def get_open_positions(
     it simply doesn't recognize yet (e.g. right after a restart, before
     known_positions has repopulated — see live_loop._known_open_tickets).
 
-    FIX: retries once with a fresh ConnectEx on stale-conn_id errors.
+    FIX: retries once with a fresh Connect on stale-conn_id errors.
     """
     for attempt in range(2):
         if not _conn_id:
@@ -901,7 +905,7 @@ async def get_current_quote(symbol: str) -> dict:
     callers must treat {} as "no live price available this tick" and skip
     trailing work rather than trail off a stale/fabricated price.
 
-    FIX: retries once with a fresh ConnectEx on stale-conn_id errors, same
+    FIX: retries once with a fresh Connect on stale-conn_id errors, same
     pattern as the other mt5rest calls in this module.
     """
     for attempt in range(2):
