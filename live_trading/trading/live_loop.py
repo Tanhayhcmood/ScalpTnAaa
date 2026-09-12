@@ -912,6 +912,7 @@ class GoldScalperLive:
             range_edge_atr_distance=RANGE_EDGE_ATR_DISTANCE,
             range_risk_percent=RANGE_RISK_PERCENT,
             range_entry_filters_enabled=RANGE_ENTRY_FILTERS_ENABLED,
+            timeframe=tf,
         )
         self.last_decision = decision
 
