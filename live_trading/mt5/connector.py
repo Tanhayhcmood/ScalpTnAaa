@@ -25,6 +25,7 @@ MTAPI endpoints used:
 
 import asyncio
 import math
+import os
 import time as _time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -181,8 +182,13 @@ def _completed_candles(
 def _get_session() -> aiohttp.ClientSession:
     global _session
     if _session is None or _session.closed:
+        # MTAPI Cloud requires the service API key on every request. The
+        # value comes from Render Secrets and is never written to the repo.
+        api_key = os.getenv("MTAPI_API_KEY", "").strip()
+        headers = {"ApiKey": api_key} if api_key else {}
         _session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30),
+            headers=headers,
         )
     return _session
 
