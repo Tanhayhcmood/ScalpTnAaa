@@ -85,14 +85,14 @@ services:
         value: "24"
       - key: RISK_PERCENT
         value: "1.0"
-      # Production signal policy: require SMC plus one independent confirmation
-      # after the independent confidence, quality, regime, sizing, and risk
-      # gates have passed. The risk gates remain active and are not bypassed.
+      # Production signal policy: any two of the four independent strategies
+      # may authorize direction after confidence, quality, regime, sizing, and
+      # risk gates pass. No individual strategy is mandatory.
       - key: MIN_CONFIRMATIONS
         value: "2"
       # Dedicated RANGE playbook from the operator runbook:
       # edge + fresh same-direction sweep + closed-candle reversal +
-      # SMC plus either Price Action or Wyckoff.
+      # the two-strategy consensus floor.
       - key: RANGE_TRADING_ENABLED
         value: "true"
       - key: RANGE_MIN_CONFIRMATIONS
@@ -112,9 +112,9 @@ services:
         value: "2"
       - key: MAX_OPEN_TRADES
         value: "1"
-      # Normal entries still require two confirmations through MIN_CONFIRMATIONS,
-      # but do not force Price Action to be the second vote. This preserves
-      # SMC + Trend/Wyckoff opportunities without weakening the vote floor.
+      # Normal entries require any two same-direction votes through
+      # MIN_CONFIRMATIONS; no individual strategy is forced to be the second
+      # vote. All independent confidence, quality, regime, and risk gates stay active.
       - key: REQUIRE_PRICE_ACTION
         value: "false"
       - key: REQUIRE_SMC_PRICE_ACTION_WYCKOFF
