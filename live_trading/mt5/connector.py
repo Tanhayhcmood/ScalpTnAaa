@@ -1,26 +1,3 @@
-"""
-mt5rest HTTP Connector – GoldScalperPro v4
-
-Direct MT5 connection via the mt5rest Docker bridge (no MetaAPI cloud).
-Runs fully self-hosted on Render.
-
-Required env vars:
-    MTAPI_URL     – URL of the mt5rest Docker service
-                    e.g. https://goldscalper-mtapi.onrender.com
-    MT5_HOST      – broker server name  (e.g. AMarkets-Demo)
-    MT5_USER      – MT5 account login number
-    MT5_PASSWORD  – MT5 account password
-
-mt5rest endpoints used:
-    GET  /ConnectEx        – authenticate with broker, returns UUID conn id
-    GET  /Disconnect       – close connection
-    GET  /ConnectionStatus – check live connection
-    GET  /AccountSummary   – balance, equity, margin
-    GET  /OpenedOrders     – open positions
-    GET  /PriceHistoryV2   – OHLCV candles (ISO datetime range)
-    GET  /GetQuote         – current bid/ask price
-    GET  /Ping             – liveness probe
-"""
 
 import asyncio
 import time as _time
@@ -30,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 import aiohttp
 
 from live_trading.config import (
-    MTAPI_URL, MT5_HOST, MT5_PORT,
+    MTAPI_URL, MTAPI_API_KEY, MT5_HOST, MT5_PORT,
     MT5_USER, MT5_PASSWORD,
     SYNC_TIMEOUT,
 )
@@ -96,8 +73,10 @@ _TF_MAP = {
 def _get_session() -> aiohttp.ClientSession:
     global _session
     if _session is None or _session.closed:
+        headers = {"ApiKey": MTAPI_API_KEY} if MTAPI_API_KEY else {}
         _session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30),
+            headers=headers,
         )
     return _session
 
