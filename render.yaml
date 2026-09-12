@@ -138,6 +138,8 @@ services:
         value: "M20,M15,M10,5m"
       - key: QUALITY_ADX_MIN
         value: "12"
+      - key: BAR_CHECK_INTERVAL
+        value: "5"
       # Keep the H1/MTF context gate active. The local signal, confidence,
       # sizing, stop, position, and Guardian gates remain active as well.
       - key: MTF_ENABLED
