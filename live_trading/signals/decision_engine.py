@@ -169,7 +169,7 @@ def run_decision_engine(
     candles:           List[OHLCV],
     account_balance:   float,
     risk_percent:      float = 1.0,
-    min_confirmations: int   = 2,
+    min_confirmations: int   = 1,
     use_atr_high_vol:  bool  = False,
     dxy_signal:        str   = "NEUTRAL",
     require_price_action: bool = False,
@@ -323,7 +323,13 @@ def run_decision_engine(
     quality  = apply_quality_filter(candles, candidate, conf_result.confidence,
                                     last_structure_bar, regime.adx, regime.atr_ratio,
                                     allow_without_smc=(
-                                        pa.pa_signal == candidate and ef.price_action
+                                        ef.confirmation_count >= effective_min_confirmations
+                                        and (
+                                            ef.smc
+                                            or ef.trend
+                                            or ef.price_action
+                                            or ef.wyckoff
+                                        )
                                     ))
     if not quality.allowed:
         return DecisionResult(
