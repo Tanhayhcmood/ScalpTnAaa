@@ -112,32 +112,19 @@ def run_decision_engine(
     if candidate == "NEUTRAL":
         return _make_neutral(smc, wyckoff, pa, trend, ["No SMC signal"])
 
-    # Soft EMA gate — counter-trend trades are allowed but need 3 confirmations
-    trend_dir = ("BUY" if trend.trend == "BULLISH" else
-                 "SELL" if trend.trend == "BEARISH" else "NEUTRAL")
-    _counter_trend = (candidate == "BUY" and trend_dir == "SELL") or \
-                     (candidate == "SELL" and trend_dir == "BUY")
-
-    # Detect regime early — needed to set the adaptive confirmation threshold.
-    # RANGE / ACCUMULATION / DISTRIBUTION / HIGH_VOLATILITY markets suppress
-    # PA and Wyckoff signals by design, so we lower the bar to 2 in those
-    # regimes. Trending regimes keep the stricter operator-configured value.
+    # Soft EMA signal — it remains a confirmation vote, not an independent
+    # requirement.  SMC supplies the candidate direction and the entry gate
+    # below requires SMC plus one of Trend, Price Action, or Wyckoff.
+    # Detect regime early for the later regime and quality gates.  It must not
+    # raise the strategy-confirmation threshold: the configured trading rule is
+    # always SMC + any one additional directional strategy.
     regime = detect_market_regime(candles, trend, wyckoff, use_atr_high_vol)
+    effective_min_confirmations = 2
 
-    _RANGE_REGIMES = {"RANGE", "ACCUMULATION", "DISTRIBUTION", "HIGH_VOLATILITY"}
-    if _counter_trend:
-        # Counter-trend: one extra confirmation required — EMA opposes direction.
-        effective_min_confirmations = min(min_confirmations + 1, 4)
-    elif regime.regime in _RANGE_REGIMES:
-        # Range/volatile regimes: require one extra confirmation over the base
-        # minimum.  Structural signals alone (e.g. SMC + Wyckoff without EMA
-        # trend or PA) are insufficient in choppy/ranging markets — at least
-        # one momentum engine must also agree to avoid repeated SL hits.
-        effective_min_confirmations = min(min_confirmations + 1, 4)
-    else:
-        effective_min_confirmations = min_confirmations
-
-    # Entry filter — minimum N-of-4 vote gate (SMC always required)
+    # Entry filter — SMC is mandatory and any one of the other three
+    # directional strategies is sufficient.  Other safety gates below
+    # (confidence, freshness, regime, risk/reward, and circuit breakers)
+    # remain active.
     ef = apply_entry_filter(
         smc_signal      = candidate,
         ema_trend       = trend.trend,
