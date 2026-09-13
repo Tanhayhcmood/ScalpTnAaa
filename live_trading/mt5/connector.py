@@ -331,10 +331,26 @@ async def fetch_candles(
         candles = await _account.get_historical_candles(
             symbol, tf, start_time, count + 5
         )
+        # MetaAPI may return candles in either order and can repeat a candle
+        # around a reconnect. Normalize the order and deduplicate before
+        # selecting the closed-candle window.
+        parsed: dict[datetime, dict] = {}
+        for c in candles or []:
+            if not isinstance(c, dict):
+                continue
+            t = _parse_time(c.get("time") or c.get("brokerTime"))
+            if t is not None:
+                parsed[t] = c
+
+        ordered = sorted(parsed.items(), key=lambda item: item[0])
+        # MetaAPI includes the currently forming candle as the newest row.
+        # Keep the existing closed-candle contract, but apply it only after
+        # sorting/deduplication so it remains correct across reconnects.
+        closed = ordered[:-1] if len(ordered) > 1 else []
+
         # Convert to OHLCV; skip the still-open last candle
         result: List[OHLCV] = []
-        for c in candles[:-1]:   # drop the forming candle
-            t = _parse_time(c.get("time") or c.get("brokerTime"))
+        for t, c in closed:
             result.append(OHLCV(
                 time=t,
                 open=float(c.get("open",  0)),
@@ -540,15 +556,48 @@ async def get_last_completed_bar_time(
     candles = await fetch_candles(symbol, timeframe, count=2)
     if len(candles) < 2:
         return None
-    return candles[-2].time
+    # fetch_candles() already removes the forming candle. Returning [-2]
+    # here made every scan one complete bar late.
+    return candles[-1].time
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _parse_time(raw: Any) -> datetime:
+def _parse_time(raw: Any) -> Optional[datetime]:
+    """Parse MetaAPI candle timestamps into timezone-aware UTC datetimes.
+
+    MetaAPI responses may be ISO strings, epoch seconds, or epoch
+    milliseconds. Falling back to ``now`` on malformed input is unsafe:
+    it fabricates a fresh candle and can authorize a trade using stale data.
+    """
     if isinstance(raw, datetime):
-        return raw.replace(tzinfo=timezone.utc) if raw.tzinfo is None else raw
+        value = raw.replace(tzinfo=timezone.utc) if raw.tzinfo is None else raw
+        return value.astimezone(timezone.utc)
+
+    if raw is None:
+        return None
+
+    # Numeric timestamps are seconds for normal Unix values and milliseconds
+    # for the 13-digit values used by many broker APIs.
     try:
-        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-    except Exception:
-        return datetime.now(timezone.utc)
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            epoch = float(raw)
+        else:
+            text = str(raw).strip()
+            if not text:
+                return None
+            epoch = float(text)
+        if epoch > 100_000_000_000:
+            epoch /= 1000.0
+        return datetime.fromtimestamp(epoch, tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+
+    try:
+        value = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        log.warning("Ignoring candle with invalid timestamp: %r", raw)
+        return None
