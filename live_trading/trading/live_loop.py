@@ -31,7 +31,6 @@ from typing import List, Optional
 
 from live_trading.config import (
     SYMBOL, TIMEFRAME, CANDLE_WINDOW, RISK_PERCENT,
-    MT5_HOST, MT5_USER,
     MAX_OPEN_TRADES, COMMENT,
     BAR_CHECK_INTERVAL, RECONNECT_DELAY, SYNC_TIMEOUT,
     MIN_CONFIRMATIONS, REQUIRE_PRICE_ACTION,
@@ -60,8 +59,8 @@ from live_trading.signals.h1_validator import validate_h1_candles
 from live_trading.signals.wyckoff_engine import calibrate_wyckoff, set_calibrated_config
 from live_trading.mt5.connector import (
     connect, disconnect, ensure_connected,
-    connect_with_retry, keepalive_mtapi,
-    start_connection_watchdog, start_mt5_session_keepalive,
+    connect_with_retry, keepalive_metaapi,
+    start_connection_watchdog, start_metaapi_session_keepalive,
     fetch_candles, get_account_balance, get_account_info,
     check_symbol_available,
     get_open_positions, get_last_completed_bar_time,
@@ -240,7 +239,7 @@ class GoldScalperLive:
         self._consecutive_acc_failures: int = 0
         self._mt5_keepalive_task: asyncio.Task | None = None
 
-        # Handle for the MTAPI keepalive background task (cancelled on stop)
+        # Handle for the MetaAPI keepalive background task (cancelled on stop)
         self._keepalive_task: Optional[asyncio.Task] = None
 
         # ── Staircase Trailing Stop ──────────────────────────────────────────
@@ -277,7 +276,7 @@ class GoldScalperLive:
 
     async def start(self) -> bool:
         log.info("=" * 60)
-        log.info("  GoldScalperPro v4 — LIVE TRADING ENGINE (MTAPI)")
+        log.info("  GoldScalperPro v4 — LIVE TRADING ENGINE (MetaAPI)")
         log.info(f"  Symbol: {SYMBOL}  |  Trade TFs: {chr(44).join(TRADE_TIMEFRAMES)} (highest first)")
         log.info(f"  Risk: {RISK_PERCENT}%  |  Max positions: {MAX_OPEN_TRADES}")
         log.info(f"  Min confirmations: {MIN_CONFIRMATIONS}")
@@ -294,18 +293,18 @@ class GoldScalperLive:
         connected = await connect_with_retry(max_attempts=12, retry_delay=30.0)
         if not connected:
             log.error(
-                "MTAPI connection failure after all retry attempts. "
-                "Check MTAPI_URL, MT5_HOST, MT5_PORT, MT5_USER, and MT5_PASSWORD."
+                "MetaAPI connection failure after all retry attempts. "
+                "Check METAAPI_TOKEN and METAAPI_ACCOUNT_ID."
             )
             self._write_state("DISCONNECTED",
-                              extra={"error": "MTAPI connection failed after retries"})
+                              extra={"error": "MetaAPI connection failed after retries"})
             return False  # non-False return signals failure to main.py for sys.exit(1)
 
         # ── Read-only broker checks — no order is placed here ──────────────────
         if not await check_symbol_available(SYMBOL):
             self._write_state(
                 "DISCONNECTED",
-                extra={"error": f"{SYMBOL} is not available through MTAPI"},
+                extra={"error": f"{SYMBOL} is not available through MetaAPI"},
             )
             return False
 
@@ -324,23 +323,23 @@ class GoldScalperLive:
                 "was returned; the market may be closed"
             )
 
-        # ── MTAPI keepalive task ───────────────────────────────────────────────
+        # ── MetaAPI keepalive task ───────────────────────────────────────────────
         # Store the handle so we can cancel it when the engine stops; without
         # this, the task becomes orphaned on every supervisor-driven restart and
         # multiple background pings accumulate across restarts.
         self._keepalive_task = asyncio.create_task(
-            self._keepalive_loop(), name="mtapi_keepalive"
+            self._keepalive_loop(), name="metaapi_keepalive"
         )
         # Proactive connection watchdog: checks MT5 health every 60 s and
         # reconnects before the trading loop hits a failure.  Faster than
         # waiting for a bar-tick request to fail (worst case: one full bar).
         self._watchdog_task = asyncio.create_task(
-            start_connection_watchdog(interval_seconds=30.0), name="mt5_watchdog"
+            start_connection_watchdog(interval_seconds=30.0), name="metaapi_watchdog"
         )
         # MT5 broker-session keepalive: pings /ConnectionStatus every 3 min
         # so the broker socket stays open and conn_id never expires silently.
         self._mt5_keepalive_task = asyncio.create_task(
-            start_mt5_session_keepalive(), name="mt5_session_keepalive"
+            start_metaapi_session_keepalive(), name="metaapi_session_keepalive"
         )
         # Belt-and-suspenders: if any step below raises before _run_loop() is
         # entered, _run_loop()'s own finally block never executes, leaving the
@@ -362,8 +361,8 @@ class GoldScalperLive:
                 self._last_acc_info = acc_info
                 log.info(
                     "MT5 account connection status: CONNECTED "
-                    f"(account={str(acc_info.get('login') or MT5_USER)[:3]}***, "
-                    f"host={acc_info.get('server') or MT5_HOST}, "
+                    f"(account={str(acc_info.get('login') or 'unknown')[:3]}***, "
+                    f"host={acc_info.get('server') or 'unknown'}, "
                     f"balance={float(acc_info.get('balance', 0.0)):.2f}, "
                     f"equity={float(acc_info.get('equity', 0.0)):.2f})"
                 )
@@ -492,7 +491,7 @@ class GoldScalperLive:
                     await self._keepalive_task
                 except asyncio.CancelledError:
                     pass
-                log.debug("MTAPI keepalive task cancelled in start() finally.")
+                log.debug("MetaAPI keepalive task cancelled in start() finally.")
 
     # ── Wyckoff calibration ───────────────────────────────────────────────────
 
@@ -517,7 +516,7 @@ class GoldScalperLive:
         while True:
             await asyncio.sleep(_INTERVAL)
             try:
-                await keepalive_mtapi()
+                await keepalive_metaapi()
             except Exception:
                 pass
 
@@ -628,7 +627,7 @@ class GoldScalperLive:
             # server.py catch the exception, apply the configured backoff, and
             # restart the engine without Render having to restart the container.
         finally:
-            # Cancel the MTAPI keepalive background task so it does not remain
+            # Cancel the MetaAPI keepalive background task so it does not remain
             # orphaned when the supervisor restarts the engine inside the same
             # asyncio event loop.  Multiple orphaned tasks would fire redundant
             # pings every 10 min and accumulate across restarts indefinitely.
@@ -638,7 +637,7 @@ class GoldScalperLive:
                     await self._keepalive_task
                 except asyncio.CancelledError:
                     pass
-                log.debug("MTAPI keepalive task cancelled.")
+                log.debug("MetaAPI keepalive task cancelled.")
             if getattr(self, "_mt5_keepalive_task", None) and not self._mt5_keepalive_task.done():
                 self._mt5_keepalive_task.cancel()
                 try:
@@ -1347,7 +1346,7 @@ class GoldScalperLive:
             self._set_trade_permission(
                 True,
                 "ORDER_PLACED",
-                ["Order accepted by MTAPI"],
+                ["Order accepted by MetaAPI"],
             )
             # Block all further _on_new_bar calls in this tick from opening
             # another position (covers the multi-TF same-bar-boundary race).
@@ -1617,7 +1616,7 @@ class GoldScalperLive:
                 history = await get_closed_position_history(ticket_id)
             except RuntimeError as exc:
                 log.warning(
-                    f"Could not read MT5 close history for {ticket_id}: {exc}"
+                    f"Could not read MetaAPI close history for {ticket_id}: {exc}"
                 )
                 continue
             if not history:
@@ -1794,7 +1793,7 @@ class GoldScalperLive:
             clear_command("restart_engine")
 
         # "restart_mt5" — sent by Telegram panel Restart MT5 button.
-        # Disconnects from MTAPI so the main loop reconnects
+        # Disconnects from MetaAPI so the main loop reconnects
         # immediately (reconnect_attempts reset so no exponential backoff delay).
         if cmds.get("restart_mt5"):
             log.info(
@@ -1805,7 +1804,7 @@ class GoldScalperLive:
             self._reconnect_attempts = 0  # bypass exponential backoff
             self._write_state(
                 "DISCONNECTED",
-                extra={"info": "MT5 reconnect requested via Telegram"},
+                extra={"info": "MetaAPI reconnect requested via Telegram"},
             )
             clear_command("restart_mt5")
 

@@ -42,9 +42,9 @@ _robot_status = "STARTING"
 _current_engine = None  # live GoldScalperLive instance, set in _run_robot_once()
 # Only truly fatal states (config errors, unhandled crashes) return 503.
 # DISCONNECTED is intentionally excluded: the robot is alive and actively
-# trying to reconnect to the MT5 bridge.  Returning 503 for DISCONNECTED
+# trying to reconnect through MetaAPI. Returning 503 for DISCONNECTED
 # caused Render's health monitor to restart the service on every temporary
-# MT5 connection loss, creating an infinite restart loop that prevented the
+# broker-session loss, creating an infinite restart loop that prevented the
 # robot from ever completing its reconnect backoff.
 # RETRY_IN_* is also excluded for the same reason.
 # STOPPED is excluded: the supervisor will restart the engine automatically.
@@ -53,9 +53,9 @@ _HEARTBEAT_MAX_AGE_SECONDS = 180
 
 # Self-ping keepalive: ping /health every 8 minutes so Render free-tier
 # services never spin down.  10 min < Render's 15-min inactivity threshold.
-# The live loop keeps the MTAPI broker session alive through
-# /ConnectionStatus. The hosted MTAPI service does not expose the old
-# self-hosted bridge's /Ping endpoint.
+# The live loop keeps the MetaAPI broker session alive through
+# its RPC connection; the health endpoint remains independent of broker
+# availability so Render does not restart the service during reconnects.
 _KEEPALIVE_INTERVAL_SECONDS = 360  # 6 minutes — safer margin: 3 pings before Render 15-min sleep
 
 
@@ -118,7 +118,7 @@ def _read_local_state() -> dict | None:
 
 
 def _read_local_snapshot() -> dict | None:
-    """Read the local MT5 snapshot file."""
+    """Read the local broker snapshot file."""
     try:
         from live_trading.config import MT5_SNAPSHOT
         with open(MT5_SNAPSHOT, "r", encoding="utf-8") as f:
@@ -258,11 +258,9 @@ async def _status(req: web.Request):
             "_data_fresh": False,
             "_data_age_seconds": -1,
             "diagnostics": {
-                "mtapi_url_configured": bool(os.environ.get("MTAPI_URL")),
-                "mt5_host": os.environ.get("MT5_HOST", ""),
-                "mt5_port": os.environ.get("MT5_PORT", ""),
-                "mt5_user_configured": bool(os.environ.get("MT5_USER")),
-                "mt5_password_configured": bool(os.environ.get("MT5_PASSWORD")),
+                "metaapi_token_configured": bool(os.environ.get("METAAPI_TOKEN")),
+                "metaapi_account_configured": bool(os.environ.get("METAAPI_ACCOUNT_ID")),
+                "broker_connection": "metaapi",
                 "diagnostic_revision": "env-recheck-2",
             },
         }),
@@ -307,7 +305,7 @@ def _build_snapshot_from_state(state: dict, signal_snap: dict | None = None) -> 
 
 
 async def _snapshot(req: web.Request):
-    """GET /snapshot — returns the live MT5 account snapshot.
+    """GET /snapshot — returns the live MetaAPI account snapshot.
 
     FIX: Previous implementation returned the Redis snapshot key first, but that
     key only contains per-bar signal data (price/regime/adx/atr) — no account
@@ -315,7 +313,7 @@ async def _snapshot(req: web.Request):
     builds the response from robot state (authoritative) and merges signal data.
 
     Read-only endpoint: no authentication required.
-    Used by the Telegram panel's MT5Service HTTP fallback to get live
+    Used by the Telegram panel's broker-service HTTP fallback to get live
     account balance, positions, and trade data when Redis is unavailable.
 
     Priority:
@@ -586,19 +584,19 @@ async def _progress_log(request):
 
 async def _run_robot_once():
     global _robot_status
-    from live_trading.config import MTAPI_URL, MT5_USER, MT5_PASSWORD
+    from live_trading.config import METAAPI_TOKEN, METAAPI_ACCOUNT_ID
     from live_trading.logger import get_logger
     from live_trading.trading.live_loop import GoldScalperLive
-    from live_trading.mt5.connector import disconnect as _mt5_disconnect
+    from live_trading.mt5.connector import disconnect as _metaapi_disconnect
 
     log = get_logger()
 
-    if not MTAPI_URL:
+    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
         _robot_status = "CONFIG_ERROR"
-        raise RuntimeError("MTAPI_URL is not set — cannot start the trading engine.")
-    if not MT5_USER or not MT5_PASSWORD:
-        _robot_status = "CONFIG_ERROR"
-        raise RuntimeError("MT5_USER / MT5_PASSWORD is not set — cannot connect to broker.")
+        raise RuntimeError(
+            "METAAPI_TOKEN and METAAPI_ACCOUNT_ID must be set — "
+            "cannot start the MetaAPI trading engine."
+        )
 
     _robot_status = "STARTING"
     global _current_engine
@@ -609,20 +607,20 @@ async def _run_robot_once():
         # NOTE: engine.start() runs indefinitely by design -- including while
         # legitimately PAUSED (e.g. a RiskGuardian halt) -- so it must NOT be
         # wrapped in a bounded asyncio.wait_for(). A timeout here previously
-        # forced a full engine restart (and MT5 disconnect/reconnect) every
+        # forced a full engine restart (and MetaAPI disconnect/reconnect) every
         # ~240s even during normal, healthy PAUSED operation, which is what
         # was producing the repeated "Connection Lost / Connection Restored"
         # Telegram notifications. The actual root cause (frozen heartbeat
         # while paused) is fixed directly in live_loop.py's paused branch, so
         # no artificial bound is needed here.
         ok = await engine.start()
-        # engine.start() returns False when MT5 connection or startup fails.
+        # engine.start() returns False when the MetaAPI connection or startup fails.
         # Without this check a False return is treated as a clean exit,
         # bypassing supervisor backoff and leaving _robot_status as RUNNING.
         if not ok:
             raise RuntimeError(
                 "GoldScalperLive.start() returned False — "
-                "MT5 connection or engine startup failed."
+                "MetaAPI connection or engine startup failed."
             )
     except Exception:
         # DIAGNOSTIC: persist the full traceback to an always-writable path so
@@ -638,7 +636,7 @@ async def _run_robot_once():
     finally:
         _robot_status = "STOPPED"
         try:
-            await _mt5_disconnect()
+            await _metaapi_disconnect()
         except Exception:
             pass
 

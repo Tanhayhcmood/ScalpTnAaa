@@ -1,16 +1,12 @@
 """
 MetaAPI.cloud Connector — GoldScalperPro v4
 
-Replaces the mtapi.io bridge with MetaAPI.cloud which has a complete
-MT5 broker database (including AMarkets-Demo) and handles broker server
-discovery automatically.
+Uses MetaAPI.cloud for MT5 connectivity, broker discovery, market data,
+and trade execution through the account's RPC connection.
 
 Required env vars:
     METAAPI_TOKEN      — API token from metaapi.cloud dashboard
     METAAPI_ACCOUNT_ID — MT5 account ID from metaapi.cloud dashboard
-
-Optional (kept for backward compat but not used when MetaAPI token is set):
-    MT5_USER / MT5_PASSWORD / MT5_HOST / MTAPI_URL
 
 MetaAPI docs: https://metaapi.cloud/docs/client/
 """
@@ -20,10 +16,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Any
 
-from live_trading.config import (
-    METAAPI_TOKEN, METAAPI_ACCOUNT_ID,
-    MT5_HOST, MT5_USER, MT5_PASSWORD,
-)
+from live_trading.config import METAAPI_TOKEN, METAAPI_ACCOUNT_ID
 from live_trading.signals.gold_engine import OHLCV
 from live_trading.logger import get_logger
 
@@ -143,7 +136,118 @@ def get_connection():
     return _connection if _connected else None
 
 
+async def connect_with_retry(
+    max_attempts: int = 12,
+    retry_delay: float = 30.0,
+) -> bool:
+    """Connect to MetaAPI with bounded exponential retry backoff."""
+    for attempt in range(1, max_attempts + 1):
+        if await connect():
+            return True
+        if attempt < max_attempts:
+            delay = retry_delay * min(2 ** (attempt - 1), 4)
+            log.warning(
+                f"MetaAPI connection attempt {attempt}/{max_attempts} failed; "
+                f"retrying in {delay:.0f}s"
+            )
+            await asyncio.sleep(delay)
+    return False
+
+
+async def keepalive_metaapi() -> bool:
+    """Perform a lightweight RPC call to keep and verify the MetaAPI session."""
+    global _connected
+    if not is_connected():
+        return False
+    try:
+        await _connection.get_account_information()
+        return True
+    except Exception as exc:
+        _connected = False
+        log.warning(f"MetaAPI keepalive failed: {exc}")
+        return False
+
+
+async def start_connection_watchdog(interval_seconds: float = 30.0) -> None:
+    """Monitor the MetaAPI session and reconnect after a disconnect."""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        if not is_connected():
+            await connect()
+        else:
+            await keepalive_metaapi()
+
+
+async def start_metaapi_session_keepalive(interval_seconds: float = 180.0) -> None:
+    """Keep the synchronized MetaAPI RPC session active."""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await keepalive_metaapi()
+
+
 # ── Market data ───────────────────────────────────────────────────────────────
+
+async def check_symbol_available(symbol: str) -> bool:
+    """Return whether MetaAPI exposes a specification for the symbol."""
+    if not is_connected():
+        return False
+    try:
+        specification = await _connection.get_symbol_specification(symbol)
+        return bool(specification)
+    except Exception as exc:
+        log.warning(f"check_symbol_available({symbol}) error: {exc}")
+        return False
+
+
+async def get_current_quote(symbol: str) -> Optional[dict]:
+    """Return the current MetaAPI bid/ask quote for a symbol."""
+    if not is_connected():
+        return None
+    try:
+        quote = await _connection.get_symbol_price(symbol)
+        if not quote:
+            return None
+        return {
+            "symbol": quote.get("symbol", symbol),
+            "bid": float(quote.get("bid", 0.0)),
+            "ask": float(quote.get("ask", 0.0)),
+            "time": quote.get("time") or quote.get("brokerTime"),
+        }
+    except Exception as exc:
+        log.warning(f"get_current_quote({symbol}) error: {exc}")
+        return None
+
+
+async def get_closed_position_history(position_id: str) -> dict:
+    """Return the closing deal for a MetaAPI position, when available."""
+    if not is_connected():
+        return {}
+    try:
+        get_deals = getattr(_connection, "get_deals_by_position", None)
+        if get_deals is None:
+            log.warning("MetaAPI SDK does not expose get_deals_by_position")
+            return {}
+        deals = await get_deals(position_id)
+        if not deals:
+            return {}
+        closing = [
+            deal for deal in deals
+            if str(deal.get("entryType", "")).upper() in {
+                "DEAL_ENTRY_OUT", "DEAL_ENTRY_OUT_BY"
+            }
+        ] or deals
+        deal = closing[-1]
+        return {
+            "closePrice": deal.get("price", deal.get("closePrice")),
+            "closeTime": deal.get("time", deal.get("brokerTime")),
+            "profit": deal.get("profit", 0.0),
+            "commission": deal.get("commission", 0.0),
+            "swap": deal.get("swap", 0.0),
+        }
+    except Exception as exc:
+        log.warning(f"get_closed_position_history({position_id}) error: {exc}")
+        return {}
+
 
 async def fetch_candles(
     symbol:    str,
@@ -202,8 +306,8 @@ async def get_account_info() -> dict:
             "currency":    info.get("currency",   "USD"),
             "leverage":    info.get("leverage",   100),
             "name":        info.get("name",       ""),
-            "login":       info.get("login",      MT5_USER),
-            "server":      info.get("server",     MT5_HOST),
+            "login":       info.get("login",      ""),
+            "server":      info.get("server",     ""),
         }
     except Exception as exc:
         log.warning(f"get_account_info error: {exc}")
