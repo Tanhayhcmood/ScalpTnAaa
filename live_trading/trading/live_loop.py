@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from live_trading.config import (
+    METAAPI_TOKEN, METAAPI_ACCOUNT_ID,
     SYMBOL, TIMEFRAME, CANDLE_WINDOW, RISK_PERCENT,
     MAX_OPEN_TRADES, COMMENT,
     BAR_CHECK_INTERVAL, RECONNECT_DELAY, SYNC_TIMEOUT,
@@ -547,6 +548,8 @@ class GoldScalperLive:
 
                 # ── Reconnect with exponential backoff ────────────────────────
                 ok = await ensure_connected(
+                    METAAPI_TOKEN,
+                    METAAPI_ACCOUNT_ID,
                     SYNC_TIMEOUT,
                     attempt=self._reconnect_attempts + 1,
                 )
@@ -863,7 +866,11 @@ class GoldScalperLive:
                     "Account data unavailable (attempt 1) — "
                     "reconnecting and retrying before declaring DISCONNECTED …"
                 )
-                await ensure_connected()
+                await ensure_connected(
+                    METAAPI_TOKEN,
+                    METAAPI_ACCOUNT_ID,
+                    SYNC_TIMEOUT,
+                )
                 acc_info = await get_account_info()
             if not acc_info or "balance" not in acc_info or "equity" not in acc_info:
                 self._set_trade_permission(
