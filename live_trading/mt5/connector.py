@@ -281,7 +281,8 @@ async def fetch_candles(
         start_time = datetime.now(timezone.utc) - timedelta(
             seconds=tf_secs * (count + 10)
         )
-        candles = await _connection.get_historical_candles(
+        # Historical candles are exposed by the account API, not the RPC connection.
+        candles = await _account.get_historical_candles(
             symbol, tf, start_time, count + 5
         )
         # Convert to OHLCV; skip the still-open last candle
