@@ -341,26 +341,141 @@ async def get_account_info() -> dict:
         return {}
 
 
-async def get_open_positions(symbol: str) -> list:
-    if not is_connected():
-        return []
+# MetaAPI can occasionally return a malformed phantom position row. Keep this
+# normalization at the connector boundary so every caller sees the same safe data.
+_MAX_REASONABLE_POSITION_VOLUME = 1000.0
+
+
+def _position_ticket(position: dict) -> str:
+    value = position.get("id", position.get("ticket", position.get("positionId", "")))
+    return str(value) if value is not None else ""
+
+
+def _position_volume(position: dict) -> float:
+    """Return a position volume in lots across MetaAPI and legacy shapes."""
+    raw_volume = position.get("volume")
+    raw_lots = position.get("lots")
     try:
-        positions = await _connection.get_positions()
-        return [p for p in positions if p.get("symbol") == symbol]
+        volume = float(raw_volume) if raw_volume is not None else 0.0
+    except (TypeError, ValueError):
+        volume = 0.0
+    try:
+        lots = float(raw_lots) if raw_lots is not None else 0.0
+    except (TypeError, ValueError):
+        lots = 0.0
+    if 0.0 < lots <= _MAX_REASONABLE_POSITION_VOLUME and (
+        volume <= 0.0 or volume > _MAX_REASONABLE_POSITION_VOLUME
+    ):
+        return lots
+    return volume
+
+
+def _position_direction(position: dict) -> str:
+    value = position.get("type", position.get("direction"))
+    if value is None:
+        value = position.get("orderType")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return {0: "BUY", 1: "SELL"}.get(int(value), "UNKNOWN")
+    text = str(value).upper()
+    if "BUY" in text or "LONG" in text:
+        return "BUY"
+    if "SELL" in text or "SHORT" in text:
+        return "SELL"
+    return "UNKNOWN"
+
+
+def _dedupe_positions(
+    positions: list,
+    known_positions: Optional[dict] = None,
+) -> tuple[list, list[str]]:
+    """Drop malformed rows and repair known tickets when possible."""
+    known = known_positions or {}
+    result: list = []
+    dropped: list[str] = []
+    seen_tickets: set[str] = set()
+    for position in positions:
+        if not isinstance(position, dict):
+            dropped.append("<non-dict>")
+            continue
+        ticket = _position_ticket(position)
+        if ticket and ticket in seen_tickets:
+            log.warning("Dropping duplicate open-position row for ticket %s", ticket)
+            continue
+        if ticket:
+            seen_tickets.add(ticket)
+        volume = _position_volume(position)
+        if 0.0 < volume <= _MAX_REASONABLE_POSITION_VOLUME:
+            result.append(position)
+            continue
+        repair = known.get(ticket) if ticket else None
+        repair_volume = repair.get("volume") if isinstance(repair, dict) else None
+        try:
+            repair_volume = float(repair_volume)
+        except (TypeError, ValueError):
+            repair_volume = 0.0
+        if repair and 0.0 < repair_volume <= _MAX_REASONABLE_POSITION_VOLUME:
+            repaired = dict(position)
+            repaired["volume"] = repair_volume
+            repaired["type"] = repair.get("direction", repair.get("type", "UNKNOWN"))
+            result.append(repaired)
+            log.warning("Repaired malformed open-position row for known ticket %s", ticket)
+        else:
+            dropped.append(ticket or "<unknown>")
+            log.warning("Dropped malformed open-position row for ticket %s", ticket or "<unknown>")
+    return result, dropped
+
+
+def _parse_open_positions_response(
+    payload: Any,
+    status: int = 200,
+    known_positions: Optional[dict] = None,
+) -> tuple[list, list[str]]:
+    """Validate and normalize an open positions response."""
+    if not 200 <= int(status) < 300:
+        detail = payload.get("message") if isinstance(payload, dict) else payload
+        raise RuntimeError(f"HTTP {status}: {detail or 'open positions request failed'}")
+    if not isinstance(payload, list):
+        detail = payload.get("message") if isinstance(payload, dict) else None
+        raise RuntimeError(detail or "Malformed open positions response")
+    return _dedupe_positions(payload, known_positions=known_positions)
+
+
+async def get_open_positions(
+    symbol: str,
+    known_positions: Optional[dict] = None,
+    *,
+    return_diagnostics: bool = False,
+):
+    """Return safe open positions for one symbol."""
+    if not is_connected():
+        raise RuntimeError("MetaAPI connection is not ready")
+    try:
+        payload = await _connection.get_positions()
+        positions, dropped = _parse_open_positions_response(
+            payload, 200, known_positions=known_positions
+        )
+        filtered = [p for p in positions if p.get("symbol") == symbol]
+        if return_diagnostics:
+            return filtered, dropped
+        return filtered
+    except RuntimeError:
+        raise
     except Exception as exc:
         log.warning(f"get_open_positions error: {exc}")
-        return []
+        raise RuntimeError(f"MetaAPI get_positions failed: {exc}") from exc
 
 
 def mt5_pos_to_dict(pos: dict) -> dict:
-    ptype     = pos.get("type", "POSITION_TYPE_BUY")
-    direction = "BUY" if "BUY" in str(ptype).upper() else "SELL"
+    direction = _position_direction(pos)
+    volume = _position_volume(pos)
     return {
-        "id":         str(pos.get("id", pos.get("ticket", ""))),
+        "id":         _position_ticket(pos),
         "symbol":     pos.get("symbol", ""),
         "direction":  direction,
-        "lot_size":   pos.get("volume", 0),
-        "price_open": pos.get("openPrice", pos.get("priceOpen", 0)),
+        "type":       direction,
+        "volume":     volume,
+        "lot_size":   volume,
+        "price_open": pos.get("openPrice", pos.get("priceOpen", pos.get("open_price", 0))),
         "sl":         pos.get("stopLoss",   pos.get("sl", 0)),
         "tp":         pos.get("takeProfit", pos.get("tp", 0)),
         "profit":     pos.get("profit",  0),
