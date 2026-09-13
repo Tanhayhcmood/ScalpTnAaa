@@ -27,6 +27,13 @@ _api              = None   # MetaApi instance
 _account          = None   # MetatraderAccount
 _connection       = None   # RpcMetaApiConnection
 _connected: bool  = False
+# The main loop and the watchdog can both notice a broken session at nearly
+# the same time.  Without a lock they each create a MetaApi client and RPC
+# connection, leaving orphaned websocket subscriptions behind.  MetaAPI then
+# starts reporting "too many unexisting or undeployed trading accounts" and
+# the trading loop can miss a candle while the duplicate sessions reconnect.
+_connection_lock = asyncio.Lock()
+_health_lock = asyncio.Lock()
 
 
 def _account_field(info: Any, key: str, default: Any = None) -> Any:
@@ -52,6 +59,36 @@ _TF_SECONDS = {
 
 # ── Connection lifecycle ──────────────────────────────────────────────────────
 
+async def _close_current_connection_unlocked() -> None:
+    """Close and clear the current MetaAPI objects.
+
+    The caller must hold ``_connection_lock``.  Clearing the module state in a
+    ``finally``-style helper is important after a failed reconnect: otherwise
+    the next reconnect may keep using a half-closed SDK client.
+    """
+    global _api, _account, _connection, _connected
+
+    connection = _connection
+    api = _api
+    _connected = False
+    _connection = None
+    _account = None
+    _api = None
+
+    try:
+        if connection:
+            await connection.close()
+    except Exception as exc:
+        log.debug(f"MetaAPI RPC close failed during cleanup: {exc}")
+    try:
+        if api:
+            result = api.close()
+            if hasattr(result, "__await__"):
+                await result
+    except Exception as exc:
+        log.debug(f"MetaAPI client close failed during cleanup: {exc}")
+
+
 async def connect(*args, **kwargs) -> bool:
     """
     Connect to MT5 via MetaAPI.cloud.
@@ -76,57 +113,61 @@ async def connect(*args, **kwargs) -> bool:
         )
         return False
 
-    try:
-        from metaapi_cloud_sdk import MetaApi  # type: ignore
+    async with _connection_lock:
+        # A watchdog reconnect and a bar-tick reconnect may arrive together.
+        # The first successful caller owns the session; the second must reuse
+        # it instead of creating another websocket subscription.
+        if _connected and _connection is not None:
+            return True
 
-        log.info(f"Connecting to MetaAPI.cloud — account {account_id[:12]}…")
-        _api     = MetaApi(token)
-        _account = await _api.metatrader_account_api.get_account(account_id)
+        # Dispose of a stale/half-open client before creating a replacement.
+        await _close_current_connection_unlocked()
 
-        # Deploy account if not yet deployed
-        if _account.state not in ("DEPLOYED", "DEPLOYING"):
-            log.info("Deploying MetaAPI account…")
-            await _account.deploy()
+        try:
+            from metaapi_cloud_sdk import MetaApi  # type: ignore
 
-        log.info("Waiting for account to connect to broker…")
-        await _account.wait_connected(timeout_in_seconds=min(timeout, 120))
+            log.info(f"Connecting to MetaAPI.cloud — account {account_id[:12]}…")
+            _api     = MetaApi(token)
+            _account = await _api.metatrader_account_api.get_account(account_id)
 
-        # RPC connection is simpler and sufficient for candle + order data
-        _connection = _account.get_rpc_connection()
-        await _connection.connect()
-        await _connection.wait_synchronized(timeout_in_seconds=min(timeout, 60))
+            # Deploy account if not yet deployed.  wait_connected() is still
+            # used for DEPLOYING because MetaAPI may need a short provisioning
+            # window before the broker session becomes available.
+            if _account.state not in ("DEPLOYED", "DEPLOYING"):
+                log.info("Deploying MetaAPI account…")
+                await _account.deploy()
 
-        # broker is part of the synchronized account-information response;
-        # MetatraderAccount itself does not expose the broker field in SDK 29.1.1.
-        account_info = await _connection.get_account_information()
-        broker_label = (
-            _account_field(account_info, "broker")
-            or _account_field(account_info, "server")
-            or "MT5"
-        )
-        _connected = True
-        log.info(f"✅ MetaAPI connected — broker: {broker_label}")
-        return True
+            log.info("Waiting for account to connect to broker…")
+            await _account.wait_connected(timeout_in_seconds=min(timeout, 120))
 
-    except Exception as exc:
-        log.error(f"❌ MetaAPI connect failed: {exc}")
-        _connected = False
-        return False
+            # RPC connection is simpler and sufficient for candle + order data
+            _connection = _account.get_rpc_connection()
+            await _connection.connect()
+            await _connection.wait_synchronized(timeout_in_seconds=min(timeout, 60))
+
+            # broker is part of the synchronized account-information response;
+            # MetatraderAccount itself does not expose the broker field in SDK 29.1.1.
+            account_info = await _connection.get_account_information()
+            broker_label = (
+                _account_field(account_info, "broker")
+                or _account_field(account_info, "server")
+                or "MT5"
+            )
+            _connected = True
+            log.info(f"✅ MetaAPI connected — broker: {broker_label}")
+            return True
+
+        except Exception as exc:
+            log.error(f"❌ MetaAPI connect failed: {exc}")
+            # Close the failed client before the retry.  This prevents failed
+            # attempts from accumulating subscriptions in the SDK.
+            await _close_current_connection_unlocked()
+            return False
 
 
 async def disconnect() -> None:
-    global _connection, _account, _api, _connected
-    _connected = False
-    try:
-        if _connection:
-            await _connection.close()
-        if _api:
-            _api.close()
-    except Exception:
-        pass
-    _connection = None
-    _account    = None
-    _api        = None
+    async with _connection_lock:
+        await _close_current_connection_unlocked()
 
 
 async def ensure_connected(
@@ -135,7 +176,6 @@ async def ensure_connected(
     timeout:    int = 300,
     attempt:    int = 1,
 ) -> bool:
-    global _connected
     if _connected and _connection is not None:
         return True
     log.info(f"Reconnecting (attempt {attempt})…")
@@ -172,15 +212,21 @@ async def connect_with_retry(
 async def keepalive_metaapi() -> bool:
     """Perform a lightweight RPC call to keep and verify the MetaAPI session."""
     global _connected
-    if not is_connected():
-        return False
-    try:
-        await _connection.get_account_information()
-        return True
-    except Exception as exc:
-        _connected = False
-        log.warning(f"MetaAPI keepalive failed: {exc}")
-        return False
+    async with _health_lock:
+        connection = _connection if is_connected() else None
+        if connection is None:
+            return False
+        try:
+            await connection.get_account_information()
+            return True
+        except Exception as exc:
+            # Only invalidate the session that was actually checked.  A
+            # successful concurrent reconnect must not be marked disconnected
+            # by a stale keepalive failure.
+            if _connection is connection:
+                _connected = False
+            log.warning(f"MetaAPI keepalive failed: {exc}")
+            return False
 
 
 async def start_connection_watchdog(interval_seconds: float = 30.0) -> None:
