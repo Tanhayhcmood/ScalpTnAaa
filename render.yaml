@@ -57,15 +57,9 @@ services:
     envVars:
       - key: RENDER_EXTERNAL_URL
         value: "https://goldscalper-v4-robot-usta.onrender.com"
-      - key: MTAPI_URL
-        value: "https://goldscalper-mtapi-c3a1.onrender.com"
-      - key: MT5_HOST
-        value: "AMarkets-Demo"
-      - key: MT5_PORT
-        value: "443"
-      - key: MT5_USER
+      - key: METAAPI_TOKEN
         sync: false
-      - key: MT5_PASSWORD
+      - key: METAAPI_ACCOUNT_ID
         sync: false
       # FIX: broker reports gold as "XAUUSD", not "XAUUSDb" — the wrong
       # symbol caused every candle/order request to fail silently, which was
@@ -196,14 +190,6 @@ services:
         value: "3.11.0"
       - key: PANEL_DB_PATH
         value: "/tmp/panel.db"
-      - key: MT5_USER
-        sync: false
-      - key: MT5_PASSWORD
-        sync: false
-      - key: MT5_HOST
-        value: "AMarkets-Demo"
-      - key: MT5_ACCOUNT_TYPE
-        value: "demo"
       - key: LOG_LEVEL
         value: "INFO"
       - key: ROBOT_INTERFACE_MODE

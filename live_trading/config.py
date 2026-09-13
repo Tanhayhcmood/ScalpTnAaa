@@ -5,10 +5,8 @@ All settings are read from environment variables so they can be changed
 on Render without touching code.
 
 Required:
-    MTAPI_URL     – official MTAPI REST API URL (normally https://mt5.mtapi.io)
-    MT5_HOST      – broker server name (e.g. AMarkets-Demo)
-    MT5_USER      – MT5 account login number
-    MT5_PASSWORD  – MT5 account password
+    METAAPI_TOKEN      – MetaAPI Cloud API token
+    METAAPI_ACCOUNT_ID – MetaAPI account ID linked to the MT5 account
 """
 import os
 import sys
@@ -133,13 +131,15 @@ def _timeframe(name: str, default: str) -> str:
     return val
 
 
-# ── Official MTAPI URL ────────────────────────────────────────────────────────
-MTAPI_URL     = os.getenv("MTAPI_URL",     "https://mt5.mtapi.io").rstrip("/")
+# ── MetaAPI.cloud ─────────────────────────────────────────────────────────────
+# MetaAPI owns the broker connection; these two secrets are required on Render.
+METAAPI_TOKEN      = os.getenv("METAAPI_TOKEN", "").strip()
+METAAPI_ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "").strip()
 
-# ── MT5 Broker Credentials ───────────────────────────────────────────────────
-MT5_HOST      = os.getenv("MT5_HOST",     "AMarkets-Demo")
+# Optional compatibility metadata. These are not used for MetaAPI authentication.
+MT5_HOST      = os.getenv("MT5_HOST", "AMarkets-Demo")
 MT5_PORT      = _int("MT5_PORT", 443, lo=1, hi=65535)
-MT5_USER      = os.getenv("MT5_USER",     "")
+MT5_USER      = os.getenv("MT5_USER", "")
 MT5_PASSWORD  = os.getenv("MT5_PASSWORD", "")
 
 # ── Symbol & Timeframe ───────────────────────────────────────────────────────
@@ -299,6 +299,3 @@ WYCKOFF_SPRING_MARGIN = 2.06
 # ── Redis IPC ────────────────────────────────────────────────────────────────
 REDIS_URL = os.getenv("REDIS_URL", "")
 
-# ── Backward-compat stubs (no longer used) ───────────────────────────────────
-METAAPI_TOKEN      = ""
-METAAPI_ACCOUNT_ID = ""
