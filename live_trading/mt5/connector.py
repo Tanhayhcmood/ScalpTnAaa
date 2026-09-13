@@ -28,6 +28,13 @@ _account          = None   # MetatraderAccount
 _connection       = None   # RpcMetaApiConnection
 _connected: bool  = False
 
+
+def _account_field(info: Any, key: str, default: Any = None) -> Any:
+    """Read an account-information field from SDK dicts or model objects."""
+    if isinstance(info, dict):
+        return info.get(key, default)
+    return getattr(info, key, default)
+
 # ── Timeframe → MetaAPI period map ───────────────────────────────────────────
 _TF_MAP = {
     "1m":  "1m",  "5m":  "5m",  "15m": "15m", "30m": "30m",
@@ -89,8 +96,16 @@ async def connect(*args, **kwargs) -> bool:
         await _connection.connect()
         await _connection.wait_synchronized(timeout_in_seconds=min(timeout, 60))
 
+        # broker is part of the synchronized account-information response;
+        # MetatraderAccount itself does not expose the broker field in SDK 29.1.1.
+        account_info = await _connection.get_account_information()
+        broker_label = (
+            _account_field(account_info, "broker")
+            or _account_field(account_info, "server")
+            or "MT5"
+        )
         _connected = True
-        log.info(f"✅ MetaAPI connected — broker: {_account.broker_name or 'MT5'}")
+        log.info(f"✅ MetaAPI connected — broker: {broker_label}")
         return True
 
     except Exception as exc:
@@ -297,17 +312,28 @@ async def get_account_info() -> dict:
         return {}
     try:
         info = await _connection.get_account_information()
+        free_margin = _account_field(
+            info,
+            "freeMargin",
+            _account_field(info, "free_margin", 0.0),
+        )
         return {
-            "balance":     info.get("balance",    0.0),
-            "equity":      info.get("equity",     0.0),
-            "margin":      info.get("margin",     0.0),
-            "freeMargin":  info.get("freeMargin", info.get("free_margin", 0.0)),
-            "profit":      info.get("profit",     0.0),
-            "currency":    info.get("currency",   "USD"),
-            "leverage":    info.get("leverage",   100),
-            "name":        info.get("name",       ""),
-            "login":       info.get("login",      ""),
-            "server":      info.get("server",     ""),
+            # Fields documented by MetaAPI's MetatraderAccountInformation model.
+            "platform":    _account_field(info, "platform", "mt5"),
+            "broker":      _account_field(info, "broker", ""),
+            "balance":     _account_field(info, "balance", 0.0),
+            "equity":      _account_field(info, "equity", 0.0),
+            "margin":      _account_field(info, "margin", 0.0),
+            "freeMargin":  free_margin,
+            "profit":      _account_field(info, "profit", 0.0),
+            "currency":    _account_field(info, "currency", "USD"),
+            "leverage":    _account_field(info, "leverage", 100),
+            "marginLevel": _account_field(info, "marginLevel", 0.0),
+            "tradeAllowed": _account_field(info, "tradeAllowed", False),
+            "marginMode":  _account_field(info, "marginMode", ""),
+            "name":        _account_field(info, "name", ""),
+            "login":       _account_field(info, "login", ""),
+            "server":      _account_field(info, "server", ""),
         }
     except Exception as exc:
         log.warning(f"get_account_info error: {exc}")
