@@ -58,7 +58,7 @@ services:
       - key: RENDER_EXTERNAL_URL
         value: "https://goldscalper-v4-robot-usta.onrender.com"
       - key: MTAPI_URL
-        value: "https://mt5.mtapi.io"
+        value: "https://goldscalper-mtapi-c3a1.onrender.com"
       - key: MT5_HOST
         value: "AMarkets-Demo"
       - key: MT5_PORT
