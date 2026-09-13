@@ -100,6 +100,25 @@ _ACC_REFRESH_INTERVAL = 30.0
 _CLOSE_HISTORY_RETRY_INTERVAL = 60.0
 
 
+def _normalize_bar_time(value: object) -> Optional[datetime]:
+    """Return a comparable naive-UTC datetime for internal bar bookkeeping."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif value:
+        try:
+            parsed = datetime.fromisoformat(
+                str(value).replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
 def _history_value(record: dict, *keys: str):
     for key in keys:
         value = record.get(key)
@@ -707,15 +726,21 @@ class GoldScalperLive:
                 #   TypeError: can't compare offset-naive and offset-aware datetimes
                 # which silently crashes every _write_state() call (WAITING, ERROR,
                 # STOPPED) — leaving the state file permanently frozen at RUNNING.
-                _bt_naive = bt.replace(tzinfo=None) if bt.tzinfo else bt
-                _stale_cutoff = datetime.utcnow() - timedelta(hours=2)
+                _bt_naive = _normalize_bar_time(bt)
+                if _bt_naive is None:
+                    log.warning(f"[{tf}] Ignoring bar with invalid timestamp: {bt!r}")
+                    continue
+                _stale_cutoff = datetime.now(timezone.utc).replace(
+                    tzinfo=None
+                ) - timedelta(hours=2)
                 if _bt_naive < _stale_cutoff:
-                    # Still update last_bar_times (as naive) so we don't re-log
-                    if tf in trade_timeframes:
-                        self._last_bar_times[tf] = _bt_naive
+                    # Do not advance the processed-bar cursor with stale
+                    # history.  After the broker finishes synchronizing, the
+                    # first genuinely live closed candle must still be
+                    # eligible for processing.
                     log.debug(
                         f"[{tf}] Bar {bt.isoformat()} is stale "
-                        f"(>{int((datetime.utcnow() - _bt_naive).total_seconds()/3600)}h old) "
+                        f"(>{int((datetime.now(timezone.utc).replace(tzinfo=None) - _bt_naive).total_seconds()/3600)}h old) "
                         f"— waiting for MT5 historical data sync"
                     )
                     continue
@@ -841,6 +866,71 @@ class GoldScalperLive:
         if len(candles) < 50:
             log.warning(f"Only {len(candles)} candles returned — skipping bar")
             return
+
+        # The bar detector and the signal fetch are separate broker requests.
+        # A reconnect can make the detector see a fresh timestamp while the
+        # history endpoint still serves a cached window.  Never run the
+        # decision engine on that cached window: it is exactly how the panel
+        # can show an old candle_time while the scan itself is current.
+        _trigger_time = _normalize_bar_time(bar_time)
+        _signal_time = _normalize_bar_time(candles[-1].time)
+        if _trigger_time is None or _signal_time is None:
+            self._set_trade_permission(
+                False,
+                "INVALID_CANDLE_TIME",
+                ["Could not normalize the live candle timestamp"],
+            )
+            log.warning(f"[{tf}] Skipping bar with invalid candle timestamp")
+            return
+
+        _now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        if _signal_time < _now_naive - timedelta(hours=2):
+            reason = (
+                f"Latest closed candle {_signal_time.isoformat()} is stale; "
+                "waiting for broker history synchronization"
+            )
+            self._set_trade_permission(False, "STALE_CANDLE_DATA", [reason])
+            log.warning(f"[{tf}] {reason}")
+            self._write_state(
+                "WAITING",
+                acc_info,
+                extra={"candle_sync": {
+                    "status": "STALE",
+                    "trigger_time": _trigger_time.isoformat(),
+                    "latest_candle_time": _signal_time.isoformat(),
+                }},
+            )
+            return
+
+        if _signal_time < _trigger_time:
+            reason = (
+                f"Fetched candle {_signal_time.isoformat()} is older than "
+                f"trigger {_trigger_time.isoformat()}"
+            )
+            self._set_trade_permission(False, "STALE_CANDLE_DATA", [reason])
+            log.warning(f"[{tf}] {reason} — refusing to trade on stale history")
+            self._write_state(
+                "WAITING",
+                acc_info,
+                extra={"candle_sync": {
+                    "status": "LAGGING",
+                    "trigger_time": _trigger_time.isoformat(),
+                    "latest_candle_time": _signal_time.isoformat(),
+                }},
+            )
+            return
+
+        # A candle may close between the polling request and this history
+        # request.  Anchor all cooldown/session/order telemetry to the actual
+        # candle that was analysed and advance the cursor so the same candle
+        # is not evaluated twice on the next poll.
+        if _signal_time > _trigger_time:
+            log.info(
+                f"[{tf}] History advanced while fetching: "
+                f"{_trigger_time.isoformat()} → {_signal_time.isoformat()}"
+            )
+        bar_time = _signal_time
+        self._last_bar_times[tf] = _signal_time
 
         if htf_bias is not None:
             log.info(
