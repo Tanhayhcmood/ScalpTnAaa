@@ -1,13 +1,25 @@
-# GoldScalperPro v4 – Live Trading Engine Dependencies
-# Direct MT5 connection via mt5rest Docker bridge (no MetaAPI cloud).
+# GoldScalperPro v4 — Live Trading Engine Dependencies
+# Exact version pins for reproducible, deterministic builds.
 #
 # Install:
 #   pip install -r live_trading/requirements.txt
 #
+# Verify:
+#   python -c "import metaapi_cloud_sdk; print('OK')"
+#
 # Audit date: 2026-07-24
 
-# ── Async HTTP – mt5rest bridge calls and health checks ──────────────────────
+# ── MetaAPI.cloud SDK — MT5 connectivity with full broker database ────────────
+# Replaces the mtapi.io bridge. Set METAAPI_TOKEN + METAAPI_ACCOUNT_ID on Render.
+# Free tier: https://metaapi.cloud
+metaapi-cloud-sdk==28.1.0
+
+# ── Async HTTP — used for panel HTTP calls / health checks ───────────────────
 aiohttp==3.9.5
 
-# ── Redis – cross-service IPC between robot and Telegram panel ───────────────
+# ── Async file writes — used for atomic state file updates ───────────────────
+aiofiles==23.2.1
+
+# ── Redis — cross-service IPC between robot and Telegram panel on Render ──────
+# Required when REDIS_URL is set (separate Render services cannot share files).
 redis==5.2.1
