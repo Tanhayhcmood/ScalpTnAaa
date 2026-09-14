@@ -55,6 +55,7 @@ _TF_SECONDS = {
     "1m": 60, "5m": 300, "10m": 600, "15m": 900, "20m": 1200, "30m": 1800,
     "1h": 3600, "4h": 14400, "1d": 86400,
 }
+_MAX_HISTORICAL_CANDLES = 1000
 
 
 # ── Connection lifecycle ──────────────────────────────────────────────────────
@@ -315,21 +316,35 @@ async def fetch_candles(
     timeframe: str = "5m",
     count:     int = 300,
 ) -> List[OHLCV]:
-    """Fetch the last `count` closed candles for `symbol`."""
+    """Fetch the last ``count`` closed candles for ``symbol``.
+
+    MetaAPI loads historical candles backwards from ``start_time``. Passing a
+    calculated wall-clock timestamp here is unsafe: the broker/terminal clock
+    can differ from the worker clock, so the API may legitimately return an
+    old window even though newer candles are available. ``None`` has a
+    documented meaning in MetaAPI: start from the latest available candles.
+    """
     if not is_connected():
         log.warning("fetch_candles: not connected")
         return []
 
     tf = _TF_MAP.get(timeframe, timeframe)
     try:
-        tf_secs   = _TF_SECONDS.get(tf, 300)
-        # Start far enough back to guarantee `count` candles
-        start_time = datetime.now(timezone.utc) - timedelta(
-            seconds=tf_secs * (count + 10)
+        requested_count = max(1, min(int(count), _MAX_HISTORICAL_CANDLES - 1))
+        # Ask MetaAPI for the latest window.  Its historical endpoint walks
+        # backwards from start_time, and start_time=None explicitly means
+        # "latest available"; using datetime.now() can anchor the request to
+        # the wrong side of a broker/server clock offset.
+        request_limit = min(
+            requested_count + 5,
+            _MAX_HISTORICAL_CANDLES,
         )
         # Historical candles are exposed by the account API, not the RPC connection.
         candles = await _account.get_historical_candles(
-            symbol, tf, start_time, count + 5
+            symbol=symbol,
+            timeframe=tf,
+            start_time=None,
+            limit=request_limit,
         )
         # MetaAPI may return candles in either order and can repeat a candle
         # around a reconnect. Normalize the order and deduplicate before
@@ -359,7 +374,7 @@ async def fetch_candles(
                 close=float(c.get("close",0)),
                 volume=float(c.get("tickVolume", c.get("volume", 0))),
             ))
-        return result[-count:]
+        return result[-requested_count:]
     except Exception as exc:
         log.warning(f"fetch_candles error: {exc}")
         return []

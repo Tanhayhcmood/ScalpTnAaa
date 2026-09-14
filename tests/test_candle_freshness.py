@@ -39,3 +39,51 @@ def test_last_completed_bar_is_latest_closed_candle():
             return await connector.get_last_completed_bar_time("XAUUSD", "M5")
 
     assert asyncio.run(run_check()) == latest
+
+
+def test_fetch_candles_requests_latest_window_without_worker_clock_anchor():
+    """A broker clock offset must not make the history query return an old window."""
+    latest_open = datetime(2026, 9, 14, 3, 10, tzinfo=timezone.utc)
+    latest_closed = datetime(2026, 9, 14, 3, 5, tzinfo=timezone.utc)
+    history = [
+        {
+            "time": latest_closed.isoformat(),
+            "open": 1,
+            "high": 2,
+            "low": 0,
+            "close": 1.5,
+            "tickVolume": 10,
+        },
+        {
+            "time": latest_open.isoformat(),
+            "open": 1.5,
+            "high": 2.5,
+            "low": 1,
+            "close": 2,
+            "tickVolume": 11,
+        },
+    ]
+
+    fake_account = type(
+        "FakeAccount",
+        (),
+        {
+            "get_historical_candles": AsyncMock(return_value=history)
+        },
+    )()
+
+    async def run_fetch():
+        with (
+            patch.object(connector, "is_connected", return_value=True),
+            patch.object(connector, "_account", fake_account),
+        ):
+            return await connector.fetch_candles("XAUUSD", "M5", count=1)
+
+    result = asyncio.run(run_fetch())
+    assert [c.time for c in result] == [latest_closed]
+    fake_account.get_historical_candles.assert_awaited_once_with(
+        symbol="XAUUSD",
+        timeframe="5m",
+        start_time=None,
+        limit=6,
+    )
