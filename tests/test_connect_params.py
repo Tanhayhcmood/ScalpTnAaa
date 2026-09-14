@@ -1,30 +1,25 @@
-"""Regression tests for the official MTAPI Connect query parameters."""
+"""Regression tests for the MetaAPI connector contract."""
+
+import asyncio
+from unittest.mock import patch
 
 
-def test_connect_params_use_official_connect_fields():
-    from live_trading.mt5.connector import _connect_params
+def test_account_field_reads_dict_and_sdk_style_objects():
+    from live_trading.mt5.connector import _account_field
 
-    params = _connect_params("123", "secret", "broker.example", 443)
+    class AccountInfo:
+        broker = "AMarkets"
 
-    assert params["user"] == "123"
-    assert params["password"] == "secret"
-    assert params["host"] == "broker.example"
-    assert params["port"] == 443
-    assert params["errorReplyStatusCode"] == 400
-
-
-def test_connection_status_accepts_boolean_and_string_true_values():
-    from live_trading.mt5.connector import _connection_status_is_alive
-
-    assert _connection_status_is_alive({"isConnected": True}) is True
-    assert _connection_status_is_alive({"isConnected": "true"}) is True
-    assert _connection_status_is_alive({"connected": "CONNECTED"}) is True
+    assert _account_field({"broker": "MetaQuotes"}, "broker") == "MetaQuotes"
+    assert _account_field(AccountInfo(), "broker") == "AMarkets"
+    assert _account_field({}, "server", "MT5") == "MT5"
 
 
-def test_connection_status_rejects_false_or_malformed_payloads():
-    from live_trading.mt5.connector import _connection_status_is_alive
+def test_connect_fails_closed_without_metaapi_credentials():
+    from live_trading.mt5 import connector
 
-    assert _connection_status_is_alive({"isConnected": False}) is False
-    assert _connection_status_is_alive({"isConnected": "false"}) is False
-    assert _connection_status_is_alive({"message": "starting"}) is False
-    assert _connection_status_is_alive([]) is False
+    with (
+        patch.object(connector, "METAAPI_TOKEN", ""),
+        patch.object(connector, "METAAPI_ACCOUNT_ID", ""),
+    ):
+        assert asyncio.run(connector.connect("", "", 1)) is False

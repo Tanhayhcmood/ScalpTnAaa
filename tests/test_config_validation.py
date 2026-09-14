@@ -52,10 +52,9 @@ class TestConfigDefaults:
         assert isinstance(cfg.RISK_PERCENT, float)
 
     def test_min_confirmations_default(self):
-        """Default is 2: SMC (always required) + any 1 of (Trend / PA / Wyckoff)
-        -- see live_trading/config.py MIN_CONFIRMATIONS comment."""
+        """Default is 1; confidence and risk gates remain mandatory."""
         cfg = _reload_config({})
-        assert cfg.MIN_CONFIRMATIONS == 2
+        assert cfg.MIN_CONFIRMATIONS == 1
         assert isinstance(cfg.MIN_CONFIRMATIONS, int)
 
     def test_range_min_confirmations_default(self):

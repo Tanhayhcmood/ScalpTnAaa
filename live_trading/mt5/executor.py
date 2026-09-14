@@ -8,6 +8,7 @@ MetaAPI trade docs: https://metaapi.cloud/docs/client/
 """
 
 from dataclasses import dataclass
+import math
 from typing import Optional
 
 from live_trading.logger import get_logger
@@ -30,6 +31,24 @@ def _normalise_lot(lot: float,
                    vol_min:  float = 0.01,
                    vol_step: float = 0.01,
                    vol_max:  float = 500.0) -> float:
+    try:
+        lot = float(lot)
+        vol_min = float(vol_min)
+        vol_step = float(vol_step)
+        vol_max = float(vol_max)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("lot and broker volume constraints must be numeric") from exc
+    if (
+        not math.isfinite(lot)
+        or lot <= 0
+        or not math.isfinite(vol_min)
+        or not math.isfinite(vol_step)
+        or not math.isfinite(vol_max)
+        or vol_step <= 0
+        or vol_min <= 0
+        or vol_max < vol_min
+    ):
+        raise ValueError("invalid lot size or broker volume constraints")
     steps  = round((lot - vol_min) / vol_step)
     result = vol_min + steps * vol_step
     return max(vol_min, min(vol_max, round(result, 4)))
