@@ -62,6 +62,13 @@ class TestConfigDefaults:
         assert cfg.TREND_MIN_CONFIRMATIONS == 2
         assert isinstance(cfg.TREND_MIN_CONFIRMATIONS, int)
 
+    def test_confidence_threshold_defaults_are_forty_percent(self):
+        cfg = _reload_config({})
+        assert cfg.NORMAL_MIN_CONFIDENCE == 40.0
+        assert cfg.RANGE_MIN_CONFIDENCE == 40.0
+        assert cfg.CONF_HARD_MIN == 40.0
+        assert cfg.OPTION_TWO_MIN_CONFIDENCE == 40.0
+
     def test_range_min_confirmations_default(self):
         cfg = _reload_config({})
         assert cfg.RANGE_MIN_CONFIRMATIONS == 1
