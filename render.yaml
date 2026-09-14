@@ -123,9 +123,9 @@ services:
       - key: CONF_HARD_MIN
         value: "47"
       - key: DAILY_LOSS_LIMIT_PCT
-        value: "4.0"
+        value: "50.0"
       - key: MAX_DRAWDOWN_PCT
-        value: "12.0"
+        value: "50.0"
       - key: SLIPPAGE_POINTS
         value: "30"
       # TRADE_TIMEFRAMES / QUALITY_ADX_MIN are read by the live engine and
