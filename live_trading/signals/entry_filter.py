@@ -8,7 +8,7 @@ mandatory for the ordinary entry gate.
 from dataclasses import dataclass
 from typing import Literal
 
-MIN_CONFIRMATIONS = 2
+MIN_CONFIRMATIONS = 1
 
 
 @dataclass
