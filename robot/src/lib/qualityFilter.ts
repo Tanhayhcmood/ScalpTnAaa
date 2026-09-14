@@ -20,20 +20,16 @@ import { OHLCV } from './goldEngine.js';
 
 // ===== SESSION WINDOWS (UTC) ==============================================
 
-// XAUUSD session windows (UTC):
-//   London open:            07:00 – 12:00  → PRIME
-//   London/NY overlap:      12:00 – 17:00  → PRIME  (highest liquidity)
-//   NY afternoon:           17:00 – 22:00  → MODERATE  (single-session liquidity)
-//   Early Asia / overnight: 00:00 – 03:00  → MODERATE  (thin but some flow)
-//   Dead zones (03–07, 22–00) → BLOCKED
+// XAUUSD session quality (UTC):
+//   London/NY overlap:      07:00 – 17:00  → PRIME
+//   Asia / overnight:       00:00 – 07:00 and 17:00 – 24:00 → MODERATE
 //
-// Original window was 06:00–17:00 UTC, missing the entire NY afternoon
-// (17:00–22:00 UTC = 1pm–6pm ET) which has solid XAUUSD volume.
+// All 24 hours remain eligible for entries.  The quality label contributes to
+// confidence scoring, but no valid UTC hour is a hard "dead zone" anymore.
 const ALLOWED_SESSIONS = [
-  { startUTC:  0, endUTC:  3, quality: 'MODERATE' as const },
-  { startUTC:  7, endUTC: 12, quality: 'PRIME'    as const },
-  { startUTC: 12, endUTC: 17, quality: 'PRIME'    as const },
-  { startUTC: 17, endUTC: 22, quality: 'MODERATE' as const },
+  { startUTC:  0, endUTC:  7, quality: 'MODERATE' as const },
+  { startUTC:  7, endUTC: 17, quality: 'PRIME'    as const },
+  { startUTC: 17, endUTC: 24, quality: 'MODERATE' as const },
 ];
 
 export function getSessionQuality(isoTimestamp: string): 'PRIME' | 'MODERATE' | 'BLOCKED' {
@@ -216,7 +212,7 @@ export function applyQualityFilter(
   // ── ① Session ──────────────────────────────────────────────────────
   const sessionQuality = getSessionQuality(lastCandle.time);
   if (sessionQuality === 'BLOCKED') {
-    reasons.push(`Outside trading session (UTC ${new Date(lastCandle.time).getUTCHours()}:00 — dead zone)`);
+    reasons.push('Invalid candle timestamp — cannot determine session');
   }
 
   // ── ② Severe Range ────────────────────────────────────────────────

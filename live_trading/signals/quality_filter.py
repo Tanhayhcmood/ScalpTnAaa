@@ -9,12 +9,13 @@ from live_trading.signals.gold_engine import OHLCV
 from live_trading.signals.market_regime import calc_adx
 from live_trading.config import CONF_HARD_MIN, QUALITY_ADX_MIN, STRUCTURE_MAX_AGE_BARS
 
+# The robot may evaluate valid setups throughout the full UTC day.  Session
+# quality remains useful for confidence scoring, but it is informational only:
+# there is no "dead zone" that can block an otherwise valid entry.
 ALLOWED_SESSIONS = [
     (0,  7,  "MODERATE"),
-    (7,  12, "PRIME"),
-    (12, 17, "PRIME"),
-    (17, 22, "MODERATE"),
-    (22, 24, "MODERATE"),
+    (7, 17,  "PRIME"),
+    (17, 24, "MODERATE"),
 ]
 
 LATE_EXTENSION_MULT = 10.0
@@ -163,12 +164,13 @@ def apply_quality_filter(
     # the values are deliberately ignored. The news module remains available
     # for non-entry telemetry/UI use.
 
-    # C-2 FIX: respect BLOCKED sessions — do not override to MODERATE.
-    # BLOCKED hours represent illiquid periods where slippage and false
-    # breakouts are significantly elevated.
+    # Session quality is informational and never blocks valid setups.  Valid
+    # timestamps are covered by ALLOWED_SESSIONS for all 24 UTC hours.  Keep
+    # malformed timestamps fail-closed so bad market data cannot authorize an
+    # order.
     session = get_session_quality(last_candle.time)
     if session == "BLOCKED":
-        reasons.append("Outside tradeable session (BLOCKED hours)")
+        reasons.append("Invalid candle timestamp — cannot determine session")
 
     adx_val   = adx if adx is not None else calc_adx(candles)
     sev_range = _is_severe_range(candles, adx_val)

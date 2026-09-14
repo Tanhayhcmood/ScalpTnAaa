@@ -71,7 +71,7 @@ live_trading/
 │   ├── trend_engine.py           ← EMA 50/100/200
 │   ├── market_regime.py          ← 11 regimes + ADX
 │   ├── confidence_engine.py      ← 0–100 weighted score
-│   ├── quality_filter.py         ← Session / ADX / late-entry gate
+│   ├── quality_filter.py         ← Session quality / ADX / late-entry gate
 │   ├── entry_filter.py           ← min 3-of-4 vote gate
 │   └── decision_engine.py        ← master orchestrator
 ├── risk/
@@ -101,7 +101,7 @@ candles (300 M5 bars)
    ├─► Entry Filter      → min 3-of-4 votes (SMC required)
    ├─► Market Regime     → 11 regimes + ADX + rules per regime
    ├─► Confidence Engine → 0–100 score (6 weighted bands)
-   ├─► Quality Filter    → Session / ADX / late-entry / volume gate
+   ├─► Quality Filter    → Session quality / ADX / late-entry / volume gate
    ├─► Capital Manager   → structural SL, 2R TP, 1% risk lot size
    │
    └─► Decision Engine   → ALLOWED / BLOCKED + full reasoning
