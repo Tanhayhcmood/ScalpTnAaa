@@ -497,21 +497,6 @@ class GoldScalperLive:
                             "Guardian will block trades until account data is available"
                         )
 
-            # One-shot operational recovery for an intentionally reviewed
-            # demo-account limit change. This clears only the sticky halt;
-            # it preserves the current daily baseline so the new limit is still
-            # enforced immediately. The Render flag is removed after recovery.
-            if (
-                os.getenv("RESET_GUARDIAN_ON_START", "").strip().lower() == "true"
-                and self.guardian.is_halted
-            ):
-                if self.guardian.reset_halt(reset_daily_baseline=False):
-                    self.paused = False
-                    log.warning(
-                        "Guardian halt cleared by one-shot operational recovery; "
-                        "daily baseline preserved."
-                    )
-
             _checkpoint("before calibrate_wyckoff")
             await self._calibrate_wyckoff()
             _checkpoint("after calibrate_wyckoff")
