@@ -1,0 +1,40 @@
+# GoldScalperPro Telegram Control Panel — Python Dependencies
+# Exact version pins for reproducible, deterministic builds.
+# Update only after testing on a clean virtual environment.
+#
+# Install:
+#   pip install -r telegram_panel/requirements.txt
+#
+# Audit date: 2026-07-19 — pinned from production-verified versions.
+# Review and re-pin at minimum every 90 days.
+
+# ── Telegram Bot Framework ─────────────────────────────────────────────────────
+# job-queue extra requires APScheduler — pinned separately below.
+python-telegram-bot[job-queue]==21.6
+
+# ── Job Scheduler — required by python-telegram-bot[job-queue] ───────────────
+# python-telegram-bot 21.6 requires APScheduler>=3.10.4,<3.11
+APScheduler==3.10.4
+
+# ── Async SQLite ───────────────────────────────────────────────────────────────
+aiosqlite==0.20.0
+
+# ── Encryption — MANDATORY for production credential storage ──────────────────
+# Panel will refuse to start without this package AND a valid PANEL_ENCRYPTION_KEY.
+# Generate key: python -m telegram_panel.main --generate-key
+cryptography==42.0.8
+
+# ── System Monitoring ──────────────────────────────────────────────────────────
+psutil==6.0.0
+
+# ── Async HTTP — optional state interface + MetaAPI SDK compatibility ─────────
+aiohttp==3.9.5
+
+# ── Python version requirement ─────────────────────────────────────────────────
+# Python >= 3.11 required (uses 3.10+ type hint syntax)
+# Python 3.12 compatible (datetime.utcnow() deprecation fixed in panel code)
+
+# ── Redis — cross-service IPC between robot and Telegram panel on Render ──────
+# Required when REDIS_URL is set (two separate Render services cannot share files).
+# Safe to install even without REDIS_URL — redis_ipc.py is a no-op when unconfigured.
+redis==5.2.1

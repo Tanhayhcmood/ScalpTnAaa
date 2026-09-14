@@ -1,49 +1,35 @@
-# See https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files for more about ignoring files.
-
-# compiled output
-dist
-tmp
-out-tsc
+__pycache__/
+*.py[cod]
+*.pyo
 *.tsbuildinfo
-.expo
-.expo-shared
-
-# dependencies
-node_modules
-
-# IDEs and editors
-/.idea
-.project
-.classpath
-.c9/
-*.launch
-.settings/
-*.sublime-workspace
-
-# IDE - VSCode
+.env
+.venv
+env/
+venv/
+*.egg-info/
+dist/
+build/
+panel.json
+!panel.json.example
+*.db
+*.sqlite
+node_modules/
+*.log
+logs/
+.DS_Store
+.idea/
 .vscode/*
 !.vscode/settings.json
 !.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
-
-# misc
-/.sass-cache
-/connect.lock
-/coverage
-/libpeerconnection.log
-npm-debug.log
-yarn-error.log
-testem.log
-/typings
-
-# System Files
-.DS_Store
-Thumbs.db
-
-.cursor/rules/nx-rules.mdc
-.github/instructions/nx.instructions.md
-
-# Replit
+.sass-cache/
+coverage/
 .cache/
-.local/
+.pytest_cache/
+.coverage
+htmlcov/
+robot_state.json
+robot_commands.json
+robot_mt5_snapshot.json
+guardian_state.json
+telegram_panel/storage/data/*.db
+telegram_panel/storage/data/logs/*.log

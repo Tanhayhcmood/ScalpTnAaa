@@ -1,0 +1,49 @@
+"""RANGE regression tests: one aligned confirmation is enough."""
+
+from live_trading.signals.decision_engine import (
+    _effective_min_confirmations,
+    _range_confirmation_gate,
+)
+from live_trading.signals.entry_filter import EntryFilterResult
+
+
+def test_range_uses_one_confirmation_floor():
+    assert _effective_min_confirmations(1, "RANGE", False) == 1
+
+
+def test_range_keeps_a_stricter_operator_setting():
+    assert _effective_min_confirmations(2, "RANGE", False) == 2
+
+
+def test_range_does_not_add_a_counter_trend_vote_requirement():
+    assert _effective_min_confirmations(1, "RANGE", True) == 1
+
+
+def test_range_accepts_one_smc_confirmation():
+    result = EntryFilterResult(
+        allowed=True, direction="BUY", confirmation_count=1,
+        smc=True, trend=False, price_action=False, wyckoff=False,
+    )
+    assert _range_confirmation_gate(result, 1) == (True, "")
+
+
+def test_range_accepts_one_price_action_confirmation():
+    result = EntryFilterResult(
+        allowed=True, direction="BUY", confirmation_count=1,
+        smc=False, trend=False, price_action=True, wyckoff=False,
+    )
+    assert _range_confirmation_gate(result, 1) == (True, "")
+
+
+def test_range_rejects_zero_confirmations():
+    result = EntryFilterResult(
+        allowed=False, direction="NEUTRAL", confirmation_count=0,
+        smc=False, trend=False, price_action=False, wyckoff=False,
+    )
+    allowed, reason = _range_confirmation_gate(result, 1)
+    assert not allowed
+    assert "0/1 confirmations" in reason
+
+
+def test_non_range_regime_keeps_global_confirmation_setting():
+    assert _effective_min_confirmations(2, "WEAK_TREND_BULL", False) == 2

@@ -1,0 +1,210 @@
+services:
+  # ─── mt5rest Docker bridge ─────────────────────────────────────────────────
+  - type: web
+    name: goldscalper-mtapi
+    repo: https://github.com/Tanhayhcmood/ScalpTnAaa
+    region: oregon
+    autoDeployTrigger: commit
+    runtime: docker
+    dockerfilePath: ./mtapi-bridge/Dockerfile
+    # The Dockerfile copies files from mtapi-bridge/; keep the Docker build
+    # context scoped to that directory instead of the repository root.
+    dockerContext: ./mtapi-bridge
+    plan: free
+    healthCheckPath: /Ping
+    # Only redeploy when mtapi-bridge files actually change.
+    # Without this filter, every Python commit (live_trading/, telegram_panel/)
+    # triggers an unnecessary Docker redeploy that restarts Wine/MT5 from
+    # scratch — the primary cause of the repeated "Failed deploy" status.
+    buildFilter:
+      paths:
+        - mtapi-bridge/**
+    envVars:
+      - key: RENDER_EXTERNAL_URL
+        value: "https://goldscalper-mtapi-uuoc.onrender.com"
+      - key: MT5_HOST
+        value: "AMarkets-Demo"
+      - key: MT5_PORT
+        value: "443"
+      - key: MT5_USER
+        sync: false
+      - key: MT5_PASSWORD
+        sync: false
+      - key: UserKey
+        sync: false
+
+  # ─── Redis — cross-service IPC (robot ↔ Telegram panel) ───────────────────
+  # FIX: must be in the same region as the robot/panel web services (oregon).
+  # It was previously created in frankfurt, so its private hostname never
+  # resolved from oregon — the panel silently never saw live position/state
+  # updates from the robot even though the robot itself was healthy.
+  - type: redis
+    name: ger-redis
+    plan: free
+    region: oregon
+    ipAllowList: []   # private — Render internal routing only; no public access
+
+  # ─── Trading robot ─────────────────────────────────────────────────────────
+  - type: web
+    name: goper-v4-robot
+    region: oregon
+    autoDeployTrigger: commit
+    runtime: python
+    plan: free
+    healthCheckPath: /health
+    buildCommand: pip install -r live_trading/requirements.txt
+    startCommand: python live_trading/server.py
+    envVars:
+      - key: RENDER_EXTERNAL_URL
+        value: "https://goldscalper-v4-robot-usta.onrender.com"
+      - key: METAAPI_TOKEN
+        sync: false
+      - key: METAAPI_ACCOUNT_ID
+        sync: false
+      # FIX: broker reports gold as "XAUUSD", not "XAUUSDb" — the wrong
+      # symbol caused every candle/order request to fail silently, which was
+      # the real reason the robot never opened a trade.
+      - key: SYMBOL
+        value: XAUUSD
+      # FIX: TIMEFRAME and CANDLE_WINDOW are now env-configurable (fix #4).
+      - key: TIMEFRAME
+        value: "5m"
+      - key: CANDLE_WINDOW
+        value: "300"
+      # Option 2: keep the 47% HTF confidence floor reproducible from the live Render environment.
+      - key: OPTION_TWO_MIN_CONFIDENCE
+        value: "47"
+      # Option 4: old BOS/CHoCH events cannot authorize live entries.
+      - key: STRUCTURE_MAX_AGE_BARS
+        value: "24"
+      - key: RISK_PERCENT
+        value: "1.0"
+      # Production signal policy: any two of the four independent strategies
+      # may authorize direction after confidence, quality, regime, sizing, and
+      # risk gates pass. No individual strategy is mandatory.
+      - key: MIN_CONFIRMATIONS
+        value: "1"
+      # Dedicated RANGE playbook:
+      # edge + fresh same-direction sweep + closed-candle reversal +
+      # at least one aligned strategy confirmation.
+      - key: RANGE_TRADING_ENABLED
+        value: "true"
+      - key: RANGE_MIN_CONFIRMATIONS
+        value: "1"
+      - key: RANGE_MIN_RR
+        value: "1.5"
+      - key: RANGE_EDGE_ATR_DISTANCE
+        value: "0.25"
+      - key: RANGE_RISK_PERCENT
+        value: "0.25"
+      # RANGE protection: BUY entries must be at support and SELL entries must
+      # be at resistance, with a fresh same-direction sweep, a closed-candle
+      # reversal, and at least one aligned strategy confirmation.
+      - key: RANGE_ENTRY_FILTERS_ENABLED
+        value: "true"
+      - key: MAX_RANGE_TRADES_PER_SESSION
+        value: "2"
+      - key: MAX_OPEN_TRADES
+        value: "4"
+      # One concurrent position per strategy slot: SMC, Trend, Price Action,
+      # and Wyckoff. Legacy untagged positions fail closed and occupy all slots.
+      # Normal entries require any one same-direction vote through
+      # MIN_CONFIRMATIONS; no individual strategy is mandatory
+      # vote. All independent confidence, quality, regime, and risk gates stay active.
+      - key: REQUIRE_PRICE_ACTION
+        value: "false"
+      - key: REQUIRE_SMC_PRICE_ACTION_WYCKOFF
+        value: "false"
+      # Operator-selected confidence policy: 47% for normal and RANGE entries.
+      - key: NORMAL_MIN_CONFIDENCE
+        value: "47"
+      - key: RANGE_MIN_CONFIDENCE
+        value: "47"
+      - key: CONF_HARD_MIN
+        value: "47"
+      - key: DAILY_LOSS_LIMIT_PCT
+        value: "50.0"
+      - key: MAX_DRAWDOWN_PCT
+        value: "50.0"
+      - key: SLIPPAGE_POINTS
+        value: "30"
+      # TRADE_TIMEFRAMES / QUALITY_ADX_MIN are read by the live engine and
+      # were set on the live service but missing from this manifest.
+      - key: TRADE_TIMEFRAMES
+        value: "M20,M15,M10,5m"
+      - key: QUALITY_ADX_MIN
+        value: "12"
+      - key: BAR_CHECK_INTERVAL
+        value: "10"
+      # Keep the H1/MTF context gate active. The local signal, confidence,
+      # sizing, stop, position, and Guardian gates remain active as well.
+      - key: MTF_ENABLED
+        value: "true"
+      - key: MTF_TIMEFRAME
+        value: "H1"
+      - key: MTF_CANDLE_WINDOW
+        value: "300"
+      - key: OPTION_TWO_MIN_TIMEFRAMES
+        value: "2"
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      - key: STATE_FILE
+        value: "/tmp/robot_state.json"
+      - key: MT5_SNAPSHOT
+        value: "/tmp/robot_mt5_snapshot.json"
+      - key: COMMANDS_FILE
+        value: "/tmp/robot_commands.json"
+      - key: GUARDIAN_STATE_FILE
+        value: "/tmp/guardian_state.json"
+      - key: LOG_FILE
+        value: "/tmp/robot.log"
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: ger-redis
+          property: connectionString
+      # FIX #1: ROBOT_COMMAND_TOKEN enables HTTP command fallback from panel.
+      - key: ROBOT_COMMAND_TOKEN
+        sync: false
+
+  # ─── Telegram control panel ────────────────────────────────────────────────
+  - type: web
+    name: goldscalper-v4-panel
+    region: oregon
+    autoDeployTrigger: commit
+    runtime: python
+    plan: free
+    healthCheckPath: /health
+    buildCommand: pip install -r telegram_panel/requirements.txt
+    startCommand: python telegram_panel/server.py
+    envVars:
+      - key: RENDER_EXTERNAL_URL
+        value: "https://goldscalper-v4-panel-kzru.onrender.com"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_OWNER_ID
+        sync: false
+      - key: PANEL_ENCRYPTION_KEY
+        sync: false
+      - key: TELEGRAM_ADMIN_IDS
+        value: ""
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      - key: PANEL_DB_PATH
+        value: "/tmp/panel.db"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: ROBOT_INTERFACE_MODE
+        value: "redis"
+      - key: ROBOT_STATE_PATH
+        value: "/tmp/robot_state.json"
+      # FIX #1: ROBOT_BASE_URL and ROBOT_COMMAND_TOKEN enable HTTP fallback.
+      - key: ROBOT_BASE_URL
+        value: "https://goldscalper-v4-robot-usta.onrender.com"
+      - key: ROBOT_COMMAND_TOKEN
+        sync: false
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: ger-redis
+          property: connectionString

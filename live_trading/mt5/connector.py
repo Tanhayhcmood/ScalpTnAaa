@@ -1,0 +1,619 @@
+"""
+MetaAPI.cloud Connector — GoldScalperPro v4
+
+Uses MetaAPI.cloud for MT5 connectivity, broker discovery, market data,
+and trade execution through the account's RPC connection.
+
+Required env vars:
+    METAAPI_TOKEN      — API token from metaapi.cloud dashboard
+    METAAPI_ACCOUNT_ID — MT5 account ID from metaapi.cloud dashboard
+
+MetaAPI docs: https://metaapi.cloud/docs/client/
+"""
+
+import asyncio
+import logging
+from datetime import datetime, timezone, timedelta
+from typing import List, Optional, Any
+
+from live_trading.config import METAAPI_TOKEN, METAAPI_ACCOUNT_ID
+from live_trading.signals.gold_engine import OHLCV
+from live_trading.logger import get_logger
+
+log = get_logger()
+
+# ── Module-level MetaAPI state ────────────────────────────────────────────────
+_api              = None   # MetaApi instance
+_account          = None   # MetatraderAccount
+_connection       = None   # RpcMetaApiConnection
+_connected: bool  = False
+# The main loop and the watchdog can both notice a broken session at nearly
+# the same time.  Without a lock they each create a MetaApi client and RPC
+# connection, leaving orphaned websocket subscriptions behind.  MetaAPI then
+# starts reporting "too many unexisting or undeployed trading accounts" and
+# the trading loop can miss a candle while the duplicate sessions reconnect.
+_connection_lock = asyncio.Lock()
+_health_lock = asyncio.Lock()
+
+
+def _account_field(info: Any, key: str, default: Any = None) -> Any:
+    """Read an account-information field from SDK dicts or model objects."""
+    if isinstance(info, dict):
+        return info.get(key, default)
+    return getattr(info, key, default)
+
+# ── Timeframe → MetaAPI period map ───────────────────────────────────────────
+_TF_MAP = {
+    "1m":  "1m",  "5m":  "5m",  "10m": "10m", "15m": "15m", "20m": "20m", "30m": "30m",
+    "1h":  "1h",  "4h":  "4h",  "1d":  "1d",
+    "M1":  "1m",  "M5":  "5m",  "M10": "10m", "M15": "15m", "M20": "20m", "M30": "30m",
+    "H1":  "1h",  "H4":  "4h",  "D1":  "1d",
+}
+
+# Candle period duration in seconds
+_TF_SECONDS = {
+    "1m": 60, "5m": 300, "10m": 600, "15m": 900, "20m": 1200, "30m": 1800,
+    "1h": 3600, "4h": 14400, "1d": 86400,
+}
+_MAX_HISTORICAL_CANDLES = 1000
+
+
+# ── Connection lifecycle ──────────────────────────────────────────────────────
+
+async def _close_current_connection_unlocked() -> None:
+    """Close and clear the current MetaAPI objects.
+
+    The caller must hold ``_connection_lock``.  Clearing the module state in a
+    ``finally``-style helper is important after a failed reconnect: otherwise
+    the next reconnect may keep using a half-closed SDK client.
+    """
+    global _api, _account, _connection, _connected
+
+    connection = _connection
+    api = _api
+    _connected = False
+    _connection = None
+    _account = None
+    _api = None
+
+    try:
+        if connection:
+            await connection.close()
+    except Exception as exc:
+        log.debug(f"MetaAPI RPC close failed during cleanup: {exc}")
+    try:
+        if api:
+            result = api.close()
+            if hasattr(result, "__await__"):
+                await result
+    except Exception as exc:
+        log.debug(f"MetaAPI client close failed during cleanup: {exc}")
+
+
+async def connect(*args, **kwargs) -> bool:
+    """
+    Connect to MT5 via MetaAPI.cloud.
+    Signature: connect(token, account_id, timeout_seconds)
+    Falls back to env vars METAAPI_TOKEN / METAAPI_ACCOUNT_ID.
+    """
+    global _api, _account, _connection, _connected
+
+    token      = args[0] if args else METAAPI_TOKEN
+    account_id = args[1] if len(args) > 1 else METAAPI_ACCOUNT_ID
+    timeout    = args[2] if len(args) > 2 else 300
+
+    # Prefer env vars when args are empty strings
+    token      = token      or METAAPI_TOKEN
+    account_id = account_id or METAAPI_ACCOUNT_ID
+
+    if not token or not account_id:
+        log.error(
+            "METAAPI_TOKEN and METAAPI_ACCOUNT_ID must be set. "
+            "Sign up at https://metaapi.cloud, add your MT5 account, "
+            "and set these two env vars on Render."
+        )
+        return False
+
+    async with _connection_lock:
+        # A watchdog reconnect and a bar-tick reconnect may arrive together.
+        # The first successful caller owns the session; the second must reuse
+        # it instead of creating another websocket subscription.
+        if _connected and _connection is not None:
+            return True
+
+        # Dispose of a stale/half-open client before creating a replacement.
+        await _close_current_connection_unlocked()
+
+        try:
+            from metaapi_cloud_sdk import MetaApi  # type: ignore
+
+            log.info(f"Connecting to MetaAPI.cloud — account {account_id[:12]}…")
+            _api     = MetaApi(token)
+            _account = await _api.metatrader_account_api.get_account(account_id)
+
+            # Deploy account if not yet deployed.  wait_connected() is still
+            # used for DEPLOYING because MetaAPI may need a short provisioning
+            # window before the broker session becomes available.
+            if _account.state not in ("DEPLOYED", "DEPLOYING"):
+                log.info("Deploying MetaAPI account…")
+                await _account.deploy()
+
+            log.info("Waiting for account to connect to broker…")
+            await _account.wait_connected(timeout_in_seconds=min(timeout, 120))
+
+            # RPC connection is simpler and sufficient for candle + order data
+            _connection = _account.get_rpc_connection()
+            await _connection.connect()
+            await _connection.wait_synchronized(timeout_in_seconds=min(timeout, 60))
+
+            # broker is part of the synchronized account-information response;
+            # MetatraderAccount itself does not expose the broker field in SDK 29.1.1.
+            account_info = await _connection.get_account_information()
+            broker_label = (
+                _account_field(account_info, "broker")
+                or _account_field(account_info, "server")
+                or "MT5"
+            )
+            _connected = True
+            log.info(f"✅ MetaAPI connected — broker: {broker_label}")
+            return True
+
+        except Exception as exc:
+            log.error(f"❌ MetaAPI connect failed: {exc}")
+            # Close the failed client before the retry.  This prevents failed
+            # attempts from accumulating subscriptions in the SDK.
+            await _close_current_connection_unlocked()
+            return False
+
+
+async def disconnect() -> None:
+    async with _connection_lock:
+        await _close_current_connection_unlocked()
+
+
+async def ensure_connected(
+    token:      str,
+    account_id: str,
+    timeout:    int = 300,
+    attempt:    int = 1,
+) -> bool:
+    if _connected and _connection is not None:
+        return True
+    log.info(f"Reconnecting (attempt {attempt})…")
+    return await connect(token, account_id, timeout)
+
+
+def is_connected() -> bool:
+    return _connected and _connection is not None
+
+
+def get_connection():
+    """Return the active RPC connection or None."""
+    return _connection if _connected else None
+
+
+async def connect_with_retry(
+    max_attempts: int = 12,
+    retry_delay: float = 30.0,
+) -> bool:
+    """Connect to MetaAPI with bounded exponential retry backoff."""
+    for attempt in range(1, max_attempts + 1):
+        if await connect():
+            return True
+        if attempt < max_attempts:
+            delay = retry_delay * min(2 ** (attempt - 1), 4)
+            log.warning(
+                f"MetaAPI connection attempt {attempt}/{max_attempts} failed; "
+                f"retrying in {delay:.0f}s"
+            )
+            await asyncio.sleep(delay)
+    return False
+
+
+async def keepalive_metaapi() -> bool:
+    """Perform a lightweight RPC call to keep and verify the MetaAPI session."""
+    global _connected
+    async with _health_lock:
+        connection = _connection if is_connected() else None
+        if connection is None:
+            return False
+        try:
+            await connection.get_account_information()
+            return True
+        except Exception as exc:
+            # Only invalidate the session that was actually checked.  A
+            # successful concurrent reconnect must not be marked disconnected
+            # by a stale keepalive failure.
+            if _connection is connection:
+                _connected = False
+            log.warning(f"MetaAPI keepalive failed: {exc}")
+            return False
+
+
+async def start_connection_watchdog(interval_seconds: float = 30.0) -> None:
+    """Monitor the MetaAPI session and reconnect after a disconnect."""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        if not is_connected():
+            await connect()
+        else:
+            await keepalive_metaapi()
+
+
+async def start_metaapi_session_keepalive(interval_seconds: float = 180.0) -> None:
+    """Keep the synchronized MetaAPI RPC session active."""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await keepalive_metaapi()
+
+
+# ── Market data ───────────────────────────────────────────────────────────────
+
+async def check_symbol_available(symbol: str) -> bool:
+    """Return whether MetaAPI exposes a specification for the symbol."""
+    if not is_connected():
+        return False
+    try:
+        specification = await _connection.get_symbol_specification(symbol)
+        return bool(specification)
+    except Exception as exc:
+        log.warning(f"check_symbol_available({symbol}) error: {exc}")
+        return False
+
+
+async def get_current_quote(symbol: str) -> Optional[dict]:
+    """Return the current MetaAPI bid/ask quote for a symbol."""
+    if not is_connected():
+        return None
+    try:
+        quote = await _connection.get_symbol_price(symbol)
+        if not quote:
+            return None
+        return {
+            "symbol": quote.get("symbol", symbol),
+            "bid": float(quote.get("bid", 0.0)),
+            "ask": float(quote.get("ask", 0.0)),
+            "time": quote.get("time") or quote.get("brokerTime"),
+        }
+    except Exception as exc:
+        log.warning(f"get_current_quote({symbol}) error: {exc}")
+        return None
+
+
+async def get_closed_position_history(position_id: str) -> dict:
+    """Return the closing deal for a MetaAPI position, when available."""
+    if not is_connected():
+        return {}
+    try:
+        get_deals = getattr(_connection, "get_deals_by_position", None)
+        if get_deals is None:
+            log.warning("MetaAPI SDK does not expose get_deals_by_position")
+            return {}
+        deals = await get_deals(position_id)
+        if not deals:
+            return {}
+        closing = [
+            deal for deal in deals
+            if str(deal.get("entryType", "")).upper() in {
+                "DEAL_ENTRY_OUT", "DEAL_ENTRY_OUT_BY"
+            }
+        ] or deals
+        deal = closing[-1]
+        return {
+            "closePrice": deal.get("price", deal.get("closePrice")),
+            "closeTime": deal.get("time", deal.get("brokerTime")),
+            "profit": deal.get("profit", 0.0),
+            "commission": deal.get("commission", 0.0),
+            "swap": deal.get("swap", 0.0),
+        }
+    except Exception as exc:
+        log.warning(f"get_closed_position_history({position_id}) error: {exc}")
+        return {}
+
+
+async def fetch_candles(
+    symbol:    str,
+    timeframe: str = "5m",
+    count:     int = 300,
+) -> List[OHLCV]:
+    """Fetch the last ``count`` closed candles for ``symbol``.
+
+    MetaAPI loads historical candles backwards from ``start_time``. Passing a
+    calculated wall-clock timestamp here is unsafe: the broker/terminal clock
+    can differ from the worker clock, so the API may legitimately return an
+    old window even though newer candles are available. ``None`` has a
+    documented meaning in MetaAPI: start from the latest available candles.
+    """
+    if not is_connected():
+        log.warning("fetch_candles: not connected")
+        return []
+
+    tf = _TF_MAP.get(timeframe, timeframe)
+    try:
+        requested_count = max(1, min(int(count), _MAX_HISTORICAL_CANDLES - 1))
+        # Ask MetaAPI for the latest window.  Its historical endpoint walks
+        # backwards from start_time, and start_time=None explicitly means
+        # "latest available"; using datetime.now() can anchor the request to
+        # the wrong side of a broker/server clock offset.
+        request_limit = min(
+            requested_count + 5,
+            _MAX_HISTORICAL_CANDLES,
+        )
+        # Historical candles are exposed by the account API, not the RPC connection.
+        candles = await _account.get_historical_candles(
+            symbol=symbol,
+            timeframe=tf,
+            start_time=None,
+            limit=request_limit,
+        )
+        # MetaAPI may return candles in either order and can repeat a candle
+        # around a reconnect. Normalize the order and deduplicate before
+        # selecting the closed-candle window.
+        parsed: dict[datetime, dict] = {}
+        for c in candles or []:
+            if not isinstance(c, dict):
+                continue
+            t = _parse_time(c.get("time") or c.get("brokerTime"))
+            if t is not None:
+                parsed[t] = c
+
+        ordered = sorted(parsed.items(), key=lambda item: item[0])
+        # MetaAPI includes the currently forming candle as the newest row.
+        # Keep the existing closed-candle contract, but apply it only after
+        # sorting/deduplication so it remains correct across reconnects.
+        closed = ordered[:-1] if len(ordered) > 1 else []
+
+        # Convert to OHLCV; skip the still-open last candle
+        result: List[OHLCV] = []
+        for t, c in closed:
+            result.append(OHLCV(
+                time=t,
+                open=float(c.get("open",  0)),
+                high=float(c.get("high",  0)),
+                low= float(c.get("low",   0)),
+                close=float(c.get("close",0)),
+                volume=float(c.get("tickVolume", c.get("volume", 0))),
+            ))
+        return result[-requested_count:]
+    except Exception as exc:
+        log.warning(f"fetch_candles error: {exc}")
+        return []
+
+
+async def get_account_balance() -> float:
+    info = await get_account_info()
+    return info.get("balance", 0.0)
+
+
+async def get_account_info() -> dict:
+    if not is_connected():
+        return {}
+    try:
+        info = await _connection.get_account_information()
+        free_margin = _account_field(
+            info,
+            "freeMargin",
+            _account_field(info, "free_margin", 0.0),
+        )
+        return {
+            # Fields documented by MetaAPI's MetatraderAccountInformation model.
+            "platform":    _account_field(info, "platform", "mt5"),
+            "broker":      _account_field(info, "broker", ""),
+            "balance":     _account_field(info, "balance", 0.0),
+            "equity":      _account_field(info, "equity", 0.0),
+            "margin":      _account_field(info, "margin", 0.0),
+            "freeMargin":  free_margin,
+            "profit":      _account_field(info, "profit", 0.0),
+            "currency":    _account_field(info, "currency", "USD"),
+            "leverage":    _account_field(info, "leverage", 100),
+            "marginLevel": _account_field(info, "marginLevel", 0.0),
+            "tradeAllowed": _account_field(info, "tradeAllowed", False),
+            "marginMode":  _account_field(info, "marginMode", ""),
+            "name":        _account_field(info, "name", ""),
+            "login":       _account_field(info, "login", ""),
+            "server":      _account_field(info, "server", ""),
+        }
+    except Exception as exc:
+        log.warning(f"get_account_info error: {exc}")
+        return {}
+
+
+# MetaAPI can occasionally return a malformed phantom position row. Keep this
+# normalization at the connector boundary so every caller sees the same safe data.
+_MAX_REASONABLE_POSITION_VOLUME = 1000.0
+
+
+def _position_ticket(position: dict) -> str:
+    value = position.get("id", position.get("ticket", position.get("positionId", "")))
+    return str(value) if value is not None else ""
+
+
+def _position_volume(position: dict) -> float:
+    """Return a position volume in lots across MetaAPI and legacy shapes."""
+    raw_volume = position.get("volume")
+    raw_lots = position.get("lots")
+    try:
+        volume = float(raw_volume) if raw_volume is not None else 0.0
+    except (TypeError, ValueError):
+        volume = 0.0
+    try:
+        lots = float(raw_lots) if raw_lots is not None else 0.0
+    except (TypeError, ValueError):
+        lots = 0.0
+    if 0.0 < lots <= _MAX_REASONABLE_POSITION_VOLUME and (
+        volume <= 0.0 or volume > _MAX_REASONABLE_POSITION_VOLUME
+    ):
+        return lots
+    return volume
+
+
+def _position_direction(position: dict) -> str:
+    value = position.get("type", position.get("direction"))
+    if value is None:
+        value = position.get("orderType")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return {0: "BUY", 1: "SELL"}.get(int(value), "UNKNOWN")
+    text = str(value).upper()
+    if "BUY" in text or "LONG" in text:
+        return "BUY"
+    if "SELL" in text or "SHORT" in text:
+        return "SELL"
+    return "UNKNOWN"
+
+
+def _dedupe_positions(
+    positions: list,
+    known_positions: Optional[dict] = None,
+) -> tuple[list, list[str]]:
+    """Drop malformed rows and repair known tickets when possible."""
+    known = known_positions or {}
+    result: list = []
+    dropped: list[str] = []
+    seen_tickets: set[str] = set()
+    for position in positions:
+        if not isinstance(position, dict):
+            dropped.append("<non-dict>")
+            continue
+        ticket = _position_ticket(position)
+        if ticket and ticket in seen_tickets:
+            log.warning("Dropping duplicate open-position row for ticket %s", ticket)
+            continue
+        if ticket:
+            seen_tickets.add(ticket)
+        volume = _position_volume(position)
+        if 0.0 < volume <= _MAX_REASONABLE_POSITION_VOLUME:
+            result.append(position)
+            continue
+        repair = known.get(ticket) if ticket else None
+        repair_volume = repair.get("volume") if isinstance(repair, dict) else None
+        try:
+            repair_volume = float(repair_volume)
+        except (TypeError, ValueError):
+            repair_volume = 0.0
+        if repair and 0.0 < repair_volume <= _MAX_REASONABLE_POSITION_VOLUME:
+            repaired = dict(position)
+            repaired["volume"] = repair_volume
+            repaired["type"] = repair.get("direction", repair.get("type", "UNKNOWN"))
+            result.append(repaired)
+            log.warning("Repaired malformed open-position row for known ticket %s", ticket)
+        else:
+            dropped.append(ticket or "<unknown>")
+            log.warning("Dropped malformed open-position row for ticket %s", ticket or "<unknown>")
+    return result, dropped
+
+
+def _parse_open_positions_response(
+    payload: Any,
+    status: int = 200,
+    known_positions: Optional[dict] = None,
+) -> tuple[list, list[str]]:
+    """Validate and normalize an open positions response."""
+    if not 200 <= int(status) < 300:
+        detail = payload.get("message") if isinstance(payload, dict) else payload
+        raise RuntimeError(f"HTTP {status}: {detail or 'open positions request failed'}")
+    if not isinstance(payload, list):
+        detail = payload.get("message") if isinstance(payload, dict) else None
+        raise RuntimeError(detail or "Malformed open positions response")
+    return _dedupe_positions(payload, known_positions=known_positions)
+
+
+async def get_open_positions(
+    symbol: str,
+    known_positions: Optional[dict] = None,
+    *,
+    return_diagnostics: bool = False,
+):
+    """Return safe open positions for one symbol."""
+    if not is_connected():
+        raise RuntimeError("MetaAPI connection is not ready")
+    try:
+        payload = await _connection.get_positions()
+        positions, dropped = _parse_open_positions_response(
+            payload, 200, known_positions=known_positions
+        )
+        filtered = [p for p in positions if p.get("symbol") == symbol]
+        if return_diagnostics:
+            return filtered, dropped
+        return filtered
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        log.warning(f"get_open_positions error: {exc}")
+        raise RuntimeError(f"MetaAPI get_positions failed: {exc}") from exc
+
+
+def mt5_pos_to_dict(pos: dict) -> dict:
+    direction = _position_direction(pos)
+    volume = _position_volume(pos)
+    return {
+        "id":         _position_ticket(pos),
+        "symbol":     pos.get("symbol", ""),
+        "direction":  direction,
+        "type":       direction,
+        "volume":     volume,
+        "lot_size":   volume,
+        "price_open": pos.get("openPrice", pos.get("priceOpen", pos.get("open_price", 0))),
+        "sl":         pos.get("stopLoss",   pos.get("sl", 0)),
+        "tp":         pos.get("takeProfit", pos.get("tp", 0)),
+        "profit":     pos.get("profit",  0),
+        "comment":    pos.get("comment", ""),
+        "time_str":   str(pos.get("time", pos.get("openTime", ""))),
+        # keep original for executor
+        "_raw":       pos,
+    }
+
+
+# ── Bar-close detection ───────────────────────────────────────────────────────
+
+async def get_last_completed_bar_time(
+    symbol:    str,
+    timeframe: str = "5m",
+) -> Optional[datetime]:
+    candles = await fetch_candles(symbol, timeframe, count=2)
+    if len(candles) < 2:
+        return None
+    # fetch_candles() already removes the forming candle. Returning [-2]
+    # here made every scan one complete bar late.
+    return candles[-1].time
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _parse_time(raw: Any) -> Optional[datetime]:
+    """Parse MetaAPI candle timestamps into timezone-aware UTC datetimes.
+
+    MetaAPI responses may be ISO strings, epoch seconds, or epoch
+    milliseconds. Falling back to ``now`` on malformed input is unsafe:
+    it fabricates a fresh candle and can authorize a trade using stale data.
+    """
+    if isinstance(raw, datetime):
+        value = raw.replace(tzinfo=timezone.utc) if raw.tzinfo is None else raw
+        return value.astimezone(timezone.utc)
+
+    if raw is None:
+        return None
+
+    # Numeric timestamps are seconds for normal Unix values and milliseconds
+    # for the 13-digit values used by many broker APIs.
+    try:
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            epoch = float(raw)
+        else:
+            text = str(raw).strip()
+            if not text:
+                return None
+            epoch = float(text)
+        if epoch > 100_000_000_000:
+            epoch /= 1000.0
+        return datetime.fromtimestamp(epoch, tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+
+    try:
+        value = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        log.warning("Ignoring candle with invalid timestamp: %r", raw)
+        return None
