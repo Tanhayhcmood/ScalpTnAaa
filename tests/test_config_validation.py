@@ -60,7 +60,7 @@ class TestConfigDefaults:
 
     def test_range_min_confirmations_default(self):
         cfg = _reload_config({})
-        assert cfg.RANGE_MIN_CONFIRMATIONS == 2
+        assert cfg.RANGE_MIN_CONFIRMATIONS == 1
         assert isinstance(cfg.RANGE_MIN_CONFIRMATIONS, int)
 
     def test_daily_loss_limit_default(self):

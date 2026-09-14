@@ -84,13 +84,13 @@ services:
       # risk gates pass. No individual strategy is mandatory.
       - key: MIN_CONFIRMATIONS
         value: "1"
-      # Dedicated RANGE playbook from the operator runbook:
+      # Dedicated RANGE playbook:
       # edge + fresh same-direction sweep + closed-candle reversal +
-      # the two-strategy consensus floor.
+      # at least one aligned strategy confirmation.
       - key: RANGE_TRADING_ENABLED
         value: "true"
       - key: RANGE_MIN_CONFIRMATIONS
-        value: "2"
+        value: "1"
       - key: RANGE_MIN_RR
         value: "1.5"
       - key: RANGE_EDGE_ATR_DISTANCE
@@ -99,15 +99,15 @@ services:
         value: "0.25"
       # RANGE protection: BUY entries must be at support and SELL entries must
       # be at resistance, with a fresh same-direction sweep, a closed-candle
-      # reversal, and the dedicated confirmation floor.
+      # reversal, and at least one aligned strategy confirmation.
       - key: RANGE_ENTRY_FILTERS_ENABLED
         value: "true"
       - key: MAX_RANGE_TRADES_PER_SESSION
         value: "2"
       - key: MAX_OPEN_TRADES
         value: "1"
-      # Normal entries require any two same-direction votes through
-      # MIN_CONFIRMATIONS; no individual strategy is forced to be the second
+      # Normal entries require any one same-direction vote through
+      # MIN_CONFIRMATIONS; no individual strategy is mandatory
       # vote. All independent confidence, quality, regime, and risk gates stay active.
       - key: REQUIRE_PRICE_ACTION
         value: "false"

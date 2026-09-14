@@ -98,7 +98,7 @@ candles (300 M5 bars)
    ├─► Price Action      → Engulf, Pin Bar, Breakout
    ├─► Wyckoff Engine    → Phase, Spring, Upthrust
    │
-   ├─► Entry Filter      → min 3-of-4 votes (SMC required)
+   ├─► Entry Filter      → min 1-of-4 vote (SMC required)
    ├─► Market Regime     → 11 regimes + ADX + rules per regime
    ├─► Confidence Engine → 0–100 score (6 weighted bands)
    ├─► Quality Filter    → Session quality / ADX / late-entry / volume gate
@@ -116,7 +116,7 @@ candles (300 M5 bars)
 | Confidence hard minimum | 70% | decisionEngine.ts |
 | Risk per trade | 1% of balance | capitalManager.ts |
 | Take profit | 2R | capitalManager.ts |
-| Min confirmations | 3-of-4 | entryFilter.ts |
+| Min confirmations | 1-of-4 | entryFilter.ts |
 | SMC swing lookback | 5 bars | smcEngine.ts |
 | ATR period | 14 (Wilder) | goldEngine.ts |
 

@@ -168,11 +168,12 @@ RANGE_MIN_CONFIDENCE  = _float("RANGE_MIN_CONFIDENCE",  47.0, lo=0.0, hi=100.0)
 MIN_CONFIRMATIONS = _int("MIN_CONFIRMATIONS",   1,    lo=1,    hi=10)
 # Dedicated RANGE playbook: the edge/sweep/reversal gate is mandatory and the
 # four-engine vote must still meet this minimum. Keep it separate from the
-# global floor so non-RANGE behavior remains unchanged.
+# global floor so non-RANGE behavior remains unchanged. One aligned engine is
+# enough for this vote; all other RANGE and risk gates remain mandatory.
 RANGE_TRADING_ENABLED = os.getenv("RANGE_TRADING_ENABLED", "true").strip().lower() in {
     "1", "true", "yes", "on",
 }
-RANGE_MIN_CONFIRMATIONS = _int("RANGE_MIN_CONFIRMATIONS", 2, lo=2, hi=4)
+RANGE_MIN_CONFIRMATIONS = _int("RANGE_MIN_CONFIRMATIONS", 1, lo=1, hi=4)
 RANGE_MIN_RR = _float("RANGE_MIN_RR", 1.5, lo=1.0, hi=10.0)
 RANGE_EDGE_ATR_DISTANCE = _float("RANGE_EDGE_ATR_DISTANCE", 0.25, lo=0.05, hi=2.0)
 RANGE_RISK_PERCENT = _float("RANGE_RISK_PERCENT", 0.5, lo=0.01, hi=10.0)

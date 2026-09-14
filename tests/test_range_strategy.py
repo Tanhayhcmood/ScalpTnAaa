@@ -75,14 +75,22 @@ def _candles() -> list[OHLCV]:
     ]
 
 
-def test_range_buy_requires_edge_sweep_reversal_and_two_confirmations():
+def test_range_buy_requires_edge_sweep_reversal_and_one_confirmation():
     result = evaluate_range_entry(
-        _candles(), "BUY", _smc("BUY", 20), _pa(True), 2, 2
+        _candles(), "BUY", _smc("BUY", 20), _pa(True), 1, 1
     )
     assert result.valid
     assert result.location == "SUPPORT"
     assert result.liquidity_sweep
     assert result.reversal_candle
+
+
+def test_range_buy_accepts_one_confirmation_when_other_range_gates_pass():
+    result = evaluate_range_entry(
+        _candles(), "BUY", _smc("BUY", 20), _pa(True), 1, 1
+    )
+    assert result.valid
+    assert result.confirmation_count == 1
 
 
 def test_range_blocks_middle_of_range_even_with_confirmations():
