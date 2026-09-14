@@ -118,7 +118,7 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `RANGE_RISK_PERCENT` | No | `0.25` | Risk per RANGE trade (% of balance) |
 | `RANGE_ENTRY_FILTERS_ENABLED` | No | `true` | When false, disables only Option 2 RANGE edge/sweep/reversal/confirmation blockers |
 | `MAX_RANGE_TRADES_PER_SESSION` | No | `2` | Successful RANGE entries allowed per UTC session |
-| `MAX_OPEN_TRADES` | No | `1` | Maximum simultaneous open positions |
+| `MAX_OPEN_TRADES` | No | `4` | Maximum simultaneous open positions (one per strategy slot) |
 | `CONF_HARD_MIN` | No | `32` | Confidence-engine hard floor |
 | `OPTION_TWO_MIN_CONFIDENCE` | No | `49` | MTF confidence floor for the HTF-confirmed entry gate |
 | `MTF_ENABLED` | No | `true` | Enable the Option 1/2 higher-timeframe entry blocker |

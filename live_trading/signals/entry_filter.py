@@ -2,7 +2,7 @@
 Entry Filter — Minimum N of 4 independent confirmations.
 
 A trade may open when N independent engines agree on the same direction.
-The production default is two votes out of four; no individual engine is
+The production default is one vote out of four; no individual engine is
 mandatory for the ordinary entry gate.
 """
 from dataclasses import dataclass

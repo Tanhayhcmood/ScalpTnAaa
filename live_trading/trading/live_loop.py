@@ -70,6 +70,11 @@ from live_trading.mt5.connector import (
 from live_trading.mt5.executor import (
     place_market_order, close_position, modify_position, TradeResult
 )
+from live_trading.trading.strategy_slots import (
+    strategy_order_comment,
+    strategy_slots_for_decision,
+    available_for_strategy_slots,
+)
 from live_trading.utils.state_writer import (
     write_robot_state, write_mt5_snapshot,
     read_commands, clear_command, log_trade,
@@ -1189,7 +1194,7 @@ class GoldScalperLive:
             },
         )
 
-        # 7. Gate: max positions
+        # 7. Gate: aggregate strategy-slot capacity
         if len(raw_positions) >= MAX_OPEN_TRADES:
             self._set_trade_permission(
                 False,
@@ -1240,6 +1245,31 @@ class GoldScalperLive:
             log.info(f"No trade → {reasons}")
             self._write_state(
                 "SCANNING", acc_info, decision, pos,
+                extra=self._guardian_extra(gs),
+            )
+            return
+
+        candidate_strategy_slots = strategy_slots_for_decision(decision)
+        slots_available, slot_reason = available_for_strategy_slots(
+            pos_dicts,
+            candidate_strategy_slots,
+            max_open_positions=MAX_OPEN_TRADES,
+        )
+        if not slots_available:
+            self._set_trade_permission(
+                False,
+                "STRATEGY_POSITION_LIMIT",
+                [slot_reason],
+            )
+            log.info(
+                f"Strategy position limit — {slot_reason}; "
+                f"candidate={candidate_strategy_slots}"
+            )
+            self._write_state(
+                "HOLDING" if pos_dicts else "SCANNING",
+                acc_info,
+                decision,
+                pos,
                 extra=self._guardian_extra(gs),
             )
             return
@@ -1360,8 +1390,8 @@ class GoldScalperLive:
                                   extra=self._guardian_extra(gs))
                 return
 
-        # 8c. Safety re-check: confirm we are still flat immediately before
-        # sending the order.
+        # 8c. Safety re-check: confirm strategy-slot capacity immediately
+        # before sending the order.
         #
         # ROOT CAUSE: mt5rest has occasionally corrupted a genuinely open
         # position's row into a "lone row with an insane volume" (see
@@ -1371,13 +1401,13 @@ class GoldScalperLive:
         # get_open_positions() briefly reports the account as flat (raw
         # positions = []) even though a real position is still open in MT5.
         # If that happens to coincide with step 4's position check above, the
-        # MAX_OPEN_TRADES gate (step 7) sees 0 open positions and lets a
-        # second, unintended position stack on top of the first.
+        # strategy-slot gate (step 7) sees too few occupied slots and could
+        # allow an unintended duplicate.
         #
         # Re-polling right here — seconds later, after the decision engine,
         # snapshot write, and all other gates have already run — is enough
         # time for a transient bridge glitch to clear. If a position now
-        # shows up, we abort this entry rather than risk stacking a duplicate.
+        # claims the candidate slot, we abort this entry rather than stack it.
         # This costs one extra read-only mt5rest call only on the path that
         # is about to place an order; every other code path (trailing stop,
         # /close_all, panel snapshot) is untouched.
@@ -1396,18 +1426,26 @@ class GoldScalperLive:
             self._write_state("WAITING", acc_info, decision, pos,
                                extra=self._guardian_extra(gs))
             return
-        if _confirm_positions:
+        _confirm_pos_dicts = [
+            mt5_pos_to_dict(position) for position in _confirm_positions
+        ]
+        _confirm_slots_available, _confirm_slot_reason = (
+            available_for_strategy_slots(
+                _confirm_pos_dicts,
+                candidate_strategy_slots,
+                max_open_positions=MAX_OPEN_TRADES,
+            )
+        )
+        if not _confirm_slots_available:
             self._set_trade_permission(
                 False,
-                "POSITION_ALREADY_OPEN",
-                ["A position appeared during the pre-order safety re-check"],
+                "STRATEGY_POSITION_LIMIT",
+                [_confirm_slot_reason],
             )
-            _confirm_pos = mt5_pos_to_dict(_confirm_positions[0])
+            _confirm_pos = _confirm_pos_dicts[0] if _confirm_pos_dicts else pos
             log.warning(
-                f"Pre-order safety re-check found position "
-                f"{_confirm_pos.get('id')} that was missing from the earlier "
-                f"scan this bar (likely a transient mt5rest reporting glitch) "
-                f"— aborting this entry to avoid stacking a duplicate position."
+                f"Pre-order strategy-capacity check blocked entry: "
+                f"{_confirm_slot_reason}"
             )
             self._write_state("HOLDING", acc_info, decision, _confirm_pos,
                                extra=self._guardian_extra(gs))
@@ -1420,6 +1458,10 @@ class GoldScalperLive:
             ["All live entry gates passed"],
         )
         tp_params = decision.trade_params
+        order_comment = strategy_order_comment(
+            COMMENT,
+            candidate_strategy_slots,
+        )
         log.info(
             f"🔔 SIGNAL [{tf}] {decision.direction}  "
             f"conf={decision.confidence:.1f}%  "
@@ -1435,7 +1477,7 @@ class GoldScalperLive:
             lot_size  = tp_params.lot_size,
             sl        = tp_params.stop_loss,
             tp        = tp_params.take_profit,
-            comment   = COMMENT,
+            comment   = order_comment,
             deviation = SLIPPAGE_POINTS,
         )
 
@@ -1464,6 +1506,7 @@ class GoldScalperLive:
                 "regime":      decision.regime,
                 "bar_time":    bar_time.isoformat(),
                 "strategy":    strategy,
+                "strategy_slots": list(candidate_strategy_slots),
             }
             log_trade(self.trade_history, entry_log)
             # Publish the "why" behind this trade, keyed by ticket, so the
@@ -1499,7 +1542,7 @@ class GoldScalperLive:
                 "sl":         tp_params.stop_loss,
                 "tp":         tp_params.take_profit,
                 "profit":     0.0,
-                "comment":    COMMENT,
+                "comment":    order_comment,
             }
             # ROOT-CAUSE FIX: push the newly opened position into the live
             # Redis snapshot immediately. write_mt5_snapshot() above (step 6)

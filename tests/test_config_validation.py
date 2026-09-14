@@ -62,6 +62,11 @@ class TestConfigDefaults:
         assert cfg.RANGE_MIN_CONFIRMATIONS == 1
         assert isinstance(cfg.RANGE_MIN_CONFIRMATIONS, int)
 
+    def test_max_open_trades_default_is_one_per_strategy_slot(self):
+        cfg = _reload_config({})
+        assert cfg.MAX_OPEN_TRADES == 4
+        assert isinstance(cfg.MAX_OPEN_TRADES, int)
+
     def test_daily_loss_limit_default(self):
         cfg = _reload_config({})
         assert cfg.DAILY_LOSS_LIMIT_PCT == 3.0

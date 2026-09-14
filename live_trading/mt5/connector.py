@@ -556,6 +556,7 @@ def mt5_pos_to_dict(pos: dict) -> dict:
         "sl":         pos.get("stopLoss",   pos.get("sl", 0)),
         "tp":         pos.get("takeProfit", pos.get("tp", 0)),
         "profit":     pos.get("profit",  0),
+        "comment":    pos.get("comment", ""),
         "time_str":   str(pos.get("time", pos.get("openTime", ""))),
         # keep original for executor
         "_raw":       pos,

@@ -51,7 +51,7 @@ def _effective_min_confirmations(
 
     Counter-trend and choppy-market handling remain covered by the existing
     confidence, quality, regime, MTF, and risk gates; they do not silently
-    turn the requested two-strategy consensus into a three-vote requirement.
+    turn the configured one-strategy floor into a stricter vote requirement.
     """
     if regime == "RANGE":
         return max(base_min_confirmations, range_min_confirmations)
@@ -182,7 +182,9 @@ def run_decision_engine(
 
     candidate = _candidate_direction(smc, wyckoff, pa, trend)
     if candidate == "NEUTRAL":
-        return _make_neutral(smc, wyckoff, pa, trend, ["No two-strategy consensus"])
+        return _make_neutral(
+            smc, wyckoff, pa, trend, ["No unique strategy direction"]
+        )
 
     # Soft EMA gate — counter-trend trades are allowed but need 3 confirmations
     trend_dir = ("BUY" if trend.trend == "BULLISH" else

@@ -105,7 +105,9 @@ services:
       - key: MAX_RANGE_TRADES_PER_SESSION
         value: "2"
       - key: MAX_OPEN_TRADES
-        value: "1"
+        value: "4"
+      # One concurrent position per strategy slot: SMC, Trend, Price Action,
+      # and Wyckoff. Legacy untagged positions fail closed and occupy all slots.
       # Normal entries require any one same-direction vote through
       # MIN_CONFIRMATIONS; no individual strategy is mandatory
       # vote. All independent confidence, quality, regime, and risk gates stay active.
