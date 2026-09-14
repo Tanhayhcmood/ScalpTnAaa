@@ -41,19 +41,32 @@ class QualityFilterResult:
     is_news_blocked: bool = False
 
 
-def get_session_quality(iso_timestamp: str) -> Literal["PRIME", "MODERATE", "BLOCKED"]:
+def get_session_quality(timestamp: object) -> Literal["PRIME", "MODERATE", "BLOCKED"]:
+    """Classify a candle timestamp in UTC without rejecting valid datetime objects."""
     try:
-        dt   = datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00"))
-        hour = dt.hour if dt.tzinfo else datetime.strptime(
-            iso_timestamp[:19], "%Y-%m-%dT%H:%M:%S").hour
-    except Exception:
+        if isinstance(timestamp, datetime):
+            dt = timestamp
+        elif isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
+            epoch = float(timestamp)
+            if epoch > 100_000_000_000:
+                epoch /= 1000.0
+            dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+        else:
+            text = str(timestamp).strip()
+            if not text:
+                return "BLOCKED"
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
         return "BLOCKED"
+    hour = dt.hour
     for start, end, quality in ALLOWED_SESSIONS:
         if start <= hour < end:
             return quality  # type: ignore
     return "BLOCKED"
-
-
 def _calc_ema50(closes: List[float]) -> float:
     period = 50
     if len(closes) < period:
