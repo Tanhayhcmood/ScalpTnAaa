@@ -79,11 +79,12 @@ services:
         value: "24"
       - key: RISK_PERCENT
         value: "1.0"
-      # Production signal policy: any two of the four independent strategies
-      # may authorize direction after confidence, quality, regime, sizing, and
-      # risk gates pass. No individual strategy is mandatory.
+      # Ordinary entries keep the operator-selected one-vote floor, but a
+      # Trend-aligned entry must have two independent confirmations.
       - key: MIN_CONFIRMATIONS
         value: "1"
+      - key: TREND_MIN_CONFIRMATIONS
+        value: "2"
       # Dedicated RANGE playbook:
       # edge + fresh same-direction sweep + closed-candle reversal +
       # at least one aligned strategy confirmation.
@@ -108,9 +109,9 @@ services:
         value: "4"
       # One concurrent position per strategy slot: SMC, Trend, Price Action,
       # and Wyckoff. Legacy untagged positions fail closed and occupy all slots.
-      # Normal entries require any one same-direction vote through
-      # MIN_CONFIRMATIONS; no individual strategy is mandatory
-      # vote. All independent confidence, quality, regime, and risk gates stay active.
+      # Normal non-Trend entries use MIN_CONFIRMATIONS. Trend-aligned entries
+      # use TREND_MIN_CONFIRMATIONS. All independent confidence, quality,
+      # regime, and risk gates stay active.
       - key: REQUIRE_PRICE_ACTION
         value: "false"
       - key: REQUIRE_SMC_PRICE_ACTION_WYCKOFF

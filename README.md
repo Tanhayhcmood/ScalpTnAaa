@@ -110,7 +110,8 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `TRADE_TIMEFRAMES` | No | `M20,M15,M10,5m` | Multi-timeframe scan order, highest first |
 | `CANDLE_WINDOW` | No | `300` | Bars fetched per candle request |
 | `RISK_PERCENT` | No | `1.0` | Risk per trade (% of balance) |
-| `MIN_CONFIRMATIONS` | No | `1` | Min signal confirmations (SMC always required + N of Trend/PA/Wyckoff) |
+| `MIN_CONFIRMATIONS` | No | `1` | Ordinary-entry confirmation floor |
+| `TREND_MIN_CONFIRMATIONS` | No | `2` | Minimum confirmations when Trend votes for the entry direction |
 | `RANGE_TRADING_ENABLED` | No | `true` | Enable the dedicated edge/sweep/reversal RANGE playbook |
 | `RANGE_MIN_CONFIRMATIONS` | No | `1` | RANGE requires at least one aligned strategy confirmation |
 | `RANGE_MIN_RR` | No | `1.5` | Minimum RANGE risk/reward |

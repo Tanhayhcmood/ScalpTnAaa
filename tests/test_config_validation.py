@@ -52,10 +52,15 @@ class TestConfigDefaults:
         assert isinstance(cfg.RISK_PERCENT, float)
 
     def test_min_confirmations_default(self):
-        """Default is 1; confidence and risk gates remain mandatory."""
+        """Ordinary entries keep the operator-selected default floor."""
         cfg = _reload_config({})
         assert cfg.MIN_CONFIRMATIONS == 1
         assert isinstance(cfg.MIN_CONFIRMATIONS, int)
+
+    def test_trend_min_confirmations_default(self):
+        cfg = _reload_config({})
+        assert cfg.TREND_MIN_CONFIRMATIONS == 2
+        assert isinstance(cfg.TREND_MIN_CONFIRMATIONS, int)
 
     def test_range_min_confirmations_default(self):
         cfg = _reload_config({})

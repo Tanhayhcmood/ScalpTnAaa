@@ -28,6 +28,7 @@ from live_trading.config import (
     RANGE_MIN_CONFIRMATIONS,
     REQUIRE_SMC_PRICE_ACTION_WYCKOFF,
     RANGE_ENTRY_FILTERS_ENABLED,
+    TREND_MIN_CONFIRMATIONS,
 )
 
 # Marginal confidence R:R floor: trades with confidence between CONF_HARD_MIN
@@ -162,6 +163,7 @@ def run_decision_engine(
     account_balance:   float,
     risk_percent:      float = 1.0,
     min_confirmations: int   = 1,
+    trend_min_confirmations: int = TREND_MIN_CONFIRMATIONS,
     use_atr_high_vol:  bool  = False,
     dxy_signal:        str   = "NEUTRAL",
     require_price_action: bool = False,
@@ -205,6 +207,16 @@ def run_decision_engine(
     # Price Action or Wyckoff is sufficient; the global option-1 gate must
     # not turn that dedicated two-confirmation playbook into a three-vote gate.
     is_range_regime = regime.regime == "RANGE"
+    # A Trend-aligned entry is more exposed to a single transient EMA signal
+    # than a structure/price-action setup. Keep the ordinary operator floor,
+    # but require a second independent confirmation whenever Trend votes for
+    # the candidate direction. RANGE keeps its dedicated playbook unchanged.
+    if (
+        not is_range_regime
+        and trend_dir == candidate
+        and trend_min_confirmations > effective_min_confirmations
+    ):
+        effective_min_confirmations = trend_min_confirmations
     ef = apply_entry_filter(
         smc_signal      = smc.smc_signal,
         ema_trend       = trend.trend,

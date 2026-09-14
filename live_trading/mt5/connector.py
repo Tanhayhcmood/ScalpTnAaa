@@ -289,7 +289,28 @@ async def get_closed_position_history(position_id: str) -> dict:
         if get_deals is None:
             log.warning("MetaAPI SDK does not expose get_deals_by_position")
             return {}
-        deals = await get_deals(position_id)
+        raw_deals = await get_deals(position_id)
+        if isinstance(raw_deals, dict):
+            # SDK versions/adapters may wrap the list or return one deal.
+            if any(key in raw_deals for key in (
+                "price", "closePrice", "time", "brokerTime", "entryType",
+            )):
+                deals = [raw_deals]
+            else:
+                deals = (
+                    raw_deals.get("deals")
+                    or raw_deals.get("items")
+                    or raw_deals.get("data")
+                    or []
+                )
+        elif isinstance(raw_deals, (list, tuple)):
+            deals = raw_deals
+        else:
+            deals = []
+        # A malformed adapter response must not break close detection on
+        # every retry. Ignore non-mapping entries instead of calling .get()
+        # on strings or other scalar values.
+        deals = [deal for deal in deals if isinstance(deal, dict)]
         if not deals:
             return {}
         closing = [

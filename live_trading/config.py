@@ -149,7 +149,8 @@ CANDLE_WINDOW = _int("CANDLE_WINDOW", 300, lo=50, hi=5000)
 
 # ── Risk & Trade Rules ───────────────────────────────────────────────────────
 # Production defaults — override via Render env vars if needed.
-# MIN_CONFIRMATIONS: minimum engines that must agree (out of 4: SMC, Trend, PA, Wyckoff).
+# MIN_CONFIRMATIONS: minimum engines that must agree for ordinary entries
+# (out of 4: SMC, Trend, PA, Wyckoff).
 # CONF_HARD_MIN: trades below this confidence % are always rejected.
 RISK_PERCENT      = _float("RISK_PERCENT",      1.0,  lo=0.01, hi=10.0)
 #
@@ -161,11 +162,16 @@ RISK_PERCENT      = _float("RISK_PERCENT",      1.0,  lo=0.01, hi=10.0)
 # both live entry modes.
 NORMAL_MIN_CONFIDENCE = _float("NORMAL_MIN_CONFIDENCE", 47.0, lo=0.0, hi=100.0)
 RANGE_MIN_CONFIDENCE  = _float("RANGE_MIN_CONFIDENCE",  47.0, lo=0.0, hi=100.0)
-# MIN_CONFIRMATIONS=1: one aligned engine may qualify the ordinary entry gate.
-# Confidence, quality, MTF, regime, R:R, and risk gates remain active.
+# MIN_CONFIRMATIONS=1 keeps the operator-selected ordinary entry floor.
+# Trend-aligned entries have their own safer floor below, so a Trend vote
+# cannot open a trade by itself after a transient candle signal.
 # RANGE has its own stricter floor below so choppy conditions cannot enter on
 # only one agreeing engine.
 MIN_CONFIRMATIONS = _int("MIN_CONFIRMATIONS",   1,    lo=1,    hi=10)
+# A Trend-aligned ordinary entry must have at least two independent votes by
+# default. This is deliberately separate from MIN_CONFIRMATIONS so SMC/PA/
+# Wyckoff-only entries can retain the operator-selected ordinary policy.
+TREND_MIN_CONFIRMATIONS = _int("TREND_MIN_CONFIRMATIONS", 2, lo=1, hi=4)
 # Dedicated RANGE playbook: the edge/sweep/reversal gate is mandatory and the
 # four-engine vote must still meet this minimum. Keep it separate from the
 # global floor so non-RANGE behavior remains unchanged. One aligned engine is

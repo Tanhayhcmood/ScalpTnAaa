@@ -73,7 +73,10 @@ def _calc_smart_sl(direction: str, entry: float, atr: float, inp: CapitalInput) 
         if inp.support_level is not None and inp.support_level < entry:
             cands.append(inp.support_level)
         if cands:
-            level  = max(cands)
+            # Use the outer structural invalidation for a long as well. The
+            # nearest support can be a wick or the edge of the active order
+            # block; use the lowest valid level and keep the ATR cap below.
+            level  = min(cands)
             raw_sl = entry - (entry - level + buffer)
     else:
         cands = []
@@ -84,7 +87,12 @@ def _calc_smart_sl(direction: str, entry: float, atr: float, inp: CapitalInput) 
         if inp.resistance_level is not None and inp.resistance_level > entry:
             cands.append(inp.resistance_level)
         if cands:
-            level  = min(cands)
+            # Use the outer structural invalidation for a short. The nearest
+            # resistance is often only a wick or the edge of the active
+            # order block; putting the stop there lets a normal retracement
+            # invalidate a still-valid trend. MAX_SL_ATR_MULT below still
+            # bounds the result.
+            level  = max(cands)
             raw_sl = entry + (level - entry + buffer)
 
     fallback  = atr * 1.5
