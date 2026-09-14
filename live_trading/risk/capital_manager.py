@@ -46,6 +46,8 @@ class CapitalOutput:
     risk_amount:            float
     sl_distance_usd:        float
     sl_distance_pips:       float
+    risk_budget:            float
+    min_lot_risk_exceeded:  bool
 
 
 def _clamp(val: float, lo: float, hi: float) -> float:
@@ -93,12 +95,18 @@ def _calc_smart_sl(direction: str, entry: float, atr: float, inp: CapitalInput) 
 
 def _calc_lot_size(sl_dist_usd: float, balance: float, risk_pct: float):
     if sl_dist_usd <= 0:
-        return MIN_LOT, 0.0
-    risk_amount = balance * risk_pct / 100
-    raw_lot     = risk_amount / (sl_dist_usd * LOT_DOLLAR_PER_UNIT)
+        return MIN_LOT, 0.0, 0.0, False
+    risk_budget = max(0.0, balance * risk_pct / 100)
+    raw_lot     = risk_budget / (sl_dist_usd * LOT_DOLLAR_PER_UNIT)
     lot_size    = _r4(_clamp(raw_lot, MIN_LOT, MAX_LOT))
     actual_risk = _r2(lot_size * sl_dist_usd * LOT_DOLLAR_PER_UNIT)
-    return lot_size, actual_risk
+    # A broker's minimum volume can be larger than the requested risk budget.
+    # Never silently report that trade as a 1% risk trade: the live decision
+    # engine uses this flag to reject it before an order is sent.
+    min_lot_risk_exceeded = (
+        raw_lot < MIN_LOT and actual_risk > risk_budget + 0.01
+    )
+    return lot_size, actual_risk, _r2(risk_budget), min_lot_risk_exceeded
 
 
 def calc_trade_parameters(inp: CapitalInput) -> CapitalOutput:
@@ -126,7 +134,9 @@ def calc_trade_parameters(inp: CapitalInput) -> CapitalOutput:
         tp = _r2(entry + tp_dist if direction == "BUY" else entry - tp_dist)
     rr         = _r2(tp_dist / sl_dist) if sl_dist > 0 else 0.0
 
-    lot, risk  = _calc_lot_size(sl_dist, inp.account_balance, risk_pct)
+    lot, risk, risk_budget, min_lot_risk_exceeded = _calc_lot_size(
+        sl_dist, inp.account_balance, risk_pct
+    )
 
     # Break-even trigger: price must move 1× SL distance in our favour before
     # we can safely move the stop to entry.  Trailing stop activates at the
@@ -150,4 +160,6 @@ def calc_trade_parameters(inp: CapitalInput) -> CapitalOutput:
         risk_amount=risk,
         sl_distance_usd=sl_dist,
         sl_distance_pips=sl_pips,
+        risk_budget=risk_budget,
+        min_lot_risk_exceeded=min_lot_risk_exceeded,
     )

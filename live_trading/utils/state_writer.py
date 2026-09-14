@@ -161,6 +161,10 @@ def write_robot_state(
                 "lot":    decision.trade_params.lot_size,
                 "rr":     decision.trade_params.risk_reward_ratio,
                 "risk_usd": decision.trade_params.risk_amount,
+                "risk_budget_usd": decision.trade_params.risk_budget,
+                "risk_budget_exceeded": (
+                    decision.trade_params.min_lot_risk_exceeded
+                ),
             } if decision.trade_params else None,
             # Per-candle structured telemetry for the panel and post-trade
             # analysis. This is derived from the same DecisionResult and does

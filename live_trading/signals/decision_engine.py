@@ -419,6 +419,32 @@ def run_decision_engine(
     )
     trade_params = calc_trade_parameters(cap_input)
 
+    # A minimum broker volume must not turn a configured percentage risk into
+    # an account-sized loss. This is a risk-capacity guard, not a signal
+    # filter: it only blocks when the broker cannot express the requested
+    # risk with its minimum lot size.
+    if trade_params.min_lot_risk_exceeded:
+        risk_reason = (
+            f"Minimum lot {trade_params.lot_size:.4f} would risk "
+            f"${trade_params.risk_amount:.2f} versus the "
+            f"${trade_params.risk_budget:.2f} risk budget"
+        )
+        return DecisionResult(
+            allowed=False, direction=candidate,  # type: ignore
+            confidence=conf_result.confidence, components=conf_result.components,
+            grade=conf_result.grade, regime=regime.regime,
+            regime_label=regime.rules.label, regime_rules=regime.rules,
+            quality_filter=quality,
+            blocked_reasons=[risk_reason],
+            reasoning=conf_result.reasoning + [risk_reason],
+            trade_params=trade_params,
+            smc=smc, wyckoff=wyckoff, pa=pa, trend=trend,
+            entry_filter=ef,
+            divergence=divergence,
+            dxy_signal=dxy_signal,
+            range_context=range_context,
+        )
+
     # Marginal confidence check
     min_conf = regime.rules.min_confidence
     if conf_result.confidence < min_conf:
