@@ -14,9 +14,13 @@ MetaAPI docs: https://metaapi.cloud/docs/client/
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Any
+from typing import Awaitable, List, Optional, Any
 
-from live_trading.config import METAAPI_TOKEN, METAAPI_ACCOUNT_ID
+from live_trading.config import (
+    METAAPI_TOKEN,
+    METAAPI_ACCOUNT_ID,
+    RPC_CALL_TIMEOUT,
+)
 from live_trading.signals.gold_engine import OHLCV
 from live_trading.logger import get_logger
 
@@ -35,6 +39,53 @@ _connected: bool  = False
 _connection_lock = asyncio.Lock()
 _health_lock = asyncio.Lock()
 _consecutive_health_failures = 0
+
+
+def _is_transport_failure(exc: BaseException) -> bool:
+    """Identify failures that mean the RPC session cannot be trusted."""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "timed out",
+            "timeout",
+            "disconnected",
+            "connection lost",
+            "not connected",
+            "websocket",
+        )
+    )
+
+
+def mark_connection_unhealthy(reason: str) -> None:
+    """Make the next loop iteration replace the current RPC session."""
+    global _connected
+    if _connected:
+        _connected = False
+        log.error("MetaAPI session marked unhealthy: %s", reason)
+
+
+async def _rpc_call(awaitable: Awaitable[Any], operation: str) -> Any:
+    """Run a data-plane MetaAPI call with a hard upper bound.
+
+    The MetaAPI SDK normally reports request timeouts, but a broken websocket
+    can leave one coroutine pending long enough to stop the trading loop from
+    writing heartbeats.  Cancelling that call lets the next loop iteration
+    close the stale client and build one clean replacement connection.
+    """
+    try:
+        return await asyncio.wait_for(awaitable, timeout=RPC_CALL_TIMEOUT)
+    except asyncio.TimeoutError as exc:
+        mark_connection_unhealthy(f"{operation} timed out after {RPC_CALL_TIMEOUT}s")
+        raise RuntimeError(
+            f"MetaAPI {operation} timed out after {RPC_CALL_TIMEOUT}s"
+        ) from exc
+    except Exception as exc:
+        if _is_transport_failure(exc):
+            mark_connection_unhealthy(f"{operation} failed: {exc}")
+        raise
 
 
 def _account_field(info: Any, key: str, default: Any = None) -> Any:
@@ -80,14 +131,20 @@ async def _close_current_connection_unlocked() -> None:
 
     try:
         if connection:
-            await connection.close()
+            await asyncio.wait_for(
+                connection.close(),
+                timeout=min(15, RPC_CALL_TIMEOUT),
+            )
     except Exception as exc:
         log.debug(f"MetaAPI RPC close failed during cleanup: {exc}")
     try:
         if api:
             result = api.close()
             if hasattr(result, "__await__"):
-                await result
+                await asyncio.wait_for(
+                    result,
+                    timeout=min(15, RPC_CALL_TIMEOUT),
+                )
     except Exception as exc:
         log.debug(f"MetaAPI client close failed during cleanup: {exc}")
 
@@ -229,7 +286,10 @@ async def keepalive_metaapi() -> bool:
         if connection is None:
             return False
         try:
-            await connection.get_account_information()
+            await asyncio.wait_for(
+                connection.get_account_information(),
+                timeout=RPC_CALL_TIMEOUT,
+            )
             _consecutive_health_failures = 0
             return True
         except Exception as exc:
@@ -281,7 +341,10 @@ async def check_symbol_available(symbol: str) -> bool:
     if not is_connected():
         return False
     try:
-        specification = await _connection.get_symbol_specification(symbol)
+        specification = await _rpc_call(
+            _connection.get_symbol_specification(symbol),
+            f"symbol specification for {symbol}",
+        )
         return bool(specification)
     except Exception as exc:
         log.warning(f"check_symbol_available({symbol}) error: {exc}")
@@ -293,7 +356,10 @@ async def get_current_quote(symbol: str) -> Optional[dict]:
     if not is_connected():
         return None
     try:
-        quote = await _connection.get_symbol_price(symbol)
+        quote = await _rpc_call(
+            _connection.get_symbol_price(symbol),
+            f"price for {symbol}",
+        )
         if not quote:
             return None
         return {
@@ -316,7 +382,10 @@ async def get_closed_position_history(position_id: str) -> dict:
         if get_deals is None:
             log.warning("MetaAPI SDK does not expose get_deals_by_position")
             return {}
-        raw_deals = await get_deals(position_id)
+        raw_deals = await _rpc_call(
+            get_deals(position_id),
+            f"close history for position {position_id}",
+        )
         if isinstance(raw_deals, dict):
             # SDK versions/adapters may wrap the list or return one deal.
             if any(key in raw_deals for key in (
@@ -388,11 +457,14 @@ async def fetch_candles(
             _MAX_HISTORICAL_CANDLES,
         )
         # Historical candles are exposed by the account API, not the RPC connection.
-        candles = await _account.get_historical_candles(
-            symbol=symbol,
-            timeframe=tf,
-            start_time=None,
-            limit=request_limit,
+        candles = await _rpc_call(
+            _account.get_historical_candles(
+                symbol=symbol,
+                timeframe=tf,
+                start_time=None,
+                limit=request_limit,
+            ),
+            f"historical candles for {symbol} {tf}",
         )
         # MetaAPI may return candles in either order and can repeat a candle
         # around a reconnect. Normalize the order and deduplicate before
@@ -437,7 +509,10 @@ async def get_account_info() -> dict:
     if not is_connected():
         return {}
     try:
-        info = await _connection.get_account_information()
+        info = await _rpc_call(
+            _connection.get_account_information(),
+            "account information",
+        )
         free_margin = _account_field(
             info,
             "freeMargin",
@@ -575,7 +650,10 @@ async def get_open_positions(
     if not is_connected():
         raise RuntimeError("MetaAPI connection is not ready")
     try:
-        payload = await _connection.get_positions()
+        payload = await _rpc_call(
+            _connection.get_positions(),
+            f"open positions for {symbol}",
+        )
         positions, dropped = _parse_open_positions_response(
             payload, 200, known_positions=known_positions
         )

@@ -7,12 +7,14 @@ managed by connector.py.
 MetaAPI trade docs: https://metaapi.cloud/docs/client/
 """
 
+import asyncio
 from dataclasses import dataclass
 import math
 from typing import Optional
 
+from live_trading.config import RPC_CALL_TIMEOUT
 from live_trading.logger import get_logger
-from live_trading.mt5.connector import get_connection
+from live_trading.mt5.connector import get_connection, mark_connection_unhealthy
 
 log = get_logger()
 
@@ -78,18 +80,24 @@ async def place_market_order(
             "slippage":  deviation,
         }
         if direction.upper() == "BUY":
-            result = await conn.create_market_buy_order(
-                symbol, lot,
-                stop_loss=round(sl, 2),
-                take_profit=round(tp, 2),
-                options=options,
+            result = await asyncio.wait_for(
+                conn.create_market_buy_order(
+                    symbol, lot,
+                    stop_loss=round(sl, 2),
+                    take_profit=round(tp, 2),
+                    options=options,
+                ),
+                timeout=RPC_CALL_TIMEOUT,
             )
         else:
-            result = await conn.create_market_sell_order(
-                symbol, lot,
-                stop_loss=round(sl, 2),
-                take_profit=round(tp, 2),
-                options=options,
+            result = await asyncio.wait_for(
+                conn.create_market_sell_order(
+                    symbol, lot,
+                    stop_loss=round(sl, 2),
+                    take_profit=round(tp, 2),
+                    options=options,
+                ),
+                timeout=RPC_CALL_TIMEOUT,
             )
 
         # MetaAPI returns a dict with 'orderId' and 'tradeExecutionTime'
@@ -101,6 +109,8 @@ async def place_market_order(
         return TradeResult(True, pos_id, "OK", pos_id)
 
     except Exception as exc:
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in str(exc).lower():
+            mark_connection_unhealthy(f"place order failed: {exc}")
         log.error(f"❌ place_market_order error: {exc}")
         return TradeResult(False, None, str(exc))
 
@@ -113,11 +123,16 @@ async def close_position(position_id: str, **kwargs) -> TradeResult:
         return TradeResult(False, None, "No MetaAPI connection")
 
     try:
-        result = await conn.close_position(position_id)
+        result = await asyncio.wait_for(
+            conn.close_position(position_id),
+            timeout=RPC_CALL_TIMEOUT,
+        )
         log.info(f"✅ Position {position_id} closed")
         return TradeResult(True, position_id, "Closed")
 
     except Exception as exc:
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in str(exc).lower():
+            mark_connection_unhealthy(f"close position failed: {exc}")
         log.error(f"❌ close_position error: {exc}")
         return TradeResult(False, None, str(exc))
 
@@ -132,14 +147,19 @@ async def modify_position(position_id: str,
         return TradeResult(False, None, "No MetaAPI connection")
 
     try:
-        await conn.modify_position(
-            position_id,
-            stop_loss=round(sl, 2),
-            take_profit=round(tp, 2),
+        await asyncio.wait_for(
+            conn.modify_position(
+                position_id,
+                stop_loss=round(sl, 2),
+                take_profit=round(tp, 2),
+            ),
+            timeout=RPC_CALL_TIMEOUT,
         )
         log.info(f"✅ Position {position_id} modified — SL={sl}  TP={tp}")
         return TradeResult(True, position_id, "Modified")
 
     except Exception as exc:
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in str(exc).lower():
+            mark_connection_unhealthy(f"modify position failed: {exc}")
         log.error(f"❌ modify_position error: {exc}")
         return TradeResult(False, None, str(exc))

@@ -270,6 +270,9 @@ COMMENT = "GSPv4"
 BAR_CHECK_INTERVAL = _int("BAR_CHECK_INTERVAL", 5, lo=1, hi=60)
 RECONNECT_DELAY    = 30       # seconds before reconnect attempt
 SYNC_TIMEOUT       = 120      # seconds to wait for initial connect
+# Bound every individual MetaAPI RPC so one stalled websocket request cannot
+# freeze the trading loop and its heartbeat indefinitely.
+RPC_CALL_TIMEOUT   = _int("RPC_CALL_TIMEOUT", 30, lo=5, hi=120)
 
 # ── File Paths (for Telegram panel) ─────────────────────────────────────────
 STATE_FILE          = os.getenv("STATE_FILE",           "robot_state.json")

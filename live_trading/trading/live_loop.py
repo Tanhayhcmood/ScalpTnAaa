@@ -33,7 +33,7 @@ from live_trading.config import (
     METAAPI_TOKEN, METAAPI_ACCOUNT_ID,
     SYMBOL, TIMEFRAME, CANDLE_WINDOW, RISK_PERCENT,
     MAX_OPEN_TRADES, COMMENT,
-    BAR_CHECK_INTERVAL, RECONNECT_DELAY, SYNC_TIMEOUT,
+    BAR_CHECK_INTERVAL, RECONNECT_DELAY, SYNC_TIMEOUT, RPC_CALL_TIMEOUT,
     MIN_CONFIRMATIONS, TREND_MIN_CONFIRMATIONS,
     PRICE_ACTION_STANDALONE, REQUIRE_PRICE_ACTION,
     REQUIRE_SMC_PRICE_ACTION_WYCKOFF, USE_ATR_HIGH_VOL_FILTER,
@@ -577,9 +577,15 @@ class GoldScalperLive:
                 # Staircase trailing stop — checked every tick (not just on
                 # candle close) so it reacts within seconds of price crossing
                 # a step, not up to 5 minutes late.
-                await self._manage_trailing_stop()
+                await self._run_stage(
+                    "trailing stop management",
+                    self._manage_trailing_stop(),
+                )
                 _checkpoint(f"loop#{self.loop_count} trailing stop managed")
-                await self._reconcile_closed_trades()
+                await self._run_stage(
+                    "closed-trade reconciliation",
+                    self._reconcile_closed_trades(),
+                )
                 _checkpoint(f"loop#{self.loop_count} closed trades reconciled")
 
                 # Reset the within-tick trade guard before processing this
@@ -587,7 +593,10 @@ class GoldScalperLive:
                 # (e.g. M20+M10+M5 closing simultaneously) will see the same
                 # flag and only the first successful placement will go through.
                 self._trade_opened_this_tick = False
-                new_bars = await self._check_new_bars()
+                new_bars = await self._run_stage(
+                    "new-bar polling",
+                    self._check_new_bars(),
+                )
                 _checkpoint(f"loop#{self.loop_count} new_bars={len(new_bars)}")
                 if new_bars:
                     for _tf, _bar_time in new_bars:
@@ -596,7 +605,10 @@ class GoldScalperLive:
                             f"─── Bar #{self.loop_count} [{_tf}] "
                             f"at {_bar_time.isoformat()} ───"
                         )
-                        await self._on_new_bar(_bar_time, _tf)
+                        await self._run_stage(
+                            f"{_tf} bar processing",
+                            self._on_new_bar(_bar_time, _tf),
+                        )
                 else:
                     # Refresh account info every _ACC_REFRESH_INTERVAL seconds
                     # so the panel shows current balance/equity between candles.
@@ -641,6 +653,23 @@ class GoldScalperLive:
             await disconnect()
             self._write_state("STOPPED")
             log.info("Engine stopped.")
+
+    async def _run_stage(self, name: str, operation):
+        """Prevent one stalled MetaAPI operation from freezing the engine."""
+        timeout = max(RPC_CALL_TIMEOUT * 3, 90)
+        try:
+            return await asyncio.wait_for(operation, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            log.error(
+                f"Trading stage '{name}' exceeded {timeout}s; "
+                "forcing a clean MetaAPI reconnect."
+            )
+            self._write_state(
+                "DISCONNECTED",
+                self._last_acc_info,
+                extra={"error": f"{name} timeout"},
+            )
+            raise RuntimeError(f"Trading stage timed out: {name}") from exc
 
     # ── Bar detection ─────────────────────────────────────────────────────────
 
