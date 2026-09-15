@@ -140,10 +140,11 @@ services:
         value: "10"
       - key: BAR_CHECK_INTERVAL
         value: "10"
-      # Keep the H1/MTF context gate active. The local signal, confidence,
-      # sizing, stop, position, and Guardian gates remain active as well.
+      # MTF/H1 is intentionally disabled for the standalone Price Action
+      # mode. Local signal, confidence, sizing, stop, position, and Guardian
+      # gates remain active.
       - key: MTF_ENABLED
-        value: "true"
+        value: "false"
       - key: MTF_TIMEFRAME
         value: "H1"
       - key: MTF_CANDLE_WINDOW
