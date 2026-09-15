@@ -38,6 +38,21 @@ def test_opposing_two_to_two_vote_is_blocked():
     assert result.direction == "NEUTRAL"
 
 
+def test_single_strategy_vote_cannot_pass_two_confirmation_policy():
+    result = apply_entry_filter(
+        smc_signal="NEUTRAL",
+        ema_trend="NEUTRAL",
+        pa_signal="BUY",
+        wyckoff_signal="NEUTRAL",
+        min_confirmations=2,
+        price_action_standalone=False,
+    )
+
+    assert result.allowed is False
+    assert result.direction == "NEUTRAL"
+    assert result.confirmation_count == 1
+
+
 def test_candidate_direction_uses_the_consensus_not_smc_alone():
     result = _candidate_direction(
         SimpleNamespace(smc_signal="NEUTRAL"),

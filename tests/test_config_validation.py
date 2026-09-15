@@ -71,8 +71,12 @@ class TestConfigDefaults:
 
     def test_range_min_confirmations_default(self):
         cfg = _reload_config({})
-        assert cfg.RANGE_MIN_CONFIRMATIONS == 1
+        assert cfg.RANGE_MIN_CONFIRMATIONS == 2
         assert isinstance(cfg.RANGE_MIN_CONFIRMATIONS, int)
+
+    def test_price_action_standalone_is_disabled_by_default(self):
+        cfg = _reload_config({})
+        assert cfg.PRICE_ACTION_STANDALONE is False
 
     def test_max_open_trades_default_is_one_per_strategy_slot(self):
         cfg = _reload_config({})

@@ -94,9 +94,9 @@ def _range_confirmation_gate(
 
     RANGE keeps its separate edge, fresh sweep, reversal, R:R, and session
     limits. Its signal vote still follows the same equal-weight N-of-4
-    consensus as ordinary entries, but the dedicated range playbook requires
-    one aligned strategy vote is enough when the operator floor is one;
-    all other RANGE safeguards remain mandatory.
+    consensus as ordinary entries, but the dedicated range playbook still
+    applies the configured confirmation floor; all other RANGE safeguards
+    remain mandatory.
     """
     if entry_filter.confirmation_count < min_confirmations:
         return (

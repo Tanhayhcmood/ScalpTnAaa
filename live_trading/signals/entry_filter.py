@@ -1,13 +1,13 @@
 """Entry Filter — four-engine confirmation policy.
 
-Ordinary entries require the configured number of aligned engines. Price
-Action can optionally use a dedicated standalone path; the other engines
-remain subject to the ordinary confirmation floor.
+Ordinary entries require the configured number of aligned engines. The
+production policy uses two aligned confirmations and does not allow a single
+Price Action vote to bypass that floor.
 """
 from dataclasses import dataclass
 from typing import Literal
 
-MIN_CONFIRMATIONS = 1
+MIN_CONFIRMATIONS = 2
 
 
 @dataclass
@@ -40,8 +40,8 @@ def apply_entry_filter(
     """Allow an entry when the configured strategy policy is satisfied.
 
     With ``price_action_standalone`` enabled, a directional Price Action vote
-    selects the candidate and may pass without SMC, Trend, or Wyckoff. A tied
-    vote is still blocked when Price Action is neutral.
+    selects the candidate and may pass without SMC, Trend, or Wyckoff. The
+    production configuration keeps that override disabled.
     """
     votes = {
         "smc": _vote(smc_signal),

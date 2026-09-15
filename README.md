@@ -110,11 +110,11 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `TRADE_TIMEFRAMES` | No | `M20,M15,M10,5m` | Multi-timeframe scan order, highest first |
 | `CANDLE_WINDOW` | No | `300` | Bars fetched per candle request |
 | `RISK_PERCENT` | No | `1.0` | Risk per trade (% of balance) |
-| `MIN_CONFIRMATIONS` | No | `2` | Ordinary-entry confirmation floor; Price Action has a standalone path |
+| `MIN_CONFIRMATIONS` | No | `2` | Every ordinary entry requires two aligned engine confirmations |
 | `TREND_MIN_CONFIRMATIONS` | No | `2` | Minimum confirmations when Trend votes for the entry direction |
-| `PRICE_ACTION_STANDALONE` | No | `true` | Allow a directional Price Action signal to pass without SMC, Trend, or Wyckoff |
+| `PRICE_ACTION_STANDALONE` | No | `false` | Allow a directional Price Action signal to bypass the two-confirmation floor |
 | `RANGE_TRADING_ENABLED` | No | `true` | Enable the dedicated edge/sweep/reversal RANGE playbook |
-| `RANGE_MIN_CONFIRMATIONS` | No | `1` | RANGE requires at least one aligned strategy confirmation |
+| `RANGE_MIN_CONFIRMATIONS` | No | `2` | RANGE requires two aligned strategy confirmations |
 | `RANGE_MIN_RR` | No | `1.5` | Minimum RANGE risk/reward |
 | `RANGE_EDGE_ATR_DISTANCE` | No | `0.25` | Maximum distance from a RANGE edge in ATR units |
 | `RANGE_RISK_PERCENT` | No | `0.25` | Risk per RANGE trade (% of balance) |

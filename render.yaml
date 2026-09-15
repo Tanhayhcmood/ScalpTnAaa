@@ -81,19 +81,18 @@ services:
         value: "24"
       - key: RISK_PERCENT
         value: "1.0"
-      # Ordinary entries require two aligned engines. Price Action has a
-      # dedicated standalone path; SMC, Trend, and Wyckoff do not.
+      # Every entry requires two aligned engine confirmations.
       - key: MIN_CONFIRMATIONS
-        value: "1"
+        value: "2"
       - key: TREND_MIN_CONFIRMATIONS
-        value: "1"
+        value: "2"
       # Dedicated RANGE playbook:
       # edge + fresh same-direction sweep + closed-candle reversal +
-      # at least one aligned strategy confirmation.
+      # at least two aligned strategy confirmations.
       - key: RANGE_TRADING_ENABLED
         value: "true"
       - key: RANGE_MIN_CONFIRMATIONS
-        value: "1"
+        value: "2"
       - key: RANGE_MIN_RR
         value: "1.5"
       - key: RANGE_EDGE_ATR_DISTANCE
@@ -102,11 +101,12 @@ services:
         value: "0.25"
       # RANGE protection: BUY entries must be at support and SELL entries must
       # be at resistance, with a fresh same-direction sweep, a closed-candle
-      # reversal, and at least one aligned strategy confirmation.
+      # reversal, and at least two aligned strategy confirmations.
       - key: RANGE_ENTRY_FILTERS_ENABLED
         value: "false"
+      # A single Price Action vote cannot bypass the two-confirmation floor.
       - key: PRICE_ACTION_STANDALONE
-        value: "true"
+        value: "false"
       - key: MAX_RANGE_TRADES_PER_SESSION
         value: "2"
       - key: MAX_OPEN_TRADES

@@ -1,4 +1,4 @@
-"""RANGE regression tests: one aligned confirmation is enough."""
+"""RANGE regression tests: the default policy requires two confirmations."""
 
 from live_trading.signals.decision_engine import (
     _effective_min_confirmations,
@@ -7,8 +7,8 @@ from live_trading.signals.decision_engine import (
 from live_trading.signals.entry_filter import EntryFilterResult
 
 
-def test_range_uses_one_confirmation_floor():
-    assert _effective_min_confirmations(1, "RANGE", False) == 1
+def test_range_uses_two_confirmation_floor_by_default():
+    assert _effective_min_confirmations(1, "RANGE", False) == 2
 
 
 def test_range_keeps_a_stricter_operator_setting():
@@ -16,7 +16,7 @@ def test_range_keeps_a_stricter_operator_setting():
 
 
 def test_range_does_not_add_a_counter_trend_vote_requirement():
-    assert _effective_min_confirmations(1, "RANGE", True) == 1
+    assert _effective_min_confirmations(1, "RANGE", True) == 2
 
 
 def test_range_accepts_one_smc_confirmation():
