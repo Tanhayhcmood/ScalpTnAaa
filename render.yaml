@@ -3,7 +3,7 @@ services:
   - type: web
     name: goldscalper-mtapi
     repo: https://github.com/Tanhayhcmood/ScalpTnAaa
-    region: oregon
+    region: frankfurt
     autoDeployTrigger: commit
     runtime: docker
     dockerfilePath: ./mtapi-bridge/Dockerfile
@@ -12,6 +12,8 @@ services:
     dockerContext: ./mtapi-bridge
     plan: free
     healthCheckPath: /Ping
+    # Render supplies the service URL automatically; keep it out of the
+    # manifest so a generated hostname cannot go stale after a rename.
     # Only redeploy when mtapi-bridge files actually change.
     # Without this filter, every Python commit (live_trading/, telegram_panel/)
     # triggers an unnecessary Docker redeploy that restarts Wine/MT5 from
@@ -20,8 +22,6 @@ services:
       paths:
         - mtapi-bridge/**
     envVars:
-      - key: RENDER_EXTERNAL_URL
-        value: "https://goldscalper-mtapi-uuoc.onrender.com"
       - key: MT5_HOST
         value: "AMarkets-Demo"
       - key: MT5_PORT
@@ -41,13 +41,13 @@ services:
   - type: redis
     name: ger-redis
     plan: free
-    region: oregon
+    region: frankfurt
     ipAllowList: []   # private — Render internal routing only; no public access
 
   # ─── Trading robot ─────────────────────────────────────────────────────────
   - type: web
     name: goper-v4-robot
-    region: oregon
+    region: frankfurt
     autoDeployTrigger: commit
     runtime: python
     plan: free
@@ -55,8 +55,10 @@ services:
     buildCommand: pip install -r live_trading/requirements.txt
     startCommand: python live_trading/server.py
     envVars:
-      - key: RENDER_EXTERNAL_URL
-        value: "https://goldscalper-v4-robot-usta.onrender.com"
+      # Render supplies RENDER_EXTERNAL_URL/RENDER_EXTERNAL_HOSTNAME for the
+      # current service. Do not hard-code a generated hostname here: when the
+      # service is renamed, a stale value makes the free-tier keepalive ping a
+      # different service and the robot can be suspended for inactivity.
       - key: METAAPI_TOKEN
         sync: false
       - key: METAAPI_ACCOUNT_ID
@@ -180,8 +182,6 @@ services:
     buildCommand: pip install -r telegram_panel/requirements.txt
     startCommand: python telegram_panel/server.py
     envVars:
-      - key: RENDER_EXTERNAL_URL
-        value: "https://goldscalper-v4-panel-kzru.onrender.com"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_OWNER_ID
@@ -202,7 +202,7 @@ services:
         value: "/tmp/robot_state.json"
       # FIX #1: ROBOT_BASE_URL and ROBOT_COMMAND_TOKEN enable HTTP fallback.
       - key: ROBOT_BASE_URL
-        value: "https://goldscalper-v4-robot-usta.onrender.com"
+        value: "https://goldscalper-v4-robot-77pe.onrender.com"
       - key: ROBOT_COMMAND_TOKEN
         sync: false
       - key: REDIS_URL

@@ -536,6 +536,10 @@ async def _keepalive():
     await asyncio.sleep(30)
     import aiohttp
     external_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not external_url:
+        external_hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip()
+        if external_hostname:
+            external_url = f"https://{external_hostname}"
 
     own_url = f"{external_url}/health" if external_url else f"http://127.0.0.1:{PORT}/health"
     print(

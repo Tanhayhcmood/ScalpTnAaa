@@ -34,6 +34,7 @@ _connected: bool  = False
 # the trading loop can miss a candle while the duplicate sessions reconnect.
 _connection_lock = asyncio.Lock()
 _health_lock = asyncio.Lock()
+_consecutive_health_failures = 0
 
 
 def _account_field(info: Any, key: str, default: Any = None) -> Any:
@@ -67,7 +68,7 @@ async def _close_current_connection_unlocked() -> None:
     ``finally``-style helper is important after a failed reconnect: otherwise
     the next reconnect may keep using a half-closed SDK client.
     """
-    global _api, _account, _connection, _connected
+    global _api, _account, _connection, _connected, _consecutive_health_failures
 
     connection = _connection
     api = _api
@@ -75,6 +76,7 @@ async def _close_current_connection_unlocked() -> None:
     _connection = None
     _account = None
     _api = None
+    _consecutive_health_failures = 0
 
     try:
         if connection:
@@ -96,7 +98,7 @@ async def connect(*args, **kwargs) -> bool:
     Signature: connect(token, account_id, timeout_seconds)
     Falls back to env vars METAAPI_TOKEN / METAAPI_ACCOUNT_ID.
     """
-    global _api, _account, _connection, _connected
+    global _api, _account, _connection, _connected, _consecutive_health_failures
 
     token      = args[0] if args else METAAPI_TOKEN
     account_id = args[1] if len(args) > 1 else METAAPI_ACCOUNT_ID
@@ -155,6 +157,7 @@ async def connect(*args, **kwargs) -> bool:
                 or "MT5"
             )
             _connected = True
+            _consecutive_health_failures = 0
             log.info(f"✅ MetaAPI connected — broker: {broker_label}")
             return True
 
@@ -211,27 +214,51 @@ async def connect_with_retry(
 
 
 async def keepalive_metaapi() -> bool:
-    """Perform a lightweight RPC call to keep and verify the MetaAPI session."""
-    global _connected
+    """Perform a lightweight RPC call and tolerate transient network faults.
+
+    A single failed RPC is not enough evidence that the broker session is dead:
+    Render/MetaAPI can briefly lose a packet while the SDK session is still
+    recoverable.  Tearing down the session on that first failure makes a short
+    hiccup look like a multi-minute outage because reconnect must wait for
+    account deployment and synchronization.  The watchdog therefore requires
+    several consecutive failed health checks before replacing the session.
+    """
+    global _connected, _consecutive_health_failures
     async with _health_lock:
         connection = _connection if is_connected() else None
         if connection is None:
             return False
         try:
             await connection.get_account_information()
+            _consecutive_health_failures = 0
             return True
         except Exception as exc:
-            # Only invalidate the session that was actually checked.  A
+            _consecutive_health_failures += 1
+            failure_count = _consecutive_health_failures
+            # Only invalidate the session that was actually checked. A
             # successful concurrent reconnect must not be marked disconnected
             # by a stale keepalive failure.
             if _connection is connection:
-                _connected = False
-            log.warning(f"MetaAPI keepalive failed: {exc}")
+                if failure_count >= 3:
+                    _connected = False
+                    log.error(
+                        "MetaAPI health check failed %d consecutive times; "
+                        "the session will be reconnected: %s",
+                        failure_count,
+                        exc,
+                    )
+                else:
+                    log.warning(
+                        "MetaAPI health check failed (%d/3); keeping the "
+                        "existing session for a retry: %s",
+                        failure_count,
+                        exc,
+                    )
             return False
 
 
 async def start_connection_watchdog(interval_seconds: float = 30.0) -> None:
-    """Monitor the MetaAPI session and reconnect after a disconnect."""
+    """Monitor the MetaAPI session with one serialized health/reconnect loop."""
     while True:
         await asyncio.sleep(interval_seconds)
         if not is_connected():

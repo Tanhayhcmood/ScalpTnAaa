@@ -89,6 +89,9 @@ if [ "$_PORT" != "80" ]; then
     # Uses RENDER_EXTERNAL_URL which is set in render.yaml for this service.
     # Falls back to localhost (which does NOT prevent Render sleep but is harmless).
     _EXTERNAL_URL="${RENDER_EXTERNAL_URL:-}"
+    if [ -z "$_EXTERNAL_URL" ] && [ -n "${RENDER_EXTERNAL_HOSTNAME:-}" ]; then
+        _EXTERNAL_URL="https://${RENDER_EXTERNAL_HOSTNAME}"
+    fi
     if [ -n "$_EXTERNAL_URL" ]; then
         _PING_TARGET="${_EXTERNAL_URL%/}/Ping"
         echo "[render-entrypoint] Self-keepalive enabled: pinging ${_PING_TARGET} every ${_SELF_KEEPALIVE_INTERVAL}s"

@@ -74,6 +74,10 @@ async def _keepalive() -> None:
     await asyncio.sleep(30)  # wait for health server to start
     import aiohttp
     external_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not external_url:
+        external_hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip()
+        if external_hostname:
+            external_url = f"https://{external_hostname}"
     robot_url    = os.environ.get("ROBOT_BASE_URL",      "").rstrip("/")
     mtapi_url    = os.environ.get("MTAPI_URL",           "").rstrip("/")
 

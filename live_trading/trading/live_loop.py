@@ -60,8 +60,7 @@ from live_trading.signals.h1_validator import validate_h1_candles
 from live_trading.signals.wyckoff_engine import calibrate_wyckoff, set_calibrated_config
 from live_trading.mt5.connector import (
     connect, disconnect, ensure_connected,
-    connect_with_retry, keepalive_metaapi,
-    start_connection_watchdog, start_metaapi_session_keepalive,
+    connect_with_retry, start_connection_watchdog,
     fetch_candles, get_account_balance, get_account_info,
     check_symbol_available,
     get_open_positions, get_last_completed_bar_time,
@@ -262,10 +261,6 @@ class GoldScalperLive:
         # This prevents a single transient network hiccup from triggering a
         # "Connection Lost" alert — we retry once silently first.
         self._consecutive_acc_failures: int = 0
-        self._mt5_keepalive_task: asyncio.Task | None = None
-
-        # Handle for the MetaAPI keepalive background task (cancelled on stop)
-        self._keepalive_task: Optional[asyncio.Task] = None
 
         # ── Staircase Trailing Stop ──────────────────────────────────────────
         # Toggleable at runtime via the Telegram panel's "Auto Trail" switch
@@ -348,28 +343,13 @@ class GoldScalperLive:
                 "was returned; the market may be closed"
             )
 
-        # ── MetaAPI keepalive task ───────────────────────────────────────────────
-        # Store the handle so we can cancel it when the engine stops; without
-        # this, the task becomes orphaned on every supervisor-driven restart and
-        # multiple background pings accumulate across restarts.
-        self._keepalive_task = asyncio.create_task(
-            self._keepalive_loop(), name="metaapi_keepalive"
-        )
-        # Proactive connection watchdog: checks MT5 health every 60 s and
-        # reconnects before the trading loop hits a failure.  Faster than
-        # waiting for a bar-tick request to fail (worst case: one full bar).
+        # One serialized watchdog owns all proactive MetaAPI health checks and
+        # reconnects.  Older versions started three independent keepalive
+        # tasks, which sent overlapping account-info requests and could make a
+        # transient packet loss look like a full broker disconnect.
         self._watchdog_task = asyncio.create_task(
             start_connection_watchdog(interval_seconds=30.0), name="metaapi_watchdog"
         )
-        # MT5 broker-session keepalive: pings /ConnectionStatus every 3 min
-        # so the broker socket stays open and conn_id never expires silently.
-        self._mt5_keepalive_task = asyncio.create_task(
-            start_metaapi_session_keepalive(), name="metaapi_session_keepalive"
-        )
-        # Belt-and-suspenders: if any step below raises before _run_loop() is
-        # entered, _run_loop()'s own finally block never executes, leaving the
-        # keepalive task orphaned.  This outer try/finally guarantees cleanup
-        # on every exit path from start() after the task is created.
         try:
             # ── Guardian state restore (VB-02) ───────────────────────────────────
             # Redis is the cross-service persistent copy on Render; the local file
@@ -505,18 +485,15 @@ class GoldScalperLive:
             self._write_state("RUNNING", self._last_acc_info)
             await self._run_loop()
         finally:
-            # Cancel the keepalive task if it is still running.  _run_loop()'s
-            # own finally already handles the normal exit path; this block only
-            # fires when start() exits before _run_loop() is called (e.g. an
-            # unexpected exception in _calibrate_wyckoff or get_account_info).
-            # Cancelling an already-done task is a safe no-op.
-            if self._keepalive_task and not self._keepalive_task.done():
-                self._keepalive_task.cancel()
+            # If startup fails before _run_loop() is entered, its finally block
+            # cannot clean up the watchdog. Handle that early-exit path here.
+            if self._watchdog_task and not self._watchdog_task.done():
+                self._watchdog_task.cancel()
                 try:
-                    await self._keepalive_task
+                    await self._watchdog_task
                 except asyncio.CancelledError:
                     pass
-                log.debug("MetaAPI keepalive task cancelled in start() finally.")
+                log.debug("MetaAPI watchdog cancelled in start() finally.")
 
     # ── Wyckoff calibration ───────────────────────────────────────────────────
 
@@ -534,16 +511,6 @@ class GoldScalperLive:
                         "using defaults")
 
     # ── Main async loop ───────────────────────────────────────────────────────
-
-    async def _keepalive_loop(self) -> None:
-        """Ping mt5rest bridge every 10 minutes to prevent Render free-tier sleep."""
-        _INTERVAL = 480  # 8 minutes — more margin under Render's 15-min sleep threshold
-        while True:
-            await asyncio.sleep(_INTERVAL)
-            try:
-                await keepalive_metaapi()
-            except Exception:
-                pass
 
     async def _run_loop(self) -> None:
         log.info(
@@ -654,30 +621,15 @@ class GoldScalperLive:
             # server.py catch the exception, apply the configured backoff, and
             # restart the engine without Render having to restart the container.
         finally:
-            # Cancel the MetaAPI keepalive background task so it does not remain
-            # orphaned when the supervisor restarts the engine inside the same
-            # asyncio event loop.  Multiple orphaned tasks would fire redundant
-            # pings every 10 min and accumulate across restarts indefinitely.
-            if self._keepalive_task and not self._keepalive_task.done():
-                self._keepalive_task.cancel()
-                try:
-                    await self._keepalive_task
-                except asyncio.CancelledError:
-                    pass
-                log.debug("MetaAPI keepalive task cancelled.")
-            if getattr(self, "_mt5_keepalive_task", None) and not self._mt5_keepalive_task.done():
-                self._mt5_keepalive_task.cancel()
-                try:
-                    await self._mt5_keepalive_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            if getattr(self, "_watchdog_task", None) and not self._watchdog_task.done():
+            # Cancel the single MetaAPI watchdog so it does not remain orphaned
+            # when the supervisor restarts the engine in the same event loop.
+            if self._watchdog_task and not self._watchdog_task.done():
                 self._watchdog_task.cancel()
                 try:
                     await self._watchdog_task
                 except asyncio.CancelledError:
                     pass
-                log.debug("MT5 connection watchdog cancelled.")
+                log.debug("MetaAPI connection watchdog cancelled.")
             await disconnect()
             self._write_state("STOPPED")
             log.info("Engine stopped.")
