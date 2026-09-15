@@ -135,17 +135,31 @@ def _candidate_direction(
 def _make_neutral(
     smc, wyckoff, pa, trend, blocked_reasons, reasoning=None,
     range_context: Optional[RangeContext] = None,
+    regime_result: Optional[RegimeResult] = None,
+    entry_filter: Optional[EntryFilterResult] = None,
+    direction: Optional[str] = None,
+    candles: Optional[List[OHLCV]] = None,
 ) -> DecisionResult:
     from live_trading.signals.market_regime import REGIME_RULES
-    rules = REGIME_RULES["RANGE"]
+    rules = regime_result.rules if regime_result is not None else REGIME_RULES["RANGE"]
+    regime = regime_result.regime if regime_result is not None else "RANGE"
+    regime_label = rules.label if regime_result is not None else "No Signal"
+    adx = regime_result.adx if regime_result is not None else 0.0
+    candidate = direction or _candidate_direction(smc, wyckoff, pa, trend)
+    if candidate not in {"BUY", "SELL"}:
+        candidate = "NEUTRAL"
+    try:
+        session = get_session_quality(candles[-1].time) if candles else "BLOCKED"
+    except (IndexError, AttributeError):
+        session = "BLOCKED"
     return DecisionResult(
-        allowed=False, direction="NEUTRAL", confidence=0.0,
+        allowed=False, direction=candidate, confidence=0.0,
         components=ConfidenceComponents(0,0,0,0,0,0,0),
-        grade="REJECTED", regime="RANGE", regime_label="No Signal",
+        grade="REJECTED", regime=regime, regime_label=regime_label,
         regime_rules=rules,
         quality_filter=QualityFilterResult(
             allowed=False, blocked_reasons=blocked_reasons,
-            session_quality="BLOCKED", adx=0.0,
+            session_quality=session, adx=adx,
             is_severe_range=False, is_late_entry=False,
             is_low_probability=False, is_fake_breakout=False,
             is_weak_volume=False, is_low_momentum=False,
@@ -154,6 +168,7 @@ def _make_neutral(
         reasoning=reasoning or [],
         trade_params=None,
         smc=smc, wyckoff=wyckoff, pa=pa, trend=trend,
+        entry_filter=entry_filter,
         range_context=range_context,
     )
 
@@ -235,8 +250,12 @@ def run_decision_engine(
         if not range_votes_ok:
             return _make_neutral(
                 smc, wyckoff, pa, trend,
-                [range_votes_reason],
-                [range_votes_reason],
+            [range_votes_reason],
+            [range_votes_reason],
+            regime_result=regime,
+            entry_filter=ef,
+            direction=candidate,
+            candles=candles,
             )
     elif not is_range_regime and not ef.allowed:
         votes = (f"SMC={'✓' if ef.smc else '✗'}  "
@@ -257,7 +276,13 @@ def run_decision_engine(
         else:
             reason = (f"Entry filter: only {ef.confirmation_count}/{effective_min_confirmations} "
                       f"confirmations — {votes}  [regime={regime.regime}]")
-        return _make_neutral(smc, wyckoff, pa, trend, [reason], [reason])
+        return _make_neutral(
+            smc, wyckoff, pa, trend, [reason], [reason],
+            regime_result=regime,
+            entry_filter=ef,
+            direction=candidate,
+            candles=candles,
+        )
 
     # RANGE is a separate playbook. It must never inherit a trend entry just
     # because the generic four-engine vote happened to pass.
@@ -268,6 +293,10 @@ def run_decision_engine(
                 smc, wyckoff, pa, trend,
                 ["RANGE trading is disabled"],
                 ["RANGE trading is disabled"],
+                regime_result=regime,
+                entry_filter=ef,
+                direction=candidate,
+                candles=candles,
             )
         range_context = evaluate_range_entry(
             candles=candles,
@@ -285,14 +314,26 @@ def run_decision_engine(
                 [range_context.reason],
                 [range_context.reason],
                 range_context=range_context,
+                regime_result=regime,
+                entry_filter=ef,
+                direction=candidate,
+                candles=candles,
             )
 
     if candidate == "BUY"  and not regime.rules.allow_long:
         return _make_neutral(smc, wyckoff, pa, trend,
-                             [f'Regime "{regime.rules.label}" does not allow LONG'])
+                             [f'Regime "{regime.rules.label}" does not allow LONG'],
+                             regime_result=regime,
+                             entry_filter=ef,
+                             direction=candidate,
+                             candles=candles)
     if candidate == "SELL" and not regime.rules.allow_short:
         return _make_neutral(smc, wyckoff, pa, trend,
-                             [f'Regime "{regime.rules.label}" does not allow SHORT'])
+                             [f'Regime "{regime.rules.label}" does not allow SHORT'],
+                             regime_result=regime,
+                             entry_filter=ef,
+                             direction=candidate,
+                             candles=candles)
 
     last_candle  = candles[-1]
     session      = get_session_quality(last_candle.time)
