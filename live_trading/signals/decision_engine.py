@@ -25,6 +25,8 @@ from live_trading.risk.capital_manager import (
 )
 from live_trading.config import (
     CONF_HARD_MIN,
+    MIN_CONFIRMATIONS,
+    PRICE_ACTION_STANDALONE,
     RANGE_MIN_CONFIRMATIONS,
     REQUIRE_SMC_PRICE_ACTION_WYCKOFF,
     RANGE_ENTRY_FILTERS_ENABLED,
@@ -114,8 +116,11 @@ def _candidate_direction(
     wyckoff: WyckoffResult,
     pa: PriceActionResult,
     trend: TrendResult,
+    price_action_standalone: bool = False,
 ) -> str:
     """Return the unique direction with the most strategy votes."""
+    if price_action_standalone and pa.pa_signal in {"BUY", "SELL"}:
+        return pa.pa_signal
     votes = (
         smc.smc_signal,
         "BUY" if trend.trend == "BULLISH" else
@@ -177,7 +182,7 @@ def run_decision_engine(
     candles:           List[OHLCV],
     account_balance:   float,
     risk_percent:      float = 1.0,
-    min_confirmations: int   = 1,
+    min_confirmations: int   = MIN_CONFIRMATIONS,
     trend_min_confirmations: int = TREND_MIN_CONFIRMATIONS,
     use_atr_high_vol:  bool  = False,
     dxy_signal:        str   = "NEUTRAL",
@@ -190,6 +195,7 @@ def run_decision_engine(
     range_risk_percent: Optional[float] = None,
     range_entry_filters_enabled: bool = RANGE_ENTRY_FILTERS_ENABLED,
     timeframe: str = "M5",
+    price_action_standalone: bool = PRICE_ACTION_STANDALONE,
 ) -> DecisionResult:
 
     smc     = analyze_smc_structure(candles, timeframe=timeframe)
@@ -197,7 +203,13 @@ def run_decision_engine(
     pa      = analyze_price_action(candles, timeframe=timeframe)
     trend   = analyze_trend(candles)
 
-    candidate = _candidate_direction(smc, wyckoff, pa, trend)
+    candidate = _candidate_direction(
+        smc,
+        wyckoff,
+        pa,
+        trend,
+        price_action_standalone=price_action_standalone,
+    )
     if candidate == "NEUTRAL":
         return _make_neutral(
             smc, wyckoff, pa, trend, ["No unique strategy direction"]
@@ -242,6 +254,7 @@ def run_decision_engine(
         require_smc_price_action_wyckoff = (
             require_smc_price_action_wyckoff and not is_range_regime
         ),
+        price_action_standalone=price_action_standalone,
     )
     if is_range_regime and range_entry_filters_enabled:
         range_votes_ok, range_votes_reason = _range_confirmation_gate(

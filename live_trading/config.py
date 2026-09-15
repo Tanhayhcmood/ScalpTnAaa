@@ -162,12 +162,14 @@ RISK_PERCENT      = _float("RISK_PERCENT",      1.0,  lo=0.01, hi=10.0)
 # both live entry modes.
 NORMAL_MIN_CONFIDENCE = _float("NORMAL_MIN_CONFIDENCE", 40.0, lo=0.0, hi=100.0)
 RANGE_MIN_CONFIDENCE  = _float("RANGE_MIN_CONFIDENCE",  40.0, lo=0.0, hi=100.0)
-# MIN_CONFIRMATIONS=1 keeps the operator-selected ordinary entry floor.
+# Ordinary entries require two aligned engines. Price Action has a dedicated
+# standalone path below; this keeps SMC, Trend, and Wyckoff from opening a
+# trade alone.
 # Trend-aligned entries have their own safer floor below, so a Trend vote
 # cannot open a trade by itself after a transient candle signal.
 # RANGE has its own stricter floor below so choppy conditions cannot enter on
 # only one agreeing engine.
-MIN_CONFIRMATIONS = _int("MIN_CONFIRMATIONS",   1,    lo=1,    hi=10)
+MIN_CONFIRMATIONS = _int("MIN_CONFIRMATIONS",   2,    lo=1,    hi=10)
 # A Trend-aligned ordinary entry must have at least two independent votes by
 # default. This is deliberately separate from MIN_CONFIRMATIONS so SMC/PA/
 # Wyckoff-only entries can retain the operator-selected ordinary policy.
@@ -190,6 +192,12 @@ RANGE_ENTRY_FILTERS_ENABLED = os.getenv(
     "RANGE_ENTRY_FILTERS_ENABLED", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
 MAX_RANGE_TRADES_PER_SESSION = _int("MAX_RANGE_TRADES_PER_SESSION", 2, lo=1, hi=20)
+# When enabled, a directional Price Action signal may authorize the strategy
+# vote by itself. Market-quality, MTF, RANGE, risk, and broker gates remain
+# active; this only changes the four-engine confirmation policy.
+PRICE_ACTION_STANDALONE = os.getenv(
+    "PRICE_ACTION_STANDALONE", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
 # When enabled, every new trade must also have a same-direction Price Action signal.
 # Default false preserves existing behavior until explicitly enabled on Render.
 REQUIRE_PRICE_ACTION = os.getenv("REQUIRE_PRICE_ACTION", "false").strip().lower() in {

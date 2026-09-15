@@ -1,9 +1,8 @@
-"""
-Entry Filter — Minimum N of 4 independent confirmations.
+"""Entry Filter — four-engine confirmation policy.
 
-A trade may open when N independent engines agree on the same direction.
-The production default is one vote out of four; no individual engine is
-mandatory for the ordinary entry gate.
+Ordinary entries require the configured number of aligned engines. Price
+Action can optionally use a dedicated standalone path; the other engines
+remain subject to the ordinary confirmation floor.
 """
 from dataclasses import dataclass
 from typing import Literal
@@ -36,13 +35,13 @@ def apply_entry_filter(
     min_confirmations: int = MIN_CONFIRMATIONS,
     require_price_action: bool = False,
     require_smc_price_action_wyckoff: bool = False,
+    price_action_standalone: bool = False,
 ) -> EntryFilterResult:
-    """Allow an entry when the configured number of engines share one vote.
+    """Allow an entry when the configured strategy policy is satisfied.
 
-    This is deliberately an N-of-4 consensus gate. SMC, Trend, Price Action,
-    and Wyckoff all have equal weight; SMC is not a required primary trigger.
-    A tied vote (for example, 2 BUY and 2 SELL) has no unique direction and is
-    blocked rather than guessed.
+    With ``price_action_standalone`` enabled, a directional Price Action vote
+    selects the candidate and may pass without SMC, Trend, or Wyckoff. A tied
+    vote is still blocked when Price Action is neutral.
     """
     votes = {
         "smc": _vote(smc_signal),
@@ -56,7 +55,14 @@ def apply_entry_filter(
     buy_count = sum(value == "BUY" for value in votes.values())
     sell_count = sum(value == "SELL" for value in votes.values())
 
-    if buy_count > sell_count:
+    standalone_pa = (
+        price_action_standalone
+        and votes["price_action"] in {"BUY", "SELL"}
+    )
+    if standalone_pa:
+        direction = votes["price_action"]
+        count = sum(value == direction for value in votes.values())
+    elif buy_count > sell_count:
         direction = "BUY"
         count = buy_count
     elif sell_count > buy_count:
@@ -81,6 +87,8 @@ def apply_entry_filter(
     if require_smc_price_action_wyckoff:
         # Explicit legacy/operator override. Production defaults to false.
         allowed = smc_ok and pa_ok and wyc_ok
+    elif standalone_pa:
+        allowed = pa_ok
     else:
         allowed = count >= min_confirmations and (
             not require_price_action or pa_ok

@@ -48,3 +48,37 @@ def test_option_one_blocks_when_price_action_is_missing():
 
     assert result.allowed is False
     assert result.direction == "NEUTRAL"
+
+
+def test_price_action_can_open_without_other_engine_votes():
+    result = apply_entry_filter(
+        smc_signal="NEUTRAL",
+        ema_trend="NEUTRAL",
+        pa_signal="BUY",
+        wyckoff_signal="NEUTRAL",
+        min_confirmations=2,
+        price_action_standalone=True,
+    )
+
+    assert result.allowed is True
+    assert result.direction == "BUY"
+    assert result.confirmation_count == 1
+    assert result.price_action is True
+    assert result.smc is False
+    assert result.trend is False
+    assert result.wyckoff is False
+
+
+def test_non_price_action_engine_still_needs_ordinary_confirmations():
+    result = apply_entry_filter(
+        smc_signal="BUY",
+        ema_trend="NEUTRAL",
+        pa_signal="NEUTRAL",
+        wyckoff_signal="NEUTRAL",
+        min_confirmations=2,
+        price_action_standalone=True,
+    )
+
+    assert result.allowed is False
+    assert result.direction == "NEUTRAL"
+    assert result.confirmation_count == 1

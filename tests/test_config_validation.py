@@ -52,9 +52,9 @@ class TestConfigDefaults:
         assert isinstance(cfg.RISK_PERCENT, float)
 
     def test_min_confirmations_default(self):
-        """Ordinary entries keep the operator-selected default floor."""
+        """Ordinary entries require two engines; Price Action is separate."""
         cfg = _reload_config({})
-        assert cfg.MIN_CONFIRMATIONS == 1
+        assert cfg.MIN_CONFIRMATIONS == 2
         assert isinstance(cfg.MIN_CONFIRMATIONS, int)
 
     def test_trend_min_confirmations_default(self):

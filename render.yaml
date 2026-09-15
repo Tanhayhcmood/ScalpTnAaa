@@ -79,10 +79,10 @@ services:
         value: "24"
       - key: RISK_PERCENT
         value: "1.0"
-      # Ordinary entries keep the operator-selected one-vote floor, but a
-      # Trend-aligned entry must have two independent confirmations.
+      # Ordinary entries require two aligned engines. Price Action has a
+      # dedicated standalone path; SMC, Trend, and Wyckoff do not.
       - key: MIN_CONFIRMATIONS
-        value: "1"
+        value: "2"
       - key: TREND_MIN_CONFIRMATIONS
         value: "2"
       # Dedicated RANGE playbook:
@@ -103,15 +103,16 @@ services:
       # reversal, and at least one aligned strategy confirmation.
       - key: RANGE_ENTRY_FILTERS_ENABLED
         value: "true"
+      - key: PRICE_ACTION_STANDALONE
+        value: "true"
       - key: MAX_RANGE_TRADES_PER_SESSION
         value: "2"
       - key: MAX_OPEN_TRADES
         value: "4"
       # One concurrent position per strategy slot: SMC, Trend, Price Action,
       # and Wyckoff. Legacy untagged positions fail closed and occupy all slots.
-      # Normal non-Trend entries use MIN_CONFIRMATIONS. Trend-aligned entries
-      # use TREND_MIN_CONFIRMATIONS. All independent confidence, quality,
-      # regime, and risk gates stay active.
+      # Price Action may authorize the strategy vote alone. All independent
+      # confidence, quality, regime, MTF, and risk gates stay active.
       - key: REQUIRE_PRICE_ACTION
         value: "false"
       - key: REQUIRE_SMC_PRICE_ACTION_WYCKOFF

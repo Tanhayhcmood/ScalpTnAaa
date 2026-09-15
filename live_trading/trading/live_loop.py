@@ -34,7 +34,7 @@ from live_trading.config import (
     SYMBOL, TIMEFRAME, CANDLE_WINDOW, RISK_PERCENT,
     MAX_OPEN_TRADES, COMMENT,
     BAR_CHECK_INTERVAL, RECONNECT_DELAY, SYNC_TIMEOUT,
-    MIN_CONFIRMATIONS, REQUIRE_PRICE_ACTION,
+    MIN_CONFIRMATIONS, PRICE_ACTION_STANDALONE, REQUIRE_PRICE_ACTION,
     REQUIRE_SMC_PRICE_ACTION_WYCKOFF, USE_ATR_HIGH_VOL_FILTER,
     CONF_HARD_MIN,
     RANGE_TRADING_ENABLED, RANGE_MIN_CONFIRMATIONS, RANGE_MIN_RR,
@@ -1104,6 +1104,7 @@ class GoldScalperLive:
             range_risk_percent=RANGE_RISK_PERCENT,
             range_entry_filters_enabled=RANGE_ENTRY_FILTERS_ENABLED,
             timeframe=tf,
+            price_action_standalone=PRICE_ACTION_STANDALONE,
         )
         self.last_decision = decision
 
