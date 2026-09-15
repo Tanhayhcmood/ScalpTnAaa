@@ -67,7 +67,12 @@ def mark_connection_unhealthy(reason: str) -> None:
         log.error("MetaAPI session marked unhealthy: %s", reason)
 
 
-async def _rpc_call(awaitable: Awaitable[Any], operation: str) -> Any:
+async def _rpc_call(
+    awaitable: Awaitable[Any],
+    operation: str,
+    *,
+    invalidate_on_timeout: bool = True,
+) -> Any:
     """Run a data-plane MetaAPI call with a hard upper bound.
 
     The MetaAPI SDK normally reports request timeouts, but a broken websocket
@@ -78,12 +83,15 @@ async def _rpc_call(awaitable: Awaitable[Any], operation: str) -> Any:
     try:
         return await asyncio.wait_for(awaitable, timeout=RPC_CALL_TIMEOUT)
     except asyncio.TimeoutError as exc:
-        mark_connection_unhealthy(f"{operation} timed out after {RPC_CALL_TIMEOUT}s")
+        if invalidate_on_timeout:
+            mark_connection_unhealthy(
+                f"{operation} timed out after {RPC_CALL_TIMEOUT}s"
+            )
         raise RuntimeError(
             f"MetaAPI {operation} timed out after {RPC_CALL_TIMEOUT}s"
         ) from exc
     except Exception as exc:
-        if _is_transport_failure(exc):
+        if invalidate_on_timeout and _is_transport_failure(exc):
             mark_connection_unhealthy(f"{operation} failed: {exc}")
         raise
 
@@ -653,6 +661,11 @@ async def get_open_positions(
         payload = await _rpc_call(
             _connection.get_positions(),
             f"open positions for {symbol}",
+            # Position snapshots are polled every tick and can lose one RPC
+            # while the SDK's redundant websocket clients are switching
+            # servers.  Abort this request, but let the watchdog/account health
+            # checks decide whether the whole session really needs replacing.
+            invalidate_on_timeout=False,
         )
         positions, dropped = _parse_open_positions_response(
             payload, 200, known_positions=known_positions

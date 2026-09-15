@@ -16,6 +16,9 @@ class _Connection:
             raise self.error
         return {"balance": 375.72}
 
+    async def get_positions(self):
+        raise TimeoutError("temporary position timeout")
+
 
 def test_single_health_check_failure_keeps_session_connected():
     async def run():
@@ -69,6 +72,29 @@ def test_successful_health_check_resets_failure_streak():
         assert await connector.keepalive_metaapi() is True
         assert connector._connected is True
         assert connector._consecutive_health_failures == 0
+
+    try:
+        asyncio.run(run())
+    finally:
+        connector._connection = None
+        connector._connected = False
+        connector._consecutive_health_failures = 0
+
+
+def test_position_timeout_does_not_replace_session_by_itself():
+    async def run():
+        connection = _Connection()
+        connector._connection = connection
+        connector._connected = True
+
+        try:
+            await connector.get_open_positions("XAUUSD")
+        except RuntimeError as exc:
+            assert "timed out" in str(exc).lower()
+        else:
+            raise AssertionError("position timeout did not surface")
+
+        assert connector._connected is True
 
     try:
         asyncio.run(run())
