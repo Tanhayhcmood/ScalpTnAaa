@@ -144,7 +144,7 @@ MT5_PASSWORD  = os.getenv("MT5_PASSWORD", "")
 
 # ── Symbol & Timeframe ───────────────────────────────────────────────────────
 SYMBOL        = os.getenv("SYMBOL", "XAUUSD")
-TIMEFRAME     = _timeframe("TIMEFRAME", "5m")
+TIMEFRAME     = _timeframe("TIMEFRAME", "1m")
 CANDLE_WINDOW = _int("CANDLE_WINDOW", 300, lo=50, hi=5000)
 
 # ── Risk & Trade Rules ───────────────────────────────────────────────────────
@@ -255,10 +255,10 @@ OPTION_TWO_MIN_TIMEFRAMES = _int("OPTION_TWO_MIN_TIMEFRAMES", 2, lo=2, hi=10)
 # computed on H1 regardless of which trade TFs are active, because H1
 # represents the directional context for the whole session.
 #
-# Recommended:  "M20,M15,M10,5m"  (4 TFs = ~2-4 entries/day per TF)
-# Conservative: "M15,5m"           (2 TFs = cleaner, fewer signals)
-# Aggressive:   "M20,M15,M10,5m"   (same as recommended)
-TRADE_TIMEFRAMES  = _trade_timeframes("TRADE_TIMEFRAMES", "M20,M15,M10,5m")
+# Recommended:  "M20,M15,M10,1m"  (4 TFs = ~2-4 entries/day per TF)
+# Conservative: "M15,1m"           (2 TFs = cleaner, fewer signals)
+# Aggressive:   "M20,M15,M10,1m"   (same as recommended)
+TRADE_TIMEFRAMES  = _trade_timeframes("TRADE_TIMEFRAMES", "M20,M15,M10,1m")
 
 
 
