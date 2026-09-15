@@ -1573,12 +1573,20 @@ class GoldScalperLive:
             except Exception as _sync_exc:
                 log.debug(f"Snapshot position sync skipped: {_sync_exc}")
         else:
-            self._set_trade_permission(
-                False,
-                "ORDER_FAILED",
-                [result.message or "Order was rejected"],
-            )
-            log.error(f"❌ Trade failed: {result.message}")
+            if result.message == "MARKET_CLOSED":
+                self._set_trade_permission(
+                    False,
+                    "MARKET_CLOSED",
+                    ["Broker session is closed; retrying on the next scan"],
+                )
+                log.info("⏸️ Market is closed; no order was opened. A fresh signal will be retried on the next scan.")
+            else:
+                self._set_trade_permission(
+                    False,
+                    "ORDER_FAILED",
+                    [result.message or "Order was rejected"],
+                )
+                log.error(f"❌ Trade failed: {result.message}")
 
         self._write_state(
             "RUNNING", acc_info, decision, pos,

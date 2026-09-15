@@ -56,6 +56,18 @@ def _normalise_lot(lot: float,
     return max(vol_min, min(vol_max, round(result, 4)))
 
 
+def _is_market_closed_error(exc: BaseException) -> bool:
+    """Return True for broker session-closed responses."""
+    text = str(exc).lower()
+    return any(marker in text for marker in (
+        "market is closed",
+        "market closed",
+        "market is not open",
+        "trading is disabled",
+        "trade is disabled",
+    ))
+
+
 # ── Place market order ────────────────────────────────────────────────────────
 
 async def place_market_order(
@@ -109,6 +121,11 @@ async def place_market_order(
         return TradeResult(True, pos_id, "OK", pos_id)
 
     except Exception as exc:
+        if _is_market_closed_error(exc):
+            # A closed symbol session is temporary; do not mark MetaAPI
+            # unhealthy and let the live loop retry on the next scan.
+            log.warning(f"⏸️ Broker market closed for {symbol}; retrying on the next scan")
+            return TradeResult(False, None, "MARKET_CLOSED")
         if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in str(exc).lower():
             mark_connection_unhealthy(f"place order failed: {exc}")
         log.error(f"❌ place_market_order error: {exc}")
