@@ -21,7 +21,8 @@ from live_trading.signals.entry_filter import apply_entry_filter, EntryFilterRes
 from live_trading.signals.range_strategy import RangeContext, evaluate_range_entry
 from live_trading.signals.divergence_engine import analyze_divergence, DivergenceResult
 from live_trading.risk.capital_manager import (
-    FIXED_TP_RR, CapitalInput, CapitalOutput, calc_trade_parameters,
+    FIXED_TP_RR, MAX_FIXED_LOT_RISK_USD, CapitalInput, CapitalOutput,
+    calc_trade_parameters,
 )
 from live_trading.config import (
     CONF_HARD_MIN,
@@ -505,15 +506,13 @@ def run_decision_engine(
     )
     trade_params = calc_trade_parameters(cap_input)
 
-    # A minimum broker volume must not turn a configured percentage risk into
-    # an account-sized loss. This is a risk-capacity guard, not a signal
-    # filter: it only blocks when the broker cannot express the requested
-    # risk with its minimum lot size.
+    # Fixed 0.01-lot policy: allow the configured volume up to the
+    # explicit dollar-risk ceiling, independent of the percentage budget.
     if trade_params.min_lot_risk_exceeded:
         risk_reason = (
-            f"Minimum lot {trade_params.lot_size:.4f} would risk "
-            f"${trade_params.risk_amount:.2f} versus the "
-            f"${trade_params.risk_budget:.2f} risk budget"
+            f"Fixed lot {trade_params.lot_size:.4f} would risk "
+            f"${trade_params.risk_amount:.2f}, above the "
+            f"${MAX_FIXED_LOT_RISK_USD:.2f} per-trade risk cap"
         )
         return DecisionResult(
             allowed=False, direction=candidate,  # type: ignore
