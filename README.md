@@ -121,10 +121,10 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `RANGE_ENTRY_FILTERS_ENABLED` | No | `true` | When false, disables only Option 2 RANGE edge/sweep/reversal/confirmation blockers |
 | `MAX_RANGE_TRADES_PER_SESSION` | No | `2` | Successful RANGE entries allowed per UTC session |
 | `MAX_OPEN_TRADES` | No | `4` | Maximum simultaneous open positions (one per strategy slot) |
-| `CONF_HARD_MIN` | No | `40` | Confidence-engine hard floor |
-| `OPTION_TWO_MIN_CONFIDENCE` | No | `40` | MTF confidence floor for the HTF-confirmed entry gate |
+| `CONF_HARD_MIN` | No | `35` | Balanced confidence-engine hard floor |
+| `OPTION_TWO_MIN_CONFIDENCE` | No | `35` | MTF confidence floor for the HTF-confirmed entry gate |
 | `MTF_ENABLED` | No | `true` | Enable the Option 1/2 higher-timeframe entry blocker |
-| `QUALITY_ADX_MIN` | No | `12` | Quality filter ADX floor |
+| `QUALITY_ADX_MIN` | No | `10` | Softer quality-filter ADX floor |
 | `DAILY_LOSS_LIMIT_PCT` | No | `4.0` | Guardian: daily loss halt threshold |
 | `MAX_DRAWDOWN_PCT` | No | `12.0` | Guardian: drawdown halt threshold |
 | `SLIPPAGE_POINTS` | No | `30` | Max fill slippage in broker points |
