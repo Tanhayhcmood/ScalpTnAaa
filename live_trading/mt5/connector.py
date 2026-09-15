@@ -394,27 +394,7 @@ async def get_closed_position_history(position_id: str) -> dict:
             get_deals(position_id),
             f"close history for position {position_id}",
         )
-        if isinstance(raw_deals, dict):
-            # SDK versions/adapters may wrap the list or return one deal.
-            if any(key in raw_deals for key in (
-                "price", "closePrice", "time", "brokerTime", "entryType",
-            )):
-                deals = [raw_deals]
-            else:
-                deals = (
-                    raw_deals.get("deals")
-                    or raw_deals.get("items")
-                    or raw_deals.get("data")
-                    or []
-                )
-        elif isinstance(raw_deals, (list, tuple)):
-            deals = raw_deals
-        else:
-            deals = []
-        # A malformed adapter response must not break close detection on
-        # every retry. Ignore non-mapping entries instead of calling .get()
-        # on strings or other scalar values.
-        deals = [deal for deal in deals if isinstance(deal, dict)]
+        deals = _deal_list(raw_deals)
         if not deals:
             return {}
         closing = [
@@ -430,10 +410,77 @@ async def get_closed_position_history(position_id: str) -> dict:
             "profit": deal.get("profit", 0.0),
             "commission": deal.get("commission", 0.0),
             "swap": deal.get("swap", 0.0),
+            "fee": deal.get("fee", 0.0),
+            "closeComment": deal.get("comment", deal.get("brokerComment", "")),
+            "dealId": deal.get("id", deal.get("dealId", "")),
         }
     except Exception as exc:
         log.warning(f"get_closed_position_history({position_id}) error: {exc}")
         return {}
+
+
+def _deal_list(raw_deals: Any) -> list[dict]:
+    """Normalize MetaAPI history responses without trusting their wrapper shape."""
+    if isinstance(raw_deals, dict):
+        # SDK versions/adapters may wrap the list or return one deal.
+        if any(key in raw_deals for key in (
+            "price", "closePrice", "time", "brokerTime", "entryType",
+        )):
+            deals = [raw_deals]
+        else:
+            deals = (
+                raw_deals.get("deals")
+                or raw_deals.get("items")
+                or raw_deals.get("data")
+                or []
+            )
+    elif isinstance(raw_deals, (list, tuple)):
+        deals = raw_deals
+    else:
+        deals = []
+    # A malformed adapter response must not break history reconciliation.
+    return [deal for deal in deals if isinstance(deal, dict)]
+
+
+async def get_deals_by_time_range(
+    start_time: datetime,
+    end_time: datetime,
+) -> list[dict]:
+    """Return normalized account deals for the requested UTC time range.
+
+    ``get_deals_by_position`` is enough to reconcile a trade the robot already
+    knows about, but it cannot restore history after a Render deploy when the
+    local file and Redis snapshot are both empty.  MetaAPI exposes the complete
+    account deal range through the same RPC connection; callers can then group
+    entry and exit deals by position id.
+    """
+    if not is_connected():
+        return []
+    try:
+        get_deals = getattr(_connection, "get_deals_by_time_range", None)
+        if get_deals is None:
+            log.warning("MetaAPI SDK does not expose get_deals_by_time_range")
+            return []
+        try:
+            raw_deals = await _rpc_call(
+                get_deals(start_time=start_time, end_time=end_time),
+                "deals by time range",
+            )
+        except TypeError:
+            # A small number of SDK adapters only accept positional arguments.
+            raw_deals = await _rpc_call(
+                get_deals(start_time, end_time),
+                "deals by time range",
+            )
+        return _deal_list(raw_deals)
+    except Exception as exc:
+        log.warning(
+            "get_deals_by_time_range(%s, %s) error: %s",
+            start_time.isoformat(),
+            end_time.isoformat(),
+            exc,
+        )
+        return []
 
 
 async def fetch_candles(

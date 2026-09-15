@@ -160,8 +160,8 @@ RISK_PERCENT      = _float("RISK_PERCENT",      1.0,  lo=0.01, hi=10.0)
 # - CONF_HARD_MIN and OPTION_TWO_MIN_CONFIDENCE are the global and MTF gates.
 # Keep these aligned when the operator wants one confidence threshold across
 # both live entry modes.
-NORMAL_MIN_CONFIDENCE = _float("NORMAL_MIN_CONFIDENCE", 35.0, lo=0.0, hi=100.0)
-RANGE_MIN_CONFIDENCE  = _float("RANGE_MIN_CONFIDENCE",  35.0, lo=0.0, hi=100.0)
+NORMAL_MIN_CONFIDENCE = _float("NORMAL_MIN_CONFIDENCE", 40.0, lo=0.0, hi=100.0)
+RANGE_MIN_CONFIDENCE  = _float("RANGE_MIN_CONFIDENCE",  40.0, lo=0.0, hi=100.0)
 # Ordinary entries require two aligned engines. Price Action has a dedicated
 # standalone path below; this keeps SMC, Trend, and Wyckoff from opening a
 # trade alone.
@@ -210,9 +210,10 @@ REQUIRE_SMC_PRICE_ACTION_WYCKOFF = os.getenv(
     "REQUIRE_SMC_PRICE_ACTION_WYCKOFF", "false"
 ).strip().lower() in {"1", "true", "yes", "on"}
 # CONF_HARD_MIN is the absolute confidence floor shared by normal and RANGE
-# entries. 35% is a balanced production floor: it admits borderline setups
-# while the MTF, R:R, quality, broker, and risk gates remain active.
-CONF_HARD_MIN     = _float("CONF_HARD_MIN",      35.0, lo=0.0, hi=100.0)
+# entries. 40% is the safe default; operators can explicitly set a lower floor
+# for controlled testing while the MTF, R:R, quality, broker, and risk gates
+# remain active.
+CONF_HARD_MIN     = _float("CONF_HARD_MIN",      40.0, lo=0.0, hi=100.0)
 # QUALITY_ADX_MIN: minimum ADX value required to confirm trend momentum.
 # Below this threshold the quality filter rejects the signal as "low momentum".
 # 10 is a softer floor for M5 gold. It allows developing moves while the
@@ -241,7 +242,7 @@ MTF_CANDLE_WINDOW = _int("MTF_CANDLE_WINDOW",    300, lo=50, hi=1000)
 # Option 2: a trade needs a real HTF confirmation, a matching entry
 # timeframe, and at least 35% confidence. Changing this requires an explicit
 # Render env override.
-OPTION_TWO_MIN_CONFIDENCE = _float("OPTION_TWO_MIN_CONFIDENCE", 35.0, lo=0.0, hi=100.0)
+OPTION_TWO_MIN_CONFIDENCE = _float("OPTION_TWO_MIN_CONFIDENCE", 40.0, lo=0.0, hi=100.0)
 OPTION_TWO_MIN_TIMEFRAMES = _int("OPTION_TWO_MIN_TIMEFRAMES", 2, lo=2, hi=10)
 
 # ── Trade Timeframes (Multi-Timeframe entry) ─────────────────────────────────
@@ -280,6 +281,10 @@ MT5_SNAPSHOT        = os.getenv("MT5_SNAPSHOT",         "robot_mt5_snapshot.json
 COMMANDS_FILE       = os.getenv("COMMANDS_FILE",        "robot_commands.json")
 GUARDIAN_STATE_FILE = os.getenv("GUARDIAN_STATE_FILE",  "guardian_state.json")
 LOG_FILE            = os.getenv("LOG_FILE",             "live_trading/robot.log")
+# Broker history is the source of truth after a Render restart.  Keep the
+# window bounded so a large account history cannot delay the first scan.
+HISTORY_LOOKBACK_DAYS = _int("HISTORY_LOOKBACK_DAYS", 90, lo=1, hi=3650)
+HISTORY_SYNC_INTERVAL  = _int("HISTORY_SYNC_INTERVAL", 300, lo=30, hi=86400)
 
 # ── Risk Guardian – Circuit Breakers ─────────────────────────────────────────
 # lo=0.1 prevents accidentally disabling protection with 0 or negative values.

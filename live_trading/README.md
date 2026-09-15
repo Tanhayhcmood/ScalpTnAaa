@@ -5,6 +5,20 @@ MT5 access via **MetaAPI** cloud bridge (no Windows / COM required).
 
 ---
 
+## Broker history recovery
+
+The engine restores its local/Redis snapshot first, then synchronizes the
+configured lookback window from MetaAPI account-deal history. Entry and exit
+deals are grouped by `positionId`, so a restarted Render service does not show
+an empty trade history when the broker still has real transactions.
+
+`HISTORY_LOOKBACK_DAYS` defaults to `90` and `HISTORY_SYNC_INTERVAL` defaults to
+`300` seconds. The latest result is exposed in `robot_state.json` under
+`trade_history_sync`, including whether the broker returned zero deals or the
+history request failed.
+
+---
+
 ## Quick Start
 
 ### 1 — Get MetaAPI credentials (free)

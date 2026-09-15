@@ -44,6 +44,7 @@ from live_trading.config import (
     MAX_RANGE_TRADES_PER_SESSION,
     DAILY_LOSS_LIMIT_PCT, MAX_DRAWDOWN_PCT, SLIPPAGE_POINTS,
     STATE_FILE, GUARDIAN_STATE_FILE,
+    HISTORY_LOOKBACK_DAYS, HISTORY_SYNC_INTERVAL,
     TRAIL_ENABLED, TRAIL_ACTIVATION_R, TRAIL_STEP_R,
     TRAIL_LOCK_BUFFER_R, TRAIL_ATR_GAP_MULT, TRAIL_MIN_STEP_PRICE,
     MTF_ENABLED, MTF_TIMEFRAME, MTF_CANDLE_WINDOW,
@@ -65,7 +66,8 @@ from live_trading.mt5.connector import (
     fetch_candles, get_account_balance, get_account_info,
     check_symbol_available,
     get_open_positions, get_last_completed_bar_time,
-    get_current_quote, get_closed_position_history, mt5_pos_to_dict,
+    get_current_quote, get_closed_position_history, get_deals_by_time_range,
+    mt5_pos_to_dict,
 )
 from live_trading.mt5.executor import (
     place_market_order, close_position, modify_position, TradeResult
@@ -244,6 +246,15 @@ class GoldScalperLive:
         }
         self._close_history_checked_at: dict[str, float] = {}
         self._open_position_snapshot_initialized = False
+        self._last_history_sync_at: float = 0.0
+        self._history_sync_status: dict = {
+            "status": "NOT_STARTED",
+            "lookback_days": HISTORY_LOOKBACK_DAYS,
+            "last_sync_at": None,
+            "deals_read": 0,
+            "positions_merged": 0,
+            "closed_positions": 0,
+        }
 
         # Risk Guardian — initialized after mt5rest bridge connects
         self.guardian = RiskGuardian(
@@ -486,6 +497,8 @@ class GoldScalperLive:
                         )
 
             _checkpoint("before calibrate_wyckoff")
+            await self._sync_broker_trade_history(force=True)
+            _checkpoint("after broker history sync")
             await self._calibrate_wyckoff()
             _checkpoint("after calibrate_wyckoff")
             # Write RUNNING state immediately after connect with real account data
@@ -587,6 +600,11 @@ class GoldScalperLive:
                     self._reconcile_closed_trades(),
                 )
                 _checkpoint(f"loop#{self.loop_count} closed trades reconciled")
+                await self._run_stage(
+                    "broker history sync",
+                    self._sync_broker_trade_history(),
+                )
+                _checkpoint(f"loop#{self.loop_count} broker history synced")
 
                 # Reset the within-tick trade guard before processing this
                 # tick's bars.  All _on_new_bar() calls that share this tick
@@ -1768,6 +1786,239 @@ class GoldScalperLive:
         if changed:
             self._write_state("RUNNING", self._last_acc_info)
 
+    @staticmethod
+    def _deal_value(deal: dict, *keys: str, default=None):
+        for key in keys:
+            if key in deal and deal[key] is not None:
+                return deal[key]
+        return default
+
+    @classmethod
+    def _deal_position_id(cls, deal: dict) -> str:
+        value = cls._deal_value(
+            deal,
+            "positionId",
+            "positionID",
+            "position_id",
+            "position",
+            default="",
+        )
+        return str(value) if value not in (None, "") else ""
+
+    @staticmethod
+    def _deal_direction(deal: dict) -> str:
+        raw = deal.get("type", deal.get("direction", deal.get("orderType", "")))
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return {0: "BUY", 1: "SELL"}.get(int(raw), "UNKNOWN")
+        text = str(raw).upper()
+        if "BUY" in text or "LONG" in text:
+            return "BUY"
+        if "SELL" in text or "SHORT" in text:
+            return "SELL"
+        return "UNKNOWN"
+
+    @staticmethod
+    def _deal_entry_type(deal: dict) -> str:
+        return str(
+            deal.get("entryType", deal.get("entry", deal.get("entry_type", "")))
+        ).upper()
+
+    @classmethod
+    def _history_records_from_deals(cls, deals: list[dict]) -> list[dict]:
+        """Group MetaAPI entry/exit deals into one panel record per position."""
+        grouped: dict[str, list[dict]] = {}
+        for deal in deals:
+            if not isinstance(deal, dict):
+                continue
+            symbol = str(
+                cls._deal_value(deal, "symbol", "instrument", default=SYMBOL)
+            ).upper()
+            if symbol != SYMBOL.upper():
+                continue
+            position_id = cls._deal_position_id(deal)
+            if position_id:
+                grouped.setdefault(position_id, []).append(deal)
+
+        records: list[dict] = []
+        for position_id, position_deals in grouped.items():
+            entries = [
+                deal for deal in position_deals
+                if cls._deal_entry_type(deal) in {"DEAL_ENTRY_IN", "IN"}
+            ]
+            closes = [
+                deal for deal in position_deals
+                if cls._deal_entry_type(deal) in {
+                    "DEAL_ENTRY_OUT", "DEAL_ENTRY_OUT_BY", "OUT", "OUT_BY",
+                }
+            ]
+            # Some broker adapters omit entryType. Keep such a row visible as
+            # an open entry instead of silently dropping a real position.
+            if not entries and not closes and len(position_deals) == 1:
+                entries = position_deals
+            entry = entries[0] if entries else position_deals[0]
+            close = closes[-1] if closes else None
+
+            def _number(source: dict, *keys: str, default: float = 0.0) -> float:
+                raw = cls._deal_value(source, *keys, default=default)
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    return default
+
+            direction = cls._deal_direction(entry)
+            if direction == "UNKNOWN" and close:
+                direction = cls._deal_direction(close)
+            volume = _number(entry, "volume", "lots", default=0.0)
+            open_price = _number(entry, "price", "openPrice", "open_price")
+            close_price = (
+                _number(close, "price", "closePrice", "close_price")
+                if close else None
+            )
+            profit_gross = sum(_number(deal, "profit") for deal in closes)
+            commission = sum(_number(deal, "commission") for deal in closes)
+            swap = sum(_number(deal, "swap") for deal in closes)
+            fee = sum(_number(deal, "fee") for deal in closes)
+            open_time = cls._deal_value(
+                entry, "time", "brokerTime", "openTime", "open_time"
+            )
+            close_time = (
+                cls._deal_value(
+                    close, "time", "brokerTime", "closeTime", "close_time"
+                )
+                if close else None
+            )
+            close_comment = (
+                cls._deal_value(
+                    close, "comment", "brokerComment", "closeComment", default=""
+                )
+                if close else ""
+            )
+            record = {
+                "position_id": position_id,
+                "ticket": position_id,
+                "direction": direction,
+                "type": direction,
+                "volume": volume,
+                "lot": volume,
+                "entry": open_price,
+                "open_price": open_price,
+                "close_price": close_price,
+                "bar_time": open_time,
+                "open_time": open_time,
+                "close_time": close_time,
+                "profit_gross": profit_gross,
+                "commission": commission,
+                "swap": swap,
+                "fee": fee,
+                "profit": profit_gross + commission + swap + fee,
+                "close_reason": (
+                    classify_close_reason(
+                        {
+                            "closePrice": close_price,
+                            "closeComment": close_comment,
+                        },
+                        {
+                            "direction": direction,
+                            "entry": open_price,
+                            "sl": 0.0,
+                            "tp": 0.0,
+                        },
+                    )
+                    if close else None
+                ),
+                "close_comment": close_comment,
+                "close_source": "MT5_HISTORY_SYNC" if close else None,
+                "status": "CLOSED" if close else "OPEN",
+                "source": "BROKER_HISTORY",
+            }
+            records.append(record)
+        return records
+
+    async def _sync_broker_trade_history(self, force: bool = False) -> None:
+        """Restore and refresh trade history directly from MetaAPI."""
+        now_mono = asyncio.get_event_loop().time()
+        if (
+            not force
+            and now_mono - self._last_history_sync_at < HISTORY_SYNC_INTERVAL
+        ):
+            return
+        self._last_history_sync_at = now_mono
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(days=HISTORY_LOOKBACK_DAYS)
+        self._history_sync_status = {
+            **self._history_sync_status,
+            "status": "SYNCING",
+            "lookback_days": HISTORY_LOOKBACK_DAYS,
+            "last_sync_at": end_time.isoformat(),
+        }
+        try:
+            deals = await get_deals_by_time_range(start_time, end_time)
+            records = self._history_records_from_deals(deals)
+            by_ticket = {
+                str(entry.get("position_id")): entry
+                for entry in self.trade_history
+                if isinstance(entry, dict) and entry.get("position_id") is not None
+            }
+            merged = 0
+            closed = 0
+            for record in records:
+                ticket = str(record["position_id"])
+                existing = by_ticket.get(ticket)
+                if existing is None:
+                    record["logged_at"] = (
+                        record.get("close_time")
+                        or record.get("open_time")
+                        or end_time.isoformat()
+                    )
+                    self.trade_history.append(record)
+                    by_ticket[ticket] = record
+                    merged += 1
+                else:
+                    # Preserve strategy telemetry captured at entry while
+                    # replacing broker-derived lifecycle and P/L fields.
+                    existing.update({
+                        key: value for key, value in record.items()
+                        if value is not None
+                    })
+                    merged += 1
+                if record.get("status") == "CLOSED":
+                    closed += 1
+
+            self.trade_history.sort(
+                key=lambda item: str(
+                    item.get("close_time")
+                    or item.get("open_time")
+                    or item.get("logged_at")
+                    or ""
+                )
+            )
+            self.trade_history[:] = self.trade_history[-50:]
+            self._history_sync_status = {
+                **self._history_sync_status,
+                "status": "SYNCED",
+                "deals_read": len(deals),
+                "positions_merged": merged,
+                "closed_positions": closed,
+                "records_total": len(self.trade_history),
+            }
+            log.info(
+                "📚 Broker history sync: deals=%d positions=%d closed=%d "
+                "merged_total=%d",
+                len(deals),
+                len(records),
+                closed,
+                len(self.trade_history),
+            )
+            if merged:
+                self._write_state("RUNNING", self._last_acc_info)
+        except Exception as exc:
+            self._history_sync_status = {
+                **self._history_sync_status,
+                "status": "ERROR",
+                "error": str(exc),
+            }
+            log.warning("Broker history sync failed: %s", exc)
+
     def _apply_close_history(self, entry: dict, history: dict) -> bool:
         close_price = _history_float(history, "closePrice", "price")
         close_time = _history_datetime(
@@ -2199,6 +2450,7 @@ class GoldScalperLive:
             merged_extra.update(extra)
         if self._last_candle_telemetry:
             merged_extra["candle_telemetry"] = dict(self._last_candle_telemetry)
+        merged_extra["trade_history_sync"] = dict(self._history_sync_status)
 
         write_robot_state(
             status           = status,
