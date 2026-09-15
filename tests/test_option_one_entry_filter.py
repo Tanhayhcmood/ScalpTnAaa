@@ -4,6 +4,7 @@ Option 1 requires same-direction SMC + Price Action + Wyckoff.
 EMA is intentionally not a required vote for this option.
 """
 
+from live_trading.signals.decision_engine import _allow_without_smc_for_quality
 from live_trading.signals.entry_filter import apply_entry_filter
 
 
@@ -82,3 +83,32 @@ def test_non_price_action_engine_still_needs_ordinary_confirmations():
     assert result.allowed is False
     assert result.direction == "NEUTRAL"
     assert result.confirmation_count == 1
+
+def test_price_action_standalone_reaches_quality_gate_without_two_confirmations():
+    result = apply_entry_filter(
+        smc_signal="NEUTRAL",
+        ema_trend="NEUTRAL",
+        pa_signal="BUY",
+        wyckoff_signal="NEUTRAL",
+        min_confirmations=2,
+        price_action_standalone=True,
+    )
+
+    assert _allow_without_smc_for_quality(
+        result, effective_min_confirmations=2, price_action_standalone=True
+    ) is True
+
+
+def test_non_price_action_still_needs_the_configured_quality_confirmations():
+    result = apply_entry_filter(
+        smc_signal="NEUTRAL",
+        ema_trend="NEUTRAL",
+        pa_signal="NEUTRAL",
+        wyckoff_signal="BUY",
+        min_confirmations=2,
+        price_action_standalone=True,
+    )
+
+    assert _allow_without_smc_for_quality(
+        result, effective_min_confirmations=2, price_action_standalone=True
+    ) is False
