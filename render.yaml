@@ -73,9 +73,9 @@ services:
         value: "5m"
       - key: CANDLE_WINDOW
         value: "300"
-      # Option 2: keep the 40% HTF confidence floor reproducible from the live Render environment.
+      # Option 2: keep the balanced 35% HTF confidence floor reproducible from the live Render environment.
       - key: OPTION_TWO_MIN_CONFIDENCE
-        value: "40"
+        value: "35"
       # Option 4: old BOS/CHoCH events cannot authorize live entries.
       - key: STRUCTURE_MAX_AGE_BARS
         value: "24"
@@ -119,13 +119,13 @@ services:
         value: "false"
       - key: REQUIRE_SMC_PRICE_ACTION_WYCKOFF
         value: "false"
-      # Operator-selected confidence policy: 40% for normal and RANGE entries.
+      # Operator-selected balanced confidence policy: 35% for normal and RANGE entries.
       - key: NORMAL_MIN_CONFIDENCE
-        value: "40"
+        value: "35"
       - key: RANGE_MIN_CONFIDENCE
-        value: "40"
+        value: "35"
       - key: CONF_HARD_MIN
-        value: "40"
+        value: "35"
       - key: DAILY_LOSS_LIMIT_PCT
         value: "50.0"
       - key: MAX_DRAWDOWN_PCT
@@ -137,7 +137,7 @@ services:
       - key: TRADE_TIMEFRAMES
         value: "M20,M15,M10,5m"
       - key: QUALITY_ADX_MIN
-        value: "12"
+        value: "10"
       - key: BAR_CHECK_INTERVAL
         value: "10"
       # Keep the H1/MTF context gate active. The local signal, confidence,
