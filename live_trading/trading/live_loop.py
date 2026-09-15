@@ -34,7 +34,8 @@ from live_trading.config import (
     SYMBOL, TIMEFRAME, CANDLE_WINDOW, RISK_PERCENT,
     MAX_OPEN_TRADES, COMMENT,
     BAR_CHECK_INTERVAL, RECONNECT_DELAY, SYNC_TIMEOUT,
-    MIN_CONFIRMATIONS, PRICE_ACTION_STANDALONE, REQUIRE_PRICE_ACTION,
+    MIN_CONFIRMATIONS, TREND_MIN_CONFIRMATIONS,
+    PRICE_ACTION_STANDALONE, REQUIRE_PRICE_ACTION,
     REQUIRE_SMC_PRICE_ACTION_WYCKOFF, USE_ATR_HIGH_VOL_FILTER,
     CONF_HARD_MIN,
     RANGE_TRADING_ENABLED, RANGE_MIN_CONFIRMATIONS, RANGE_MIN_RR,
@@ -298,8 +299,15 @@ class GoldScalperLive:
         log.info("=" * 60)
         log.info("  GoldScalperPro v4 — LIVE TRADING ENGINE (MetaAPI)")
         log.info(f"  Symbol: {SYMBOL}  |  Trade TFs: {chr(44).join(TRADE_TIMEFRAMES)} (highest first)")
-        log.info(f"  Risk: {RISK_PERCENT}%  |  Max positions: {MAX_OPEN_TRADES}")
+        log.info(f"  Max positions: {MAX_OPEN_TRADES}")
         log.info(f"  Min confirmations: {MIN_CONFIRMATIONS}")
+        log.info(f"  Trend min confirmations: {TREND_MIN_CONFIRMATIONS}")
+        log.info(
+            f"  MTF: {'ON' if MTF_ENABLED else 'OFF'} "
+            f"(min confidence={OPTION_TWO_MIN_CONFIDENCE:.1f}%, "
+            f"min timeframes={OPTION_TWO_MIN_TIMEFRAMES})"
+        )
+        log.info(f"  Risk per trade: {RISK_PERCENT:.2f}%")
         log.info(f"  Daily loss limit: {DAILY_LOSS_LIMIT_PCT}%  |  "
                  f"Max drawdown: {MAX_DRAWDOWN_PCT}%  |  "
                  f"Slippage: ≤{SLIPPAGE_POINTS}pts")
@@ -1046,6 +1054,7 @@ class GoldScalperLive:
             balance,
             risk_percent=RISK_PERCENT,
             min_confirmations=MIN_CONFIRMATIONS,
+            trend_min_confirmations=TREND_MIN_CONFIRMATIONS,
             use_atr_high_vol=USE_ATR_HIGH_VOL_FILTER,
             require_price_action=REQUIRE_PRICE_ACTION,
             require_smc_price_action_wyckoff=REQUIRE_SMC_PRICE_ACTION_WYCKOFF,
@@ -1066,6 +1075,14 @@ class GoldScalperLive:
         _strategy_telemetry.update({
             "candle_time": last_c.time,
             "timeframe": tf,
+            "entry_policy": {
+                "min_confirmations": MIN_CONFIRMATIONS,
+                "trend_min_confirmations": TREND_MIN_CONFIRMATIONS,
+                "price_action_standalone": bool(PRICE_ACTION_STANDALONE),
+                "require_price_action": bool(REQUIRE_PRICE_ACTION),
+                "confidence_hard_min": CONF_HARD_MIN,
+                "risk_percent": RISK_PERCENT,
+            },
             "mtf": {
                 "enabled": bool(MTF_ENABLED),
                 "timeframe": MTF_TIMEFRAME,
