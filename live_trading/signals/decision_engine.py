@@ -61,6 +61,30 @@ def _effective_min_confirmations(
     return base_min_confirmations
 
 
+def _allow_without_smc_for_quality(
+    entry_filter: EntryFilterResult,
+    effective_min_confirmations: int,
+    price_action_standalone: bool,
+) -> bool:
+    """Keep the quality gate aligned with the explicit PA standalone policy.
+
+    The entry filter can authorize a directional PA vote by itself. This later
+    quality gate must honor that same policy; other strategies still require
+    the configured confirmation floor before proceeding without SMC direction.
+    """
+    if price_action_standalone and entry_filter.price_action:
+        return True
+    return (
+        entry_filter.confirmation_count >= effective_min_confirmations
+        and (
+            entry_filter.smc
+            or entry_filter.trend
+            or entry_filter.price_action
+            or entry_filter.wyckoff
+        )
+    )
+
+
 def _range_confirmation_gate(
     entry_filter: EntryFilterResult,
     min_confirmations: int,
@@ -382,14 +406,10 @@ def run_decision_engine(
     # so both event types share the same freshness gate.
     quality  = apply_quality_filter(candles, candidate, conf_result.confidence,
                                     last_structure_bar, regime.adx, regime.atr_ratio,
-                                    allow_without_smc=(
-                                        ef.confirmation_count >= effective_min_confirmations
-                                        and (
-                                            ef.smc
-                                            or ef.trend
-                                            or ef.price_action
-                                            or ef.wyckoff
-                                        )
+                                    allow_without_smc=_allow_without_smc_for_quality(
+                                        ef,
+                                        effective_min_confirmations,
+                                        price_action_standalone,
                                     ))
     if not quality.allowed:
         return DecisionResult(
