@@ -12,6 +12,8 @@ MAX_SL_ATR_MULT     = 3.00
 FIXED_TP_RR         = 2.00
 LOT_DOLLAR_PER_UNIT = 100
 MIN_LOT             = 0.01
+# Every order uses the broker-compatible fixed volume requested by the operator.
+FIXED_LOT           = 0.01
 MAX_LOT             = 50.0
 
 
@@ -102,19 +104,15 @@ def _calc_smart_sl(direction: str, entry: float, atr: float, inp: CapitalInput) 
 
 
 def _calc_lot_size(sl_dist_usd: float, balance: float, risk_pct: float):
-    if sl_dist_usd <= 0:
-        return MIN_LOT, 0.0, 0.0, False
+    # Keep the order volume fixed at 0.01 lot. The dollar risk still depends
+    # on the computed stop-loss distance and is checked below.
     risk_budget = max(0.0, balance * risk_pct / 100)
-    raw_lot     = risk_budget / (sl_dist_usd * LOT_DOLLAR_PER_UNIT)
-    lot_size    = _r4(_clamp(raw_lot, MIN_LOT, MAX_LOT))
+    lot_size    = FIXED_LOT
     actual_risk = _r2(lot_size * sl_dist_usd * LOT_DOLLAR_PER_UNIT)
-    # A broker's minimum volume can be larger than the requested risk budget.
-    # Never silently report that trade as a 1% risk trade: the live decision
-    # engine uses this flag to reject it before an order is sent.
-    min_lot_risk_exceeded = (
-        raw_lot < MIN_LOT and actual_risk > risk_budget + 0.01
+    fixed_lot_risk_exceeded = (
+        sl_dist_usd <= 0 or actual_risk > risk_budget + 0.01
     )
-    return lot_size, actual_risk, _r2(risk_budget), min_lot_risk_exceeded
+    return lot_size, actual_risk, _r2(risk_budget), fixed_lot_risk_exceeded
 
 
 def calc_trade_parameters(inp: CapitalInput) -> CapitalOutput:

@@ -75,7 +75,7 @@ services:
         value: "300"
       # Option 2: keep the balanced 35% HTF confidence floor reproducible from the live Render environment.
       - key: OPTION_TWO_MIN_CONFIDENCE
-        value: "35"
+        value: "25"
       # Option 4: old BOS/CHoCH events cannot authorize live entries.
       - key: STRUCTURE_MAX_AGE_BARS
         value: "24"
@@ -84,9 +84,9 @@ services:
       # Ordinary entries require two aligned engines. Price Action has a
       # dedicated standalone path; SMC, Trend, and Wyckoff do not.
       - key: MIN_CONFIRMATIONS
-        value: "2"
+        value: "1"
       - key: TREND_MIN_CONFIRMATIONS
-        value: "2"
+        value: "1"
       # Dedicated RANGE playbook:
       # edge + fresh same-direction sweep + closed-candle reversal +
       # at least one aligned strategy confirmation.
@@ -104,7 +104,7 @@ services:
       # be at resistance, with a fresh same-direction sweep, a closed-candle
       # reversal, and at least one aligned strategy confirmation.
       - key: RANGE_ENTRY_FILTERS_ENABLED
-        value: "true"
+        value: "false"
       - key: PRICE_ACTION_STANDALONE
         value: "true"
       - key: MAX_RANGE_TRADES_PER_SESSION
@@ -121,11 +121,11 @@ services:
         value: "false"
       # Operator-selected balanced confidence policy: 35% for normal and RANGE entries.
       - key: NORMAL_MIN_CONFIDENCE
-        value: "35"
+        value: "25"
       - key: RANGE_MIN_CONFIDENCE
-        value: "35"
+        value: "25"
       - key: CONF_HARD_MIN
-        value: "35"
+        value: "25"
       - key: DAILY_LOSS_LIMIT_PCT
         value: "50.0"
       - key: MAX_DRAWDOWN_PCT
