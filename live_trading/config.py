@@ -160,8 +160,8 @@ RISK_PERCENT      = _float("RISK_PERCENT",      1.0,  lo=0.01, hi=10.0)
 # - CONF_HARD_MIN and OPTION_TWO_MIN_CONFIDENCE are the global and MTF gates.
 # Keep these aligned when the operator wants one confidence threshold across
 # both live entry modes.
-NORMAL_MIN_CONFIDENCE = _float("NORMAL_MIN_CONFIDENCE", 40.0, lo=0.0, hi=100.0)
-RANGE_MIN_CONFIDENCE  = _float("RANGE_MIN_CONFIDENCE",  40.0, lo=0.0, hi=100.0)
+NORMAL_MIN_CONFIDENCE = _float("NORMAL_MIN_CONFIDENCE", 35.0, lo=0.0, hi=100.0)
+RANGE_MIN_CONFIDENCE  = _float("RANGE_MIN_CONFIDENCE",  35.0, lo=0.0, hi=100.0)
 # Ordinary entries require two aligned engines. Price Action has a dedicated
 # standalone path below; this keeps SMC, Trend, and Wyckoff from opening a
 # trade alone.
@@ -210,13 +210,14 @@ REQUIRE_SMC_PRICE_ACTION_WYCKOFF = os.getenv(
     "REQUIRE_SMC_PRICE_ACTION_WYCKOFF", "false"
 ).strip().lower() in {"1", "true", "yes", "on"}
 # CONF_HARD_MIN is the absolute confidence floor shared by normal and RANGE
-# entries. 40% is the operator-selected production threshold.
-CONF_HARD_MIN     = _float("CONF_HARD_MIN",      40.0, lo=0.0, hi=100.0)
+# entries. 35% is a balanced production floor: it admits borderline setups
+# while the MTF, R:R, quality, broker, and risk gates remain active.
+CONF_HARD_MIN     = _float("CONF_HARD_MIN",      35.0, lo=0.0, hi=100.0)
 # QUALITY_ADX_MIN: minimum ADX value required to confirm trend momentum.
 # Below this threshold the quality filter rejects the signal as "low momentum".
-# 15 is the recommended floor for M5 gold — catches genuine micro-trends
-# without blocking valid moves that ADX=20 would silently filter out.
-QUALITY_ADX_MIN   = _float("QUALITY_ADX_MIN",    15.0, lo=5.0,  hi=40.0)
+# 10 is a softer floor for M5 gold. It allows developing moves while the
+# confidence, structure, MTF, R:R, broker, and risk gates remain active.
+QUALITY_ADX_MIN   = _float("QUALITY_ADX_MIN",    10.0, lo=5.0,  hi=40.0)
 # Maximum age of the structure event that can authorize a new entry.
 # 300 bars on M5 is roughly 25 hours and is too permissive for scalping;
 # the default 24 closed bars keeps BOS/CHoCH actionable for about two hours.
@@ -238,9 +239,9 @@ MTF_ENABLED       = os.getenv("MTF_ENABLED",   "true").lower() == "true"
 MTF_TIMEFRAME     = _timeframe("MTF_TIMEFRAME",  "H1")
 MTF_CANDLE_WINDOW = _int("MTF_CANDLE_WINDOW",    300, lo=50, hi=1000)
 # Option 2: a trade needs a real HTF confirmation, a matching entry
-# timeframe, and at least 40% confidence. Changing this requires an explicit
+# timeframe, and at least 35% confidence. Changing this requires an explicit
 # Render env override.
-OPTION_TWO_MIN_CONFIDENCE = _float("OPTION_TWO_MIN_CONFIDENCE", 40.0, lo=0.0, hi=100.0)
+OPTION_TWO_MIN_CONFIDENCE = _float("OPTION_TWO_MIN_CONFIDENCE", 35.0, lo=0.0, hi=100.0)
 OPTION_TWO_MIN_TIMEFRAMES = _int("OPTION_TWO_MIN_TIMEFRAMES", 2, lo=2, hi=10)
 
 # ── Trade Timeframes (Multi-Timeframe entry) ─────────────────────────────────
