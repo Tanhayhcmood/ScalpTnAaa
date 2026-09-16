@@ -31,6 +31,7 @@ from live_trading.config import (
     RANGE_MIN_CONFIRMATIONS,
     REQUIRE_SMC_PRICE_ACTION_WYCKOFF,
     RANGE_ENTRY_FILTERS_ENABLED,
+    RANGE_REQUIRE_EDGE_POSITION,
     TREND_MIN_CONFIRMATIONS,
 )
 
@@ -58,7 +59,8 @@ def _effective_min_confirmations(
     turn the configured one-strategy floor into a stricter vote requirement.
     """
     if regime == "RANGE":
-        return max(base_min_confirmations, range_min_confirmations)
+        # RANGE owns its floor; never inherit the ordinary/TREND floor.
+        return range_min_confirmations
     return base_min_confirmations
 
 
@@ -225,6 +227,7 @@ def run_decision_engine(
     range_edge_atr_distance: float = 0.25,
     range_risk_percent: Optional[float] = None,
     range_entry_filters_enabled: bool = RANGE_ENTRY_FILTERS_ENABLED,
+    range_require_edge_position: bool = RANGE_REQUIRE_EDGE_POSITION,
     timeframe: str = "M5",
     price_action_standalone: bool = PRICE_ACTION_STANDALONE,
 ) -> DecisionResult:
@@ -361,6 +364,7 @@ def run_decision_engine(
             ),
             edge_atr_distance=range_edge_atr_distance,
             strict_filters=range_entry_filters_enabled,
+            require_edge_position=range_require_edge_position,
         )
         if not range_context.valid:
             return _make_neutral(
