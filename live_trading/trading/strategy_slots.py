@@ -22,6 +22,66 @@ _CODE_TO_SLOT = {code: slot for slot, code in _SLOT_CODES.items()}
 _SLOT_PATTERN = re.compile(r"(?:^|\|)S=([A-Z,]+)(?:\||$)")
 
 
+def _normalized_direction(position: Mapping) -> str:
+    """Return a broker position direction in the small set used by the bot."""
+    raw = position.get("type", position.get("direction", ""))
+    direction = str(raw or "").upper().strip()
+    return direction if direction in {"BUY", "SELL"} else "UNKNOWN"
+
+
+def opposite_direction(direction: str) -> str:
+    """Return the only direction that is incompatible with a one-way entry."""
+    normalized = str(direction or "").upper().strip()
+    if normalized == "BUY":
+        return "SELL"
+    if normalized == "SELL":
+        return "BUY"
+    return "UNKNOWN"
+
+
+def one_way_entry_allowed(
+    positions: Iterable[Mapping],
+    candidate_direction: str,
+    *,
+    allow_hedged_positions: bool = False,
+) -> tuple[bool, str]:
+    """Prevent opposite-direction entries unless hedging is explicitly enabled.
+
+    The strategy-slot guard intentionally permits different strategy slots to
+    coexist. That is useful for scaling, but it is unsafe for this robot's
+    directional scalping model because it can leave BUY and SELL open on the
+    same symbol at the same time. Unknown position directions fail closed.
+    """
+    if allow_hedged_positions:
+        return True, ""
+
+    candidate = str(candidate_direction or "").upper().strip()
+    if candidate not in {"BUY", "SELL"}:
+        return False, f"Invalid candidate direction: {candidate or 'UNKNOWN'}"
+
+    opposite = opposite_direction(candidate)
+    unknown = 0
+    for position in positions:
+        direction = _normalized_direction(position)
+        if direction == opposite:
+            ticket = position.get("id", position.get("ticket", "?"))
+            return (
+                False,
+                f"Opposite-direction position already open: {opposite} "
+                f"(ticket={ticket}); blocked candidate={candidate}",
+            )
+        if direction == "UNKNOWN":
+            unknown += 1
+
+    if unknown:
+        return (
+            False,
+            f"Cannot verify direction for {unknown} open position(s); "
+            f"blocked candidate={candidate}",
+        )
+    return True, ""
+
+
 def strategy_slots_for_decision(decision) -> tuple[str, ...]:
     """Return the aligned strategy slots claimed by a permitted decision."""
     entry_filter = getattr(decision, "entry_filter", None)

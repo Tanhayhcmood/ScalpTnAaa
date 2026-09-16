@@ -49,6 +49,7 @@ from live_trading.config import (
     MTF_ENABLED, MTF_TIMEFRAME, MTF_CANDLE_WINDOW,
     OPTION_TWO_MIN_CONFIDENCE, OPTION_TWO_MIN_TIMEFRAMES,
     TRADE_TIMEFRAMES,
+    ALLOW_HEDGED_POSITIONS,
 )
 from live_trading.logger import get_logger
 from live_trading.risk.guardian import RiskGuardian, GuardianStatus
@@ -75,6 +76,7 @@ from live_trading.trading.strategy_slots import (
     strategy_order_comment,
     strategy_slots_for_decision,
     available_for_strategy_slots,
+    one_way_entry_allowed,
 )
 from live_trading.utils.state_writer import (
     write_robot_state, write_mt5_snapshot,
@@ -224,11 +226,16 @@ class GoldScalperLive:
         # bridge has not yet registered the trade placed by the previous call),
         # causing N trades to open instead of 1.
         self._trade_opened_this_tick: bool = False
+        # Serializes the final position re-check and broker order placement.
+        # This remains safe if entry evaluation is ever scheduled concurrently
+        # (for example, after adding independent timeframe workers).
+        self._entry_lock = asyncio.Lock()
         # tracks the last successfully placed trade (direction + bar_time)
         # so the post-SL cooldown gate can detect same-direction re-entry.
         self._last_entry_bar_time: Optional[datetime] = None
         self._last_entry_direction: str = ""
         self.trade_history: List[dict] = []
+        self._last_open_positions: list[dict] = []
         self.last_decision: Optional[DecisionResult] = None
         # Structured telemetry for the most recently evaluated closed candle.
         # It is mirrored into robot_state.json and emitted as one JSON log
@@ -310,6 +317,7 @@ class GoldScalperLive:
         log.info("  GoldScalperPro v4 — LIVE TRADING ENGINE (MTAPI)")
         log.info(f"  Symbol: {SYMBOL}  |  Trade TFs: {chr(44).join(TRADE_TIMEFRAMES)} (highest first)")
         log.info(f"  Max positions: {MAX_OPEN_TRADES}")
+        log.info(f"  Hedged positions: {'enabled' if ALLOW_HEDGED_POSITIONS else 'disabled'}")
         log.info(f"  Min confirmations: {MIN_CONFIRMATIONS}")
         log.info(f"  Trend min confirmations: {TREND_MIN_CONFIRMATIONS}")
         log.info(
@@ -1056,6 +1064,7 @@ class GoldScalperLive:
             self._write_state("WAITING", acc_info)
             return
         pos_dicts = [mt5_pos_to_dict(p) for p in raw_positions]
+        self._last_open_positions = list(pos_dicts)
         pos       = pos_dicts[0] if pos_dicts else None
 
         # DEFENSE IN DEPTH: an unrecognised corrupted row was dropped this
@@ -1441,82 +1450,35 @@ class GoldScalperLive:
         # strategy-slot gate (step 7) sees too few occupied slots and could
         # allow an unintended duplicate.
         #
-        # Re-polling right here — seconds later, after the decision engine,
-        # snapshot write, and all other gates have already run — is enough
-        # time for a transient bridge glitch to clear. If a position now
-        # claims the candidate slot, we abort this entry rather than stack it.
-        # This costs one extra read-only mt5rest call only on the path that
-        # is about to place an order; every other code path (trailing stop,
-        # /close_all, panel snapshot) is untouched.
-        try:
-            _confirm_positions = await get_open_positions(SYMBOL, self._known_open_tickets())
-        except RuntimeError as _confirm_err:
-            self._set_trade_permission(
-                False,
-                "POSITION_CHECK_FAILED",
-                [f"Could not verify open positions: {_confirm_err}"],
-            )
-            log.error(
-                f"Pre-order safety re-check could not verify positions — "
-                f"skipping entry this bar: {_confirm_err}"
-            )
-            self._write_state("WAITING", acc_info, decision, pos,
-                               extra=self._guardian_extra(gs))
-            return
-        _confirm_pos_dicts = [
-            mt5_pos_to_dict(position) for position in _confirm_positions
-        ]
-        _confirm_slots_available, _confirm_slot_reason = (
-            available_for_strategy_slots(
-                _confirm_pos_dicts,
-                candidate_strategy_slots,
-                max_open_positions=MAX_OPEN_TRADES,
-            )
-        )
-        if not _confirm_slots_available:
-            self._set_trade_permission(
-                False,
-                "STRATEGY_POSITION_LIMIT",
-                [_confirm_slot_reason],
-            )
-            _confirm_pos = _confirm_pos_dicts[0] if _confirm_pos_dicts else pos
-            log.warning(
-                f"Pre-order strategy-capacity check blocked entry: "
-                f"{_confirm_slot_reason}"
-            )
-            self._write_state("HOLDING", acc_info, decision, _confirm_pos,
-                               extra=self._guardian_extra(gs))
-            return
-
-        # 9. ── PLACE ORDER ────────────────────────────────────────────────────
-        self._set_trade_permission(
-            True,
-            "READY_TO_PLACE_ORDER",
-            ["All live entry gates passed"],
-        )
+        # Re-poll and place under one lock. This closes the race where two
+        # timeframe evaluations both see a flat account and then submit
+        # opposite orders before the bridge exposes the first fill.
         tp_params = decision.trade_params
-        order_comment = strategy_order_comment(
-            COMMENT,
-            candidate_strategy_slots,
+        result, _confirm_pos_dicts, _entry_stage, _entry_reason = (
+            await self._safe_entry_order(
+                decision,
+                candidate_strategy_slots,
+                tf,
+                bar_time,
+            )
         )
-        log.info(
-            f"🔔 SIGNAL [{tf}] {decision.direction}  "
-            f"conf={decision.confidence:.1f}%  "
-            f"lot={tp_params.lot_size}  "
-            f"SL={tp_params.stop_loss}  TP={tp_params.take_profit}  "
-            f"R:R={tp_params.risk_reward_ratio:.2f}  "
-            f"slippage≤{SLIPPAGE_POINTS}pts"
-        )
-
-        result: TradeResult = await place_market_order(
-            symbol    = SYMBOL,
-            direction = decision.direction,
-            lot_size  = tp_params.lot_size,
-            sl        = tp_params.stop_loss,
-            tp        = tp_params.take_profit,
-            comment   = order_comment,
-            deviation = SLIPPAGE_POINTS,
-        )
+        if result is None:
+            self._set_trade_permission(False, _entry_stage, [_entry_reason])
+            _confirm_pos = _confirm_pos_dicts[0] if _confirm_pos_dicts else pos
+            if _entry_stage == "POSITION_CHECK_FAILED":
+                state_status = "WAITING"
+                log.error(f"Pre-order safety check blocked entry: {_entry_reason}")
+            else:
+                state_status = "HOLDING"
+                log.warning(f"Pre-order entry guard blocked entry: {_entry_reason}")
+            self._write_state(
+                state_status,
+                acc_info,
+                decision,
+                _confirm_pos,
+                extra=self._guardian_extra(gs),
+            )
+            return
 
         if result.success:
             self._set_trade_permission(
@@ -2348,6 +2310,104 @@ class GoldScalperLive:
                 # next bar's write_mt5_snapshot() call.
                 self._write_state("RUNNING", self._last_acc_info)
 
+    async def _safe_entry_order(
+        self,
+        decision: DecisionResult,
+        candidate_strategy_slots: tuple[str, ...],
+        timeframe: str,
+        bar_time: datetime,
+    ) -> tuple[Optional[TradeResult], list[dict], str, str]:
+        """Re-check capacity and submit one entry atomically.
+
+        The initial position check is intentionally kept earlier in the bar
+        pipeline for fast feedback. This final check is the authoritative
+        safety boundary immediately before the broker request.
+        """
+        async with self._entry_lock:
+            try:
+                confirm_result = await get_open_positions(
+                    SYMBOL,
+                    self._known_open_tickets(),
+                    return_diagnostics=True,
+                )
+            except RuntimeError as exc:
+                return None, [], "POSITION_CHECK_FAILED", str(exc)
+
+            confirm_positions, dropped_unknown = confirm_result
+            confirm_dicts = [
+                mt5_pos_to_dict(position) for position in confirm_positions
+            ]
+            if dropped_unknown:
+                return (
+                    None,
+                    confirm_dicts,
+                    "UNKNOWN_POSITION_DATA",
+                    f"Unidentified live position data was reported: "
+                    f"{dropped_unknown}",
+                )
+            one_way_ok, one_way_reason = one_way_entry_allowed(
+                confirm_dicts,
+                decision.direction,
+                allow_hedged_positions=ALLOW_HEDGED_POSITIONS,
+            )
+            if not one_way_ok:
+                return (
+                    None,
+                    confirm_dicts,
+                    "OPPOSITE_POSITION_GUARD",
+                    one_way_reason,
+                )
+
+            if (
+                self._last_entry_bar_time == bar_time
+                and self._last_entry_direction
+                and self._last_entry_direction != decision.direction
+            ):
+                return (
+                    None,
+                    confirm_dicts,
+                    "SAME_BAR_DIRECTION_GUARD",
+                    f"Opposite signal on already-traded bar: "
+                    f"{self._last_entry_direction} → {decision.direction}",
+                )
+
+            slots_ok, slots_reason = available_for_strategy_slots(
+                confirm_dicts,
+                candidate_strategy_slots,
+                max_open_positions=MAX_OPEN_TRADES,
+            )
+            if not slots_ok:
+                return None, confirm_dicts, "STRATEGY_POSITION_LIMIT", slots_reason
+
+            self._set_trade_permission(
+                True,
+                "READY_TO_PLACE_ORDER",
+                ["All live entry gates passed"],
+            )
+            tp_params = decision.trade_params
+            order_comment = strategy_order_comment(
+                COMMENT,
+                candidate_strategy_slots,
+            )
+            log.info(
+                f"🔔 SIGNAL [{timeframe}] {decision.direction}  "
+                f"conf={decision.confidence:.1f}%  "
+                f"lot={tp_params.lot_size}  "
+                f"SL={tp_params.stop_loss}  TP={tp_params.take_profit}  "
+                f"R:R={tp_params.risk_reward_ratio:.2f}  "
+                f"slippage≤{SLIPPAGE_POINTS}pts"
+            )
+            result = await place_market_order(
+                symbol=SYMBOL,
+                direction=decision.direction,
+                lot_size=tp_params.lot_size,
+                sl=tp_params.stop_loss,
+                tp=tp_params.take_profit,
+                comment=order_comment,
+                deviation=SLIPPAGE_POINTS,
+            )
+            return result, confirm_dicts, "", ""
+
     # ── Trade history persistence (survives restarts) ─────────────────────────
 
     def _load_trade_history(self) -> List[dict]:
@@ -2497,5 +2557,6 @@ class GoldScalperLive:
             ),
             extra = merged_extra or None,
             trade_permission = self._last_trade_permission,
+            open_positions   = self._last_open_positions,
         )
 

@@ -121,6 +121,7 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `RANGE_ENTRY_FILTERS_ENABLED` | No | `true` | Require RANGE edge, liquidity sweep, reversal, and two-confirmation validation |
 | `MAX_RANGE_TRADES_PER_SESSION` | No | `2` | Successful RANGE entries allowed per UTC session |
 | `MAX_OPEN_TRADES` | No | `4` | Maximum simultaneous open positions (one per strategy slot) |
+| `ALLOW_HEDGED_POSITIONS` | No | `false` | Allow opposite BUY/SELL positions on the same symbol; keep disabled for one-way scalping |
 | `CONF_HARD_MIN` | No | `35` | Balanced confidence-engine hard floor |
 | `OPTION_TWO_MIN_CONFIDENCE` | No | `35` | MTF confidence floor for the HTF-confirmed entry gate |
 | `MTF_ENABLED` | No | `true` | Enable the Option 1/2 higher-timeframe entry blocker |

@@ -226,6 +226,13 @@ STRUCTURE_MAX_AGE_BARS = _int("STRUCTURE_MAX_AGE_BARS", 24, lo=3, hi=100)
 # One concurrent position is allowed per strategy slot (SMC, Trend, Price
 # Action, and Wyckoff), so the safe aggregate ceiling is four positions.
 MAX_OPEN_TRADES   = _int("MAX_OPEN_TRADES", 4, lo=1, hi=10)
+# The account is directional by default. Strategy slots may still be used for
+# scale-in decisions, but an opposite-side position is never opened while a
+# position on this symbol is live unless the operator explicitly opts into
+# hedging on Render.
+ALLOW_HEDGED_POSITIONS = os.getenv(
+    "ALLOW_HEDGED_POSITIONS", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 USE_ATR_HIGH_VOL_FILTER = os.getenv("USE_ATR_HIGH_VOL_FILTER", "false").lower() == "true"
 # ── Multi-Timeframe (HTF) Filter ─────────────────────────────────────────────

@@ -83,6 +83,10 @@ services:
         value: "2"
       - key: MAX_OPEN_TRADES
         value: "4"
+      # Directional scalping is one-way by default. Opposite positions are
+      # blocked even when they would occupy different strategy slots.
+      - key: ALLOW_HEDGED_POSITIONS
+        value: "false"
       # One concurrent position per strategy slot: SMC, Trend, Price Action,
       # and Wyckoff. Legacy untagged positions fail closed and occupy all slots.
       # Price Action may authorize the strategy vote alone. All independent

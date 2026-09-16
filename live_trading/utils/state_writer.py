@@ -114,6 +114,7 @@ def write_robot_state(
     last_signal_time:  Optional[str] = None,
     extra:             Optional[dict] = None,
     trade_permission:  Optional[dict] = None,
+    open_positions:    Optional[List[dict]] = None,
 ) -> None:
 
     pos_data = None
@@ -129,6 +130,24 @@ def write_robot_state(
             "profit":    open_position.get("profit"),
             "open_time": open_position.get("open_time"),
         }
+    positions_data = []
+    source_positions = (
+        open_positions
+        if open_positions is not None
+        else ([] if not open_position else [open_position])
+    )
+    for position in source_positions:
+        positions_data.append({
+            "ticket":    position.get("ticket", position.get("id")),
+            "symbol":    position.get("symbol"),
+            "direction": position.get("type", position.get("direction")),
+            "lot_size":  position.get("volume"),
+            "entry":     position.get("open_price"),
+            "sl":        position.get("sl"),
+            "tp":        position.get("tp"),
+            "profit":    position.get("profit"),
+            "open_time": position.get("open_time"),
+        })
 
     dec_data = None
     if decision:
@@ -247,8 +266,9 @@ def write_robot_state(
         "loop_count":        loop_count,
         # Uptime in seconds since engine start (tracked module-level)
         "uptime_seconds":    _get_uptime_seconds(),
-        # Active trades count: 1 if there is an open position, else 0
-        "active_trades":     1 if open_position else 0,
+        # Keep the legacy singular open_position field, but report every live
+        # position in the count/list so hedging incidents cannot be hidden.
+        "active_trades":     len(positions_data),
         "pending_orders":    0,
         # Legacy format (used by some panel views)
         "account": _account_dict,
@@ -273,6 +293,7 @@ def write_robot_state(
         # NOT the floating P&L (equity-balance) which is a common confusion.
         "today_profit":     round(_today_profit, 2),
         "open_position":    pos_data,
+        "open_positions":   positions_data,
         "last_decision":    dec_data,
         # Kept separate from last_decision.allowed so panel consumers cannot
         # confuse a signal with a fully evaluated, live entry permission.
