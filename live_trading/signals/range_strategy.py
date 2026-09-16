@@ -73,6 +73,7 @@ def evaluate_range_entry(
     lookback: int = 20,
     edge_atr_distance: float = 0.25,
     strict_filters: bool = True,
+    require_edge_position: bool = False,
 ) -> RangeContext:
     """Evaluate the explicit range playbook using only closed candles.
 
