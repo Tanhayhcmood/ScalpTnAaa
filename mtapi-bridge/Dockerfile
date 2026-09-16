@@ -32,7 +32,7 @@ RUN apt-get update -qq \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Stage 2: final mt5rest image with Render PORT proxy ───────────────────────
-FROM mtapiio/mt5rest:latest
+FROM timurila/mt5rest:latest
 
 # Copy socat binary and its one missing runtime dependency (libwrap.so.0).
 # Paths are from ubuntu:20.04 where libs live under /lib, not /usr/lib.
