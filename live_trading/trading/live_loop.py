@@ -1550,6 +1550,10 @@ class GoldScalperLive:
             # Build a synthetic position so the Telegram panel reflects the
             # newly opened trade immediately rather than waiting up to 5 min
             # for the next bar to re-fetch live positions.
+            # Keep the same strategy-tagged comment that was sent to MTAPI.
+            # This telemetry path runs after the order succeeds; rebuilding it
+            # here avoids carrying a local variable across _safe_entry_order().
+            order_comment = strategy_order_comment(COMMENT, candidate_strategy_slots)
             pos = {
                 "id":         result.position_id,
                 "ticket":     result.position_id,

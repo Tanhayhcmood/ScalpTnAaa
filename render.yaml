@@ -1,19 +1,19 @@
 services:
   # ─── Redis — cross-service IPC (robot ↔ Telegram panel) ───────────────────
-  # FIX: must be in the same region as the robot/panel web services (oregon).
+  # Keep the shared Redis service in Singapore with the robot and panel.
   # It was previously created in frankfurt, so its private hostname never
   # resolved from oregon — the panel silently never saw live position/state
   # updates from the robot even though the robot itself was healthy.
   - type: redis
     name: ger-redis
     plan: free
-    region: frankfurt
+    region: singapore
     ipAllowList: []   # private — Render internal routing only; no public access
 
   # ─── Trading robot ─────────────────────────────────────────────────────────
   - type: web
-    name: goldscalper-v4-robot
-    region: frankfurt
+    name: goldscalper-v4-robot-sg
+    region: singapore
     autoDeployTrigger: commit
     runtime: python
     plan: free
@@ -26,7 +26,7 @@ services:
       # service is renamed, a stale value makes the free-tier keepalive ping a
       # different service and the robot can be suspended for inactivity.
       - key: MTAPI_URL
-        value: "https://goldscalper-mtapi-c3a1.onrender.com"
+        value: "https://goldscalper-mtapi-sg.onrender.com"
       - key: MT5_HOST
         value: "AMarkets-Demo"
       - key: MT5_PORT
@@ -159,8 +159,8 @@ services:
 
   # ─── Telegram control panel ────────────────────────────────────────────────
   - type: web
-    name: goldscalper-v4-panel
-    region: oregon
+    name: goldscalper-v4-panel-sg
+    region: singapore
     autoDeployTrigger: commit
     runtime: python
     plan: free
@@ -188,7 +188,7 @@ services:
         value: "/tmp/robot_state.json"
       # FIX #1: ROBOT_BASE_URL and ROBOT_COMMAND_TOKEN enable HTTP fallback.
       - key: ROBOT_BASE_URL
-        value: "https://goldscalper-v4-robot-77pe.onrender.com"
+        value: "https://goldscalper-v4-robot-sg.onrender.com"
       - key: ROBOT_COMMAND_TOKEN
         sync: false
       - key: REDIS_URL
