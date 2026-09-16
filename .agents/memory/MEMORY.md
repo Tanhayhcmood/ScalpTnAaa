@@ -1,0 +1,1 @@
+- [Directional trading safety](directional-trading-safety.md) — Gold scalping must block opposite-side entries by default; hedging requires an explicit operator override.
