@@ -124,37 +124,37 @@ def evaluate_range_entry(
     reversal = _reversal_candle(pa, direction)
     correct_edge = location == ("SUPPORT" if direction == "BUY" else "RESISTANCE")
     if confirmation_count < min_confirmations:
-          valid = False
-          reason = (
-              f"RANGE entry blocked: {confirmation_count}/{min_confirmations} "
-              "confirmations"
-          )
-      elif not strict_filters:
-          valid = True
-          reason = (
-              f"RANGE {direction} accepted: strict Option 2 filters disabled "
-              "(edge/sweep/reversal telemetry retained)"
-          )
-      elif require_edge_position and not correct_edge:
-          valid = False
-          reason = (
-              f"RANGE entry blocked: price is in the {location.lower()}, "
-              f"not at the {('support' if direction == 'BUY' else 'resistance')} edge"
-          )
-      elif not sweep:
-          valid = False
-          reason = "RANGE entry blocked: no fresh same-direction Liquidity Sweep"
-      elif not reversal:
-          valid = False
-          reason = "RANGE entry blocked: no closed-candle reversal pattern"
-      else:
-          valid = True
-          edge_status = "edge" if require_edge_position else "edge check disabled"
-          reason = (
-              f"RANGE {direction} accepted: {edge_status} + "
-              f"Liquidity Sweep + reversal + {confirmation_count} confirmations"
-          )
-    
+        valid = False
+        reason = (
+            f"RANGE entry blocked: {confirmation_count}/{min_confirmations} "
+            "confirmations"
+        )
+    elif not strict_filters:
+        valid = True
+        reason = (
+            f"RANGE {direction} accepted: strict Option 2 filters disabled "
+            "(edge/sweep/reversal telemetry retained)"
+        )
+    elif require_edge_position and not correct_edge:
+        valid = False
+        reason = (
+            f"RANGE entry blocked: price is in the {location.lower()}, "
+            f"not at the {('support' if direction == 'BUY' else 'resistance')} edge"
+        )
+    elif not sweep:
+        valid = False
+        reason = "RANGE entry blocked: no fresh same-direction Liquidity Sweep"
+    elif not reversal:
+        valid = False
+        reason = "RANGE entry blocked: no closed-candle reversal pattern"
+    else:
+        valid = True
+        edge_status = "edge" if require_edge_position else "edge check disabled"
+        reason = (
+            f"RANGE {direction} accepted: {edge_status} + "
+            f"Liquidity Sweep + reversal + {confirmation_count} confirmations"
+        )
+
     return RangeContext(
         valid=valid,
         direction=direction if valid else "NEUTRAL",  # type: ignore[arg-type]
