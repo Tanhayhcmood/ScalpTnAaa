@@ -39,6 +39,7 @@ from live_trading.config import (
     CONF_HARD_MIN,
     RANGE_TRADING_ENABLED, RANGE_MIN_CONFIRMATIONS, RANGE_MIN_RR,
     RANGE_EDGE_ATR_DISTANCE, RANGE_RISK_PERCENT,
+    RANGE_REQUIRE_EDGE_POSITION,
     RANGE_ENTRY_FILTERS_ENABLED,
     MAX_RANGE_TRADES_PER_SESSION,
     DAILY_LOSS_LIMIT_PCT, MAX_DRAWDOWN_PCT, SLIPPAGE_POINTS,
@@ -1489,7 +1490,17 @@ class GoldScalperLive:
             return
 
         if result.success:
-            self._set_trade_permission(
+              if (
+                  decision.regime == "RANGE"
+                  and not RANGE_REQUIRE_EDGE_POSITION
+                  and decision.entry_filter is not None
+              ):
+                  log.info(
+                      "RANGE mode trade allowed "
+                      f"(relaxed: confirmations={decision.entry_filter.confirmation_count}, "
+                      "edge_check=disabled)"
+                  )
+              self._set_trade_permission(
                 True,
                 "ORDER_PLACED",
                 ["Order accepted by MetaAPI"],
