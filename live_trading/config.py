@@ -171,25 +171,31 @@ RANGE_MIN_CONFIDENCE  = _float("RANGE_MIN_CONFIDENCE",  40.0, lo=0.0, hi=100.0)
 # trade alone.
 # Trend-aligned entries have their own safer floor below, so a Trend vote
 # cannot open a trade by itself after a transient candle signal.
-# RANGE has its own confirmation floor below so choppy conditions cannot enter
-# on only one agreeing engine.
+# RANGE has its own confirmation floor below, independent of
+# TREND_MIN_CONFIRMATIONS and the ordinary entry policy.
 MIN_CONFIRMATIONS = _int("MIN_CONFIRMATIONS",   2,    lo=1,    hi=10)
 # A Trend-aligned ordinary entry must have at least two independent votes by
 # default. This is deliberately separate from MIN_CONFIRMATIONS so SMC/PA/
 # Wyckoff-only entries can retain the operator-selected ordinary policy.
 TREND_MIN_CONFIRMATIONS = _int("TREND_MIN_CONFIRMATIONS", 2, lo=1, hi=4)
-# Dedicated RANGE playbook: the edge/sweep/reversal gate is mandatory and the
-# four-engine vote must still meet this minimum. Keep it separate from the
-# global floor so non-RANGE behavior remains unchanged.
+# Dedicated RANGE playbook. Its confirmation floor is intentionally separate
+# from both MIN_CONFIRMATIONS and TREND_MIN_CONFIRMATIONS so RANGE can use a
+# lighter vote requirement without changing ordinary or TREND entries.
 RANGE_TRADING_ENABLED = os.getenv("RANGE_TRADING_ENABLED", "true").strip().lower() in {
     "1", "true", "yes", "on",
 }
-RANGE_MIN_CONFIRMATIONS = _int("RANGE_MIN_CONFIRMATIONS", 2, lo=1, hi=4)
+RANGE_MIN_CONFIRMATIONS = _int("RANGE_MIN_CONFIRMATIONS", 1, lo=1, hi=4)
 RANGE_MIN_RR = _float("RANGE_MIN_RR", 1.5, lo=1.0, hi=10.0)
 RANGE_EDGE_ATR_DISTANCE = _float("RANGE_EDGE_ATR_DISTANCE", 0.25, lo=0.05, hi=2.0)
 RANGE_RISK_PERCENT = _float("RANGE_RISK_PERCENT", 0.5, lo=0.01, hi=10.0)
-# When false, only the optional structural RANGE checks are relaxed. The
-# minimum confirmation floor remains mandatory in all cases.
+# RANGE edge proximity is an optional structural safeguard. It is disabled by
+# default so valid directional RANGE signals are not blocked in the channel
+# middle; sweep/reversal checks remain governed by RANGE_ENTRY_FILTERS_ENABLED.
+RANGE_REQUIRE_EDGE_POSITION = os.getenv(
+    "RANGE_REQUIRE_EDGE_POSITION", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+# When false, the optional structural RANGE checks are relaxed. The
+# confirmation floor remains controlled independently by RANGE_MIN_CONFIRMATIONS.
 RANGE_ENTRY_FILTERS_ENABLED = os.getenv(
     "RANGE_ENTRY_FILTERS_ENABLED", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
