@@ -20,6 +20,9 @@ from live_trading.config import (
     METAAPI_TOKEN,
     METAAPI_ACCOUNT_ID,
     RPC_CALL_TIMEOUT,
+    HISTORICAL_RPC_CONCURRENCY,
+    HISTORICAL_RETRY_ATTEMPTS,
+    HISTORICAL_RETRY_BACKOFF,
 )
 from live_trading.signals.gold_engine import OHLCV
 from live_trading.logger import get_logger
@@ -38,6 +41,7 @@ _connected: bool  = False
 # the trading loop can miss a candle while the duplicate sessions reconnect.
 _connection_lock = asyncio.Lock()
 _health_lock = asyncio.Lock()
+_historical_rpc_gate = asyncio.Semaphore(HISTORICAL_RPC_CONCURRENCY)
 _consecutive_health_failures = 0
 
 
@@ -77,8 +81,10 @@ async def _rpc_call(
 
     The MetaAPI SDK normally reports request timeouts, but a broken websocket
     can leave one coroutine pending long enough to stop the trading loop from
-    writing heartbeats.  Cancelling that call lets the next loop iteration
-    close the stale client and build one clean replacement connection.
+    writing heartbeats. Cancelling that call keeps the loop responsive. Callers
+    may opt out of invalidation for best-effort historical data requests:
+    those timeouts are retried locally and must not tear down the broker
+    session when the health check is still good.
     """
     try:
         return await asyncio.wait_for(awaitable, timeout=RPC_CALL_TIMEOUT)
@@ -496,63 +502,98 @@ async def fetch_candles(
     old window even though newer candles are available. ``None`` has a
     documented meaning in MetaAPI: start from the latest available candles.
     """
-    if not is_connected():
+    if not is_connected() or _account is None:
         log.warning("fetch_candles: not connected")
         return []
 
     tf = _TF_MAP.get(timeframe, timeframe)
-    try:
-        requested_count = max(1, min(int(count), _MAX_HISTORICAL_CANDLES - 1))
-        # Ask MetaAPI for the latest window.  Its historical endpoint walks
-        # backwards from start_time, and start_time=None explicitly means
-        # "latest available"; using datetime.now() can anchor the request to
-        # the wrong side of a broker/server clock offset.
-        request_limit = min(
-            requested_count + 5,
-            _MAX_HISTORICAL_CANDLES,
-        )
-        # Historical candles are exposed by the account API, not the RPC connection.
-        candles = await _rpc_call(
-            _account.get_historical_candles(
-                symbol=symbol,
-                timeframe=tf,
-                start_time=None,
-                limit=request_limit,
-            ),
-            f"historical candles for {symbol} {tf}",
-        )
-        # MetaAPI may return candles in either order and can repeat a candle
-        # around a reconnect. Normalize the order and deduplicate before
-        # selecting the closed-candle window.
-        parsed: dict[datetime, dict] = {}
-        for c in candles or []:
-            if not isinstance(c, dict):
-                continue
-            t = _parse_time(c.get("time") or c.get("brokerTime"))
-            if t is not None:
-                parsed[t] = c
+    requested_count = max(1, min(int(count), _MAX_HISTORICAL_CANDLES - 1))
+    # Ask MetaAPI for the latest window. Its historical endpoint walks
+    # backwards from start_time, and start_time=None explicitly means
+    # "latest available"; using datetime.now() can anchor the request to the
+    # wrong side of a broker/server clock offset.
+    request_limit = min(
+        requested_count + 5,
+        _MAX_HISTORICAL_CANDLES,
+    )
 
-        ordered = sorted(parsed.items(), key=lambda item: item[0])
-        # MetaAPI includes the currently forming candle as the newest row.
-        # Keep the existing closed-candle contract, but apply it only after
-        # sorting/deduplication so it remains correct across reconnects.
-        closed = ordered[:-1] if len(ordered) > 1 else []
+    last_error: Exception | None = None
+    for attempt in range(1, HISTORICAL_RETRY_ATTEMPTS + 1):
+        try:
+            # Historical calls are independent from the RPC health probe. A
+            # slow candle endpoint must not invalidate a session that is still
+            # serving account information and positions. The gate also avoids
+            # a burst of simultaneous subscription requests at bar close.
+            async with _historical_rpc_gate:
+                account = _account
+                if not is_connected() or account is None:
+                    return []
+                candles = await _rpc_call(
+                    account.get_historical_candles(
+                        symbol=symbol,
+                        timeframe=tf,
+                        start_time=None,
+                        limit=request_limit,
+                    ),
+                    f"historical candles for {symbol} {tf}",
+                    invalidate_on_timeout=False,
+                )
 
-        # Convert to OHLCV; skip the still-open last candle
-        result: List[OHLCV] = []
-        for t, c in closed:
-            result.append(OHLCV(
-                time=t,
-                open=float(c.get("open",  0)),
-                high=float(c.get("high",  0)),
-                low= float(c.get("low",   0)),
-                close=float(c.get("close",0)),
-                volume=float(c.get("tickVolume", c.get("volume", 0))),
-            ))
-        return result[-requested_count:]
-    except Exception as exc:
-        log.warning(f"fetch_candles error: {exc}")
-        return []
+            # MetaAPI may return candles in either order and can repeat a
+            # candle around a reconnect. Normalize the order and deduplicate
+            # before selecting the closed-candle window.
+            parsed: dict[datetime, dict] = {}
+            for c in candles or []:
+                if not isinstance(c, dict):
+                    continue
+                t = _parse_time(c.get("time") or c.get("brokerTime"))
+                if t is not None:
+                    parsed[t] = c
+
+            ordered = sorted(parsed.items(), key=lambda item: item[0])
+            # MetaAPI includes the currently forming candle as the newest row.
+            # Keep the existing closed-candle contract, but apply it only
+            # after sorting/deduplication so it remains correct across
+            # reconnects.
+            closed = ordered[:-1] if len(ordered) > 1 else []
+
+            # Convert to OHLCV; skip the still-open last candle.
+            result: List[OHLCV] = []
+            for t, c in closed:
+                result.append(OHLCV(
+                    time=t,
+                    open=float(c.get("open",  0)),
+                    high=float(c.get("high", 0)),
+                    low=float(c.get("low",   0)),
+                    close=float(c.get("close", 0)),
+                    volume=float(c.get("tickVolume", c.get("volume", 0))),
+                ))
+            return result[-requested_count:]
+        except Exception as exc:
+            last_error = exc
+            if attempt >= HISTORICAL_RETRY_ATTEMPTS:
+                break
+            delay = HISTORICAL_RETRY_BACKOFF * attempt
+            log.warning(
+                "Historical candles for %s %s failed on attempt %d/%d: %s; "
+                "retrying in %.1fs without replacing the broker session",
+                symbol,
+                tf,
+                attempt,
+                HISTORICAL_RETRY_ATTEMPTS,
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+    log.warning(
+        "fetch_candles error for %s %s after %d attempt(s): %s",
+        symbol,
+        tf,
+        HISTORICAL_RETRY_ATTEMPTS,
+        last_error,
+    )
+    return []
 
 
 async def get_account_balance() -> float:

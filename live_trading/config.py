@@ -270,6 +270,19 @@ SYNC_TIMEOUT       = 120      # seconds to wait for initial connect
 # Bound every individual MetaAPI RPC so one stalled websocket request cannot
 # freeze the trading loop and its heartbeat indefinitely.
 RPC_CALL_TIMEOUT   = _int("RPC_CALL_TIMEOUT", 30, lo=5, hi=120)
+# Historical candle requests are the noisiest MetaAPI RPC in this service:
+# several timeframes can request data around the same bar close. Keep their
+# concurrency bounded and retry a transient data-plane timeout without tearing
+# down an otherwise healthy broker session.
+HISTORICAL_RPC_CONCURRENCY = _int(
+    "HISTORICAL_RPC_CONCURRENCY", 2, lo=1, hi=4
+)
+HISTORICAL_RETRY_ATTEMPTS = _int(
+    "HISTORICAL_RETRY_ATTEMPTS", 2, lo=1, hi=3
+)
+HISTORICAL_RETRY_BACKOFF = _float(
+    "HISTORICAL_RETRY_BACKOFF", 1.0, lo=0.1, hi=10.0
+)
 
 # ── File Paths (for Telegram panel) ─────────────────────────────────────────
 STATE_FILE          = os.getenv("STATE_FILE",           "robot_state.json")

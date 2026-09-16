@@ -140,6 +140,15 @@ services:
         value: "12"
       - key: BAR_CHECK_INTERVAL
         value: "10"
+      # Historical candle calls are bounded and retried locally. They must not
+      # tear down a healthy MetaAPI session when the data endpoint has a brief
+      # timeout around a bar close.
+      - key: HISTORICAL_RPC_CONCURRENCY
+        value: "2"
+      - key: HISTORICAL_RETRY_ATTEMPTS
+        value: "2"
+      - key: HISTORICAL_RETRY_BACKOFF
+        value: "1.0"
       # MTF/H1 is intentionally disabled for the standalone Price Action
       # mode. Local signal, confidence, sizing, stop, position, and Guardian
       # gates remain active.

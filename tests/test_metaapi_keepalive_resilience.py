@@ -102,3 +102,29 @@ def test_position_timeout_does_not_replace_session_by_itself():
         connector._connection = None
         connector._connected = False
         connector._consecutive_health_failures = 0
+
+
+def test_historical_timeout_does_not_replace_healthy_session():
+    async def run():
+        class _Account:
+            async def get_historical_candles(self, **_kwargs):
+                raise TimeoutError("temporary historical timeout")
+
+        connector._account = _Account()
+        connector._connection = object()
+        connector._connected = True
+        connector._consecutive_health_failures = 0
+
+        candles = await connector.fetch_candles("XAUUSD", "1m", count=50)
+
+        assert candles == []
+        assert connector._connected is True
+        assert connector._consecutive_health_failures == 0
+
+    try:
+        asyncio.run(run())
+    finally:
+        connector._account = None
+        connector._connection = None
+        connector._connected = False
+        connector._consecutive_health_failures = 0
