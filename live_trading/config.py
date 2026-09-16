@@ -5,8 +5,10 @@ All settings are read from environment variables so they can be changed
 on Render without touching code.
 
 Required:
-    METAAPI_TOKEN      – MetaAPI Cloud API token
-    METAAPI_ACCOUNT_ID – MetaAPI account ID linked to the MT5 account
+    MTAPI_URL          – official MTAPI REST base URL
+    MT5_HOST           – broker host/IP accepted by MTAPI
+    MT5_USER           – MT5 account login number
+    MT5_PASSWORD       – MT5 account password
 """
 import os
 import sys
@@ -131,16 +133,18 @@ def _timeframe(name: str, default: str) -> str:
     return val
 
 
-# ── MetaAPI.cloud ─────────────────────────────────────────────────────────────
-# MetaAPI owns the broker connection; these two secrets are required on Render.
-METAAPI_TOKEN      = os.getenv("METAAPI_TOKEN", "").strip()
-METAAPI_ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "").strip()
-
-# Optional compatibility metadata. These are not used for MetaAPI authentication.
-MT5_HOST      = os.getenv("MT5_HOST", "AMarkets-Demo")
+# ── Official MTAPI REST connection ────────────────────────────────────────────
+# /Connect returns an in-memory session token. No UserKey, API key, bridge,
+# MetaAPI account, or self-hosted MT5 service is used.
+MTAPI_URL      = os.getenv("MTAPI_URL", "https://mt5.mtapi.io").rstrip("/")
+MT5_HOST       = os.getenv("MT5_HOST", "AMarkets-Demo").strip()
 MT5_PORT      = _int("MT5_PORT", 443, lo=1, hi=65535)
-MT5_USER      = os.getenv("MT5_USER", "")
-MT5_PASSWORD  = os.getenv("MT5_PASSWORD", "")
+MT5_USER      = os.getenv("MT5_USER", "").strip()
+MT5_PASSWORD  = os.getenv("MT5_PASSWORD", "").strip()
+# Deprecated compatibility aliases. They stay empty and are not used by the
+# direct MTAPI connector.
+METAAPI_TOKEN      = ""
+METAAPI_ACCOUNT_ID = ""
 
 # ── Symbol & Timeframe ───────────────────────────────────────────────────────
 SYMBOL        = os.getenv("SYMBOL", "XAUUSD")
@@ -267,8 +271,8 @@ COMMENT = "GSPv4"
 BAR_CHECK_INTERVAL = _int("BAR_CHECK_INTERVAL", 5, lo=1, hi=60)
 RECONNECT_DELAY    = 30       # seconds before reconnect attempt
 SYNC_TIMEOUT       = 120      # seconds to wait for initial connect
-# Bound every individual MetaAPI RPC so one stalled websocket request cannot
-# freeze the trading loop and its heartbeat indefinitely.
+# Bound individual broker HTTP calls so one stalled request cannot freeze the
+# trading loop and its heartbeat indefinitely.
 RPC_CALL_TIMEOUT   = _int("RPC_CALL_TIMEOUT", 30, lo=5, hi=120)
 # Historical candle requests are the noisiest MetaAPI RPC in this service:
 # several timeframes can request data around the same bar close. Keep their

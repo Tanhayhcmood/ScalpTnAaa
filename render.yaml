@@ -1,40 +1,4 @@
 services:
-  # ─── mt5rest Docker bridge ─────────────────────────────────────────────────
-  - type: web
-    name: goldscalper-mtapi
-    repo: https://github.com/Tanhayhcmood/ScalpTnAaa
-    region: frankfurt
-    autoDeployTrigger: commit
-    runtime: docker
-    dockerfilePath: ./mtapi-bridge/Dockerfile
-    # The Dockerfile copies files from mtapi-bridge/; keep the Docker build
-    # context scoped to that directory instead of the repository root.
-    dockerContext: ./mtapi-bridge
-    plan: free
-    healthCheckPath: /Ping
-    # Render supplies the service URL automatically; keep it out of the
-    # manifest so a generated hostname cannot go stale after a rename.
-    # Only redeploy when mtapi-bridge files actually change.
-    # Without this filter, every Python commit (live_trading/, telegram_panel/)
-    # triggers an unnecessary Docker redeploy that restarts Wine/MT5 from
-    # scratch — the primary cause of the repeated "Failed deploy" status.
-    buildFilter:
-      paths:
-        - mtapi-bridge/**
-    envVars:
-      - key: MT5_HOST
-        value: "AMarkets-Demo"
-      - key: MT5_PORT
-        value: "443"
-      - key: MT5_USER
-        sync: false
-      - key: MT5_PASSWORD
-        sync: false
-      # Static 14-day trial key from users.mtapi.io. Render prompts for this
-      # once and preserves it; the container refuses to generate a replacement.
-      - key: UserKey
-        sync: false
-
   # ─── Redis — cross-service IPC (robot ↔ Telegram panel) ───────────────────
   # FIX: must be in the same region as the robot/panel web services (oregon).
   # It was previously created in frankfurt, so its private hostname never
@@ -48,7 +12,7 @@ services:
 
   # ─── Trading robot ─────────────────────────────────────────────────────────
   - type: web
-    name: goper-v4-robot
+    name: goldscalper-v4-robot
     region: frankfurt
     autoDeployTrigger: commit
     runtime: python
@@ -61,9 +25,15 @@ services:
       # current service. Do not hard-code a generated hostname here: when the
       # service is renamed, a stale value makes the free-tier keepalive ping a
       # different service and the robot can be suspended for inactivity.
-      - key: METAAPI_TOKEN
+      - key: MTAPI_URL
+        value: "https://mt5.mtapi.io"
+      - key: MT5_HOST
+        value: "52.18.32.194"
+      - key: MT5_PORT
+        value: "443"
+      - key: MT5_USER
         sync: false
-      - key: METAAPI_ACCOUNT_ID
+      - key: MT5_PASSWORD
         sync: false
       # FIX: broker reports gold as "XAUUSD", not "XAUUSDb" — the wrong
       # symbol caused every candle/order request to fail silently, which was

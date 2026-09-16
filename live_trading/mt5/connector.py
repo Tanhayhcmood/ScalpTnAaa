@@ -1,846 +1,962 @@
 """
-MetaAPI.cloud Connector — GoldScalperPro v4
+MTAPI MT5 REST Connector – GoldScalperPro v4
 
-Uses MetaAPI.cloud for MT5 connectivity, broker discovery, market data,
-and trade execution through the account's RPC connection.
+Connects directly to the official MTAPI hosted REST API.  The token returned
+by ``/Connect`` is held in memory and passed as ``id`` to every later request.
 
 Required env vars:
-    METAAPI_TOKEN      — API token from metaapi.cloud dashboard
-    METAAPI_ACCOUNT_ID — MT5 account ID from metaapi.cloud dashboard
+    MTAPI_URL     – normally https://mt5.mtapi.io
+    MT5_HOST      – broker host/IP accepted by MTAPI
+    MT5_PORT      – broker port, normally 443
+    MT5_USER      – MT5 account login number
+    MT5_PASSWORD  – MT5 account password
 
-MetaAPI docs: https://metaapi.cloud/docs/client/
+MTAPI endpoints used:
+    GET  /Connect          – authenticate with broker, returns session token
+    GET  /Disconnect       – close connection
+    GET  /ConnectionStatus – check live connection
+    GET  /AccountSummary   – balance, equity, margin
+    GET  /OpenedOrders     – open positions
+    GET  /HistoryPositions – completed positions by ticket
+    GET  /PriceHistoryV2   – OHLCV candles (ISO datetime range)
+    GET  /GetQuote         – current bid/ask price
+    GET  /SymbolList       – verify the configured instrument is available
 """
 
 import asyncio
-import logging
+import math
+import time as _time
 from datetime import datetime, timezone, timedelta
-from typing import Awaitable, List, Optional, Any
+from typing import Dict, List, Optional, Tuple
+
+import aiohttp
 
 from live_trading.config import (
-    METAAPI_TOKEN,
-    METAAPI_ACCOUNT_ID,
-    RPC_CALL_TIMEOUT,
-    HISTORICAL_RPC_CONCURRENCY,
-    HISTORICAL_RETRY_ATTEMPTS,
-    HISTORICAL_RETRY_BACKOFF,
+    MTAPI_URL, MT5_HOST, MT5_PORT,
+    MT5_USER, MT5_PASSWORD,
+    SYNC_TIMEOUT,
 )
 from live_trading.signals.gold_engine import OHLCV
 from live_trading.logger import get_logger
 
 log = get_logger()
 
-# ── Module-level MetaAPI state ────────────────────────────────────────────────
-_api              = None   # MetaApi instance
-_account          = None   # MetatraderAccount
-_connection       = None   # RpcMetaApiConnection
-_connected: bool  = False
-# The main loop and the watchdog can both notice a broken session at nearly
-# the same time.  Without a lock they each create a MetaApi client and RPC
-# connection, leaving orphaned websocket subscriptions behind.  MetaAPI then
-# starts reporting "too many unexisting or undeployed trading accounts" and
-# the trading loop can miss a candle while the duplicate sessions reconnect.
-_connection_lock = asyncio.Lock()
-_health_lock = asyncio.Lock()
-_historical_rpc_gate = asyncio.Semaphore(HISTORICAL_RPC_CONCURRENCY)
+# ── Module-level state ────────────────────────────────────────────────────────
+_session:    Optional[aiohttp.ClientSession] = None
+_connected:  bool = False
+_base_url:   str  = ""
+_conn_id:    str  = ""   # Token returned by Connect; passed to every call
+_last_connect_time: float = 0.0   # monotonic timestamp of last successful connect()
+# Kept as a narrow test/adaptor seam for callers that provide an RPC-shaped
+# fake. Production traffic never uses this object; it always uses MTAPI REST.
+_connection = None
+_account = None
 _consecutive_health_failures = 0
+_health_lock = asyncio.Lock()
+# Deprecated compatibility names intentionally remain empty. They are not read
+# by the direct MTAPI implementation and do not enable MetaAPI.
+METAAPI_TOKEN = ""
+METAAPI_ACCOUNT_ID = ""
+
+_CONNECT_GRACE_PERIOD: float = 150.0
+_CONNECT_READY_POLL_INITIAL_S: float = 2.0
+_CONNECT_READY_POLL_MAX_S: float = 15.0
+
+_reconnect_lock: asyncio.Lock | None = None
+_watchdog_task: asyncio.Task | None = None
+_MT5_KEEPALIVE_TASK: asyncio.Task | None = None
+_MT5_KEEPALIVE_INTERVAL_S: float = 180.0
+_MT5_SESSION_REFRESH_AGE_S: float = 14400.0
 
 
-def _is_transport_failure(exc: BaseException) -> bool:
-    """Identify failures that mean the RPC session cannot be trusted."""
-    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-        return True
-    text = str(exc).lower()
-    return any(
-        marker in text
-        for marker in (
-            "timed out",
-            "timeout",
-            "disconnected",
-            "connection lost",
-            "not connected",
-            "websocket",
-        )
-    )
+def _connect_params(
+    user: str,
+    password: str,
+    host: str,
+    port: int = 443,
+) -> dict[str, object]:
+    """Build query parameters for the official MTAPI ``/Connect`` endpoint."""
+    return {
+        "user": user,
+        "password": password,
+        "host": host,
+        "port": port,
+        "connectTimeoutSeconds": 60,
+        "errorReplyStatusCode": 400,
+    }
 
 
-def mark_connection_unhealthy(reason: str) -> None:
-    """Make the next loop iteration replace the current RPC session."""
-    global _connected
-    if _connected:
-        _connected = False
-        log.error("MetaAPI session marked unhealthy: %s", reason)
+def _get_reconnect_lock() -> asyncio.Lock:
+    """Lazily create the reconnect lock on the running event loop."""
+    global _reconnect_lock
+    if _reconnect_lock is None:
+        _reconnect_lock = asyncio.Lock()
+    return _reconnect_lock
 
 
-async def _rpc_call(
-    awaitable: Awaitable[Any],
-    operation: str,
-    *,
-    invalidate_on_timeout: bool = True,
-) -> Any:
-    """Run a data-plane MetaAPI call with a hard upper bound.
+_TF_MAP = {
+    "1m": 1, "5m": 5, "10m": 10, "15m": 15, "20m": 20, "30m": 30,
+    "1h": 60, "4h": 240, "1d": 1440,
+    "M1": 1, "M5": 5, "M10": 10, "M15": 15, "M20": 20, "M30": 30,
+    "H1": 60, "H4": 240, "D1": 1440,
+}
 
-    The MetaAPI SDK normally reports request timeouts, but a broken websocket
-    can leave one coroutine pending long enough to stop the trading loop from
-    writing heartbeats. Cancelling that call keeps the loop responsive. Callers
-    may opt out of invalidation for best-effort historical data requests:
-    those timeouts are retried locally and must not tear down the broker
-    session when the health check is still good.
-    """
+
+def _parse_candle_time(value: object) -> Optional[datetime]:
+    """Parse an MTAPI candle timestamp into an aware UTC datetime."""
+    raw = str(value).strip()
+    if not raw:
+        return None
     try:
-        return await asyncio.wait_for(awaitable, timeout=RPC_CALL_TIMEOUT)
-    except asyncio.TimeoutError as exc:
-        if invalidate_on_timeout:
-            mark_connection_unhealthy(
-                f"{operation} timed out after {RPC_CALL_TIMEOUT}s"
-            )
-        raise RuntimeError(
-            f"MetaAPI {operation} timed out after {RPC_CALL_TIMEOUT}s"
-        ) from exc
-    except Exception as exc:
-        if invalidate_on_timeout and _is_transport_failure(exc):
-            mark_connection_unhealthy(f"{operation} failed: {exc}")
-        raise
+        numeric = float(raw)
+        if math.isfinite(numeric):
+            if abs(numeric) > 100_000_000_000:
+                numeric /= 1000.0
+            return datetime.fromtimestamp(numeric, tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
-def _account_field(info: Any, key: str, default: Any = None) -> Any:
-    """Read an account-information field from SDK dicts or model objects."""
+def _parse_time(value: object) -> Optional[datetime]:
+    """Backward-compatible name for the connector timestamp normalizer."""
+    if value is None:
+        return None
+    return _parse_candle_time(value)
+
+
+def _account_field(info: object, key: str, default: object = None) -> object:
+    """Read a field from either a dict or a simple adapter object."""
     if isinstance(info, dict):
         return info.get(key, default)
     return getattr(info, key, default)
 
-# ── Timeframe → MetaAPI period map ───────────────────────────────────────────
-_TF_MAP = {
-    "1m":  "1m",  "5m":  "5m",  "10m": "10m", "15m": "15m", "20m": "20m", "30m": "30m",
-    "1h":  "1h",  "4h":  "4h",  "1d":  "1d",
-    "M1":  "1m",  "M5":  "5m",  "M10": "10m", "M15": "15m", "M20": "20m", "M30": "30m",
-    "H1":  "1h",  "H4":  "4h",  "D1":  "1d",
-}
 
-# Candle period duration in seconds
-_TF_SECONDS = {
-    "1m": 60, "5m": 300, "10m": 600, "15m": 900, "20m": 1200, "30m": 1800,
-    "1h": 3600, "4h": 14400, "1d": 86400,
-}
-_MAX_HISTORICAL_CANDLES = 1000
+def _h1_request_minutes(count: int) -> int:
+    active_bars = max(count + 10, math.ceil(count * 7 / 5))
+    return active_bars * 60 + (3 * 24 * 60)
 
 
-# ── Connection lifecycle ──────────────────────────────────────────────────────
+def _completed_candles(
+    candles: List[Tuple[datetime, OHLCV]],
+    *,
+    timeframe_minutes: int,
+    now: datetime,
+) -> List[OHLCV]:
+    """Keep chronologically ordered, completed candles."""
+    ordered: List[Tuple[datetime, OHLCV]] = []
+    seen_times: set[datetime] = set()
+    for candle_time, candle in sorted(candles, key=lambda item: item[0]):
+        if candle_time in seen_times:
+            continue
+        seen_times.add(candle_time)
+        ordered.append((candle_time, candle))
+    if timeframe_minutes == 60:
+        close_cutoff = now - timedelta(seconds=2)
+        return [
+            candle for candle_time, candle in ordered
+            if candle_time + timedelta(hours=1) <= close_cutoff
+        ]
+    return [candle for _, candle in ordered[:-1]]
 
-async def _close_current_connection_unlocked() -> None:
-    """Close and clear the current MetaAPI objects.
 
-    The caller must hold ``_connection_lock``.  Clearing the module state in a
-    ``finally``-style helper is important after a failed reconnect: otherwise
-    the next reconnect may keep using a half-closed SDK client.
-    """
-    global _api, _account, _connection, _connected, _consecutive_health_failures
+def _get_session() -> aiohttp.ClientSession:
+    global _session
+    if _session is None or _session.closed:
+        _session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+    return _session
 
-    connection = _connection
-    api = _api
-    _connected = False
-    _connection = None
-    _account = None
-    _api = None
-    _consecutive_health_failures = 0
 
-    try:
-        if connection:
-            await asyncio.wait_for(
-                connection.close(),
-                timeout=min(15, RPC_CALL_TIMEOUT),
+def _connection_status_is_alive(data: object) -> bool:
+    if not isinstance(data, dict):
+        return False
+    value = data.get("isConnected", data.get("connected"))
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "connected"}
+    return bool(value)
+
+
+async def _wait_for_broker_ready(
+    base_url: str,
+    conn_id: str,
+    *,
+    timeout_s: float = _CONNECT_GRACE_PERIOD,
+) -> bool:
+    deadline = _time.monotonic() + timeout_s
+    delay = _CONNECT_READY_POLL_INITIAL_S
+    last_status = ""
+    while True:
+        try:
+            sess = _get_session()
+            async with sess.get(
+                f"{base_url}/ConnectionStatus",
+                params={"id": conn_id},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if _connection_status_is_alive(data):
+                    return True
+                last_status = str(data)[:180] if resp.status < 500 else f"HTTP {resp.status}"
+        except Exception as exc:
+            last_status = str(exc)[:180]
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            log.error(
+                "MT5 session was created but broker was not ready within "
+                f"{timeout_s:.0f}s (last status: {last_status})"
             )
-    except Exception as exc:
-        log.debug(f"MetaAPI RPC close failed during cleanup: {exc}")
-    try:
-        if api:
-            result = api.close()
-            if hasattr(result, "__await__"):
-                await asyncio.wait_for(
-                    result,
-                    timeout=min(15, RPC_CALL_TIMEOUT),
-                )
-    except Exception as exc:
-        log.debug(f"MetaAPI client close failed during cleanup: {exc}")
+            return False
+        await asyncio.sleep(min(delay, remaining))
+        delay = min(delay * 1.5, _CONNECT_READY_POLL_MAX_S)
 
 
 async def connect(*args, **kwargs) -> bool:
-    """
-    Connect to MT5 via MetaAPI.cloud.
-    Signature: connect(token, account_id, timeout_seconds)
-    Falls back to env vars METAAPI_TOKEN / METAAPI_ACCOUNT_ID.
-    """
-    global _api, _account, _connection, _connected, _consecutive_health_failures
+    """Connect directly to MT5 through mt5.mtapi.io using GET /Connect."""
+    global _connected, _base_url, _conn_id, _last_connect_time
 
-    token      = args[0] if args else METAAPI_TOKEN
-    account_id = args[1] if len(args) > 1 else METAAPI_ACCOUNT_ID
-    timeout    = args[2] if len(args) > 2 else 300
-
-    # Prefer env vars when args are empty strings
-    token      = token      or METAAPI_TOKEN
-    account_id = account_id or METAAPI_ACCOUNT_ID
-
-    if not token or not account_id:
-        log.error(
-            "METAAPI_TOKEN and METAAPI_ACCOUNT_ID must be set. "
-            "Sign up at https://metaapi.cloud, add your MT5 account, "
-            "and set these two env vars on Render."
-        )
+    base = MTAPI_URL.rstrip("/") if MTAPI_URL else ""
+    host = MT5_HOST
+    user = MT5_USER.strip() if MT5_USER else ""
+    password = MT5_PASSWORD.strip() if MT5_PASSWORD else ""
+    if not base:
+        log.error("MTAPI_URL is not set. Set it to https://mt5.mtapi.io.")
+        return False
+    if not user or not password or not host:
+        log.error("MT5_USER, MT5_PASSWORD, and MT5_HOST must be set for MTAPI /Connect.")
         return False
 
-    async with _connection_lock:
-        # A watchdog reconnect and a bar-tick reconnect may arrive together.
-        # The first successful caller owns the session; the second must reuse
-        # it instead of creating another websocket subscription.
-        if _connected and _connection is not None:
-            return True
-
-        # Dispose of a stale/half-open client before creating a replacement.
-        await _close_current_connection_unlocked()
-
-        try:
-            from metaapi_cloud_sdk import MetaApi  # type: ignore
-
-            log.info(f"Connecting to MetaAPI.cloud — account {account_id[:12]}…")
-            _api     = MetaApi(token)
-            _account = await _api.metatrader_account_api.get_account(account_id)
-
-            # Deploy account if not yet deployed.  wait_connected() is still
-            # used for DEPLOYING because MetaAPI may need a short provisioning
-            # window before the broker session becomes available.
-            if _account.state not in ("DEPLOYED", "DEPLOYING"):
-                log.info("Deploying MetaAPI account…")
-                await _account.deploy()
-
-            log.info("Waiting for account to connect to broker…")
-            await _account.wait_connected(timeout_in_seconds=min(timeout, 120))
-
-            # RPC connection is simpler and sufficient for candle + order data
-            _connection = _account.get_rpc_connection()
-            await _connection.connect()
-            await _connection.wait_synchronized(timeout_in_seconds=min(timeout, 60))
-
-            # broker is part of the synchronized account-information response;
-            # MetatraderAccount itself does not expose the broker field in SDK 29.1.1.
-            account_info = await _connection.get_account_information()
-            broker_label = (
-                _account_field(account_info, "broker")
-                or _account_field(account_info, "server")
-                or "MT5"
-            )
+    previous_conn_id = _conn_id
+    previous_connected = _connected
+    _base_url = base
+    sess = _get_session()
+    try:
+        log.info(
+            f"MTAPI connection attempt: {base}/Connect "
+            f"(host={host}, port={MT5_PORT}, account={user[:3]}***)"
+        )
+        async with sess.get(
+            f"{base}/Connect",
+            params=_connect_params(user, password, host, MT5_PORT),
+            timeout=aiohttp.ClientTimeout(total=SYNC_TIMEOUT),
+        ) as resp:
+            raw = await resp.text()
+            log.debug(f"MTAPI /Connect response ({resp.status}): [response received]")
+            if resp.status != 200:
+                log.error(f"MTAPI /Connect failed (status={resp.status}): {raw[:300]}")
+                _connected = False
+                return False
+            conn_id = raw.strip().strip('"')
+            if not conn_id or len(conn_id) < 10:
+                log.error(f"MTAPI /Connect returned an unexpected token: {raw[:200]}")
+                _connected = False
+                return False
+            if not await _wait_for_broker_ready(base, conn_id):
+                try:
+                    async with sess.get(
+                        f"{base}/Disconnect",
+                        params={"id": conn_id},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ):
+                        pass
+                except Exception:
+                    pass
+                _connected = previous_connected
+                _conn_id = previous_conn_id
+                return False
+            _conn_id = conn_id
             _connected = True
-            _consecutive_health_failures = 0
-            log.info(f"✅ MetaAPI connected — broker: {broker_label}")
+            _last_connect_time = _time.monotonic()
+            log.info(
+                f"MTAPI connection success: MT5 account connected "
+                f"(host={host}, port={MT5_PORT}, account={user[:3]}***)"
+            )
+            if previous_conn_id and previous_conn_id != conn_id:
+                try:
+                    async with sess.get(
+                        f"{base}/Disconnect",
+                        params={"id": previous_conn_id},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ):
+                        pass
+                except Exception as exc:
+                    log.debug(f"Previous MT5 session cleanup skipped: {exc}")
             return True
-
-        except Exception as exc:
-            log.error(f"❌ MetaAPI connect failed: {exc}")
-            # Close the failed client before the retry.  This prevents failed
-            # attempts from accumulating subscriptions in the SDK.
-            await _close_current_connection_unlocked()
-            return False
+    except Exception as exc:
+        log.error(f"MTAPI connection failure: {exc}")
+        _connected = False
+        return False
 
 
 async def disconnect() -> None:
-    async with _connection_lock:
-        await _close_current_connection_unlocked()
+    """Close the MTAPI connection and release the HTTP session."""
+    global _connected, _session, _conn_id, _base_url
+    conn_id, base_url, session = _conn_id, _base_url, _session
+    _connected, _conn_id, _base_url = False, "", ""
+    if conn_id and base_url and session and not session.closed:
+        try:
+            async with session.get(
+                f"{base_url}/Disconnect",
+                params={"id": conn_id},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
+                if response.status >= 400:
+                    log.warning(f"MT5 disconnect request returned HTTP {response.status}")
+        except Exception as exc:
+            log.warning(f"MT5 disconnect request failed: {exc}")
+    if session and not session.closed:
+        try:
+            await session.close()
+        except Exception as exc:
+            log.warning(f"MT5 HTTP session close failed: {exc}")
+    _session = None
 
 
-async def ensure_connected(
-    token:      str,
-    account_id: str,
-    timeout:    int = 300,
-    attempt:    int = 1,
-) -> bool:
-    if _connected and _connection is not None:
-        return True
-    log.info(f"Reconnecting (attempt {attempt})…")
-    return await connect(token, account_id, timeout)
-
-
-def is_connected() -> bool:
-    return _connected and _connection is not None
-
-
-def get_connection():
-    """Return the active RPC connection or None."""
-    return _connection if _connected else None
-
-
-async def connect_with_retry(
-    max_attempts: int = 12,
-    retry_delay: float = 30.0,
-) -> bool:
-    """Connect to MetaAPI with bounded exponential retry backoff."""
-    for attempt in range(1, max_attempts + 1):
-        if await connect():
-            return True
-        if attempt < max_attempts:
-            delay = retry_delay * min(2 ** (attempt - 1), 4)
-            log.warning(
-                f"MetaAPI connection attempt {attempt}/{max_attempts} failed; "
-                f"retrying in {delay:.0f}s"
-            )
-            await asyncio.sleep(delay)
-    return False
+async def keepalive_mtapi() -> bool:
+    if not _base_url or not _conn_id:
+        return False
+    try:
+        async with _get_session().get(
+            f"{_base_url}/ConnectionStatus",
+            params={"id": _conn_id},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            data = await resp.json(content_type=None)
+            ok = resp.status == 200 and _connection_status_is_alive(data)
+            if not ok:
+                log.warning(f"MTAPI broker-session keepalive returned {resp.status}")
+            return ok
+    except Exception as exc:
+        log.warning(f"MTAPI broker-session keepalive failed: {exc}")
+        return False
 
 
 async def keepalive_metaapi() -> bool:
-    """Perform a lightweight RPC call and tolerate transient network faults.
+    """Compatibility shim for the old health-check test/adaptor contract.
 
-    A single failed RPC is not enough evidence that the broker session is dead:
-    Render/MetaAPI can briefly lose a packet while the SDK session is still
-    recoverable.  Tearing down the session on that first failure makes a short
-    hiccup look like a multi-minute outage because reconnect must wait for
-    account deployment and synchronization.  The watchdog therefore requires
-    several consecutive failed health checks before replacing the session.
+    It deliberately uses only a supplied fake connection. Production code
+    calls ``keepalive_mtapi`` and never imports or instantiates MetaAPI.
     """
     global _connected, _consecutive_health_failures
-    async with _health_lock:
-        connection = _connection if is_connected() else None
-        if connection is None:
-            return False
-        try:
-            await asyncio.wait_for(
-                connection.get_account_information(),
-                timeout=RPC_CALL_TIMEOUT,
-            )
-            _consecutive_health_failures = 0
+    legacy_connection = globals().get("_connection")
+    get_info = getattr(legacy_connection, "get_account_information", None)
+    if get_info is None:
+        return await keepalive_mtapi()
+    try:
+        await get_info()
+        _consecutive_health_failures = 0
+        return True
+    except Exception as exc:
+        _consecutive_health_failures += 1
+        if _consecutive_health_failures >= 3:
+            _connected = False
+        return False
+
+
+async def connect_with_retry(max_attempts: int = 5, retry_delay: float = 60.0) -> bool:
+    for attempt in range(1, max_attempts + 1):
+        log.info(f"MT5 connect attempt {attempt}/{max_attempts} ...")
+        if await connect():
             return True
-        except Exception as exc:
-            _consecutive_health_failures += 1
-            failure_count = _consecutive_health_failures
-            # Only invalidate the session that was actually checked. A
-            # successful concurrent reconnect must not be marked disconnected
-            # by a stale keepalive failure.
-            if _connection is connection:
-                if failure_count >= 3:
-                    _connected = False
-                    log.error(
-                        "MetaAPI health check failed %d consecutive times; "
-                        "the session will be reconnected: %s",
-                        failure_count,
-                        exc,
-                    )
-                else:
-                    log.warning(
-                        "MetaAPI health check failed (%d/3); keeping the "
-                        "existing session for a retry: %s",
-                        failure_count,
-                        exc,
-                    )
-            return False
+        if attempt < max_attempts:
+            log.warning(f"MT5 connect failed (attempt {attempt}). Waiting {retry_delay}s ...")
+            await asyncio.sleep(retry_delay)
+    log.error(f"MT5 connect failed after {max_attempts} attempts.")
+    return False
+
+
+def _invalidate_connection() -> None:
+    global _connected, _conn_id
+    log.warning("MT5 conn_id is stale — invalidating connection (will reconnect on retry)")
+    _connected = False
+    _conn_id = ""
+
+
+async def ensure_connected(*args, **kwargs) -> bool:
+    global _connected
+    if (
+        _conn_id and _connected
+        and _time.monotonic() - _last_connect_time < _CONNECT_GRACE_PERIOD
+    ):
+        return True
+    if _conn_id and _base_url:
+        try:
+            async with _get_session().get(
+                f"{_base_url}/ConnectionStatus",
+                params={"id": _conn_id},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if _connection_status_is_alive(data):
+                    _connected = True
+                    return True
+        except Exception:
+            pass
+    _connected = False
+    lock = _get_reconnect_lock()
+    if lock.locked():
+        async with lock:
+            return _connected
+    async with lock:
+        if _connected and _time.monotonic() - _last_connect_time < _CONNECT_GRACE_PERIOD:
+            return True
+        return await connect_with_retry(max_attempts=3, retry_delay=30.0)
 
 
 async def start_connection_watchdog(interval_seconds: float = 30.0) -> None:
-    """Monitor the MetaAPI session with one serialized health/reconnect loop."""
-    while True:
-        await asyncio.sleep(interval_seconds)
-        if not is_connected():
-            await connect()
-        else:
-            await keepalive_metaapi()
+    global _watchdog_task
+    log.info(f"[watchdog] MT5 connection watchdog started (interval={interval_seconds}s)")
+    failures = 0
+    try:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            if _connected and _time.monotonic() - _last_connect_time < _CONNECT_GRACE_PERIOD:
+                continue
+            if not _connected or not _conn_id:
+                if await ensure_connected():
+                    log.info("[watchdog] MT5 proactive reconnect succeeded")
+                continue
+            try:
+                async with _get_session().get(
+                    f"{_base_url}/ConnectionStatus",
+                    params={"id": _conn_id},
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as resp:
+                    data = await resp.json(content_type=None)
+                    if _connection_status_is_alive(data):
+                        failures = 0
+                    else:
+                        failures += 1
+            except Exception as exc:
+                failures += 1
+                log.warning(f"[watchdog] ConnectionStatus check failed ({failures}/2): {exc}")
+            if failures >= 2:
+                failures = 0
+                _invalidate_connection()
+                await ensure_connected()
+    except asyncio.CancelledError:
+        log.info("[watchdog] MT5 connection watchdog stopped")
+        raise
 
 
-async def start_metaapi_session_keepalive(interval_seconds: float = 180.0) -> None:
-    """Keep the synchronized MetaAPI RPC session active."""
-    while True:
-        await asyncio.sleep(interval_seconds)
-        await keepalive_metaapi()
+async def start_mt5_session_keepalive(
+    interval_s: float = _MT5_KEEPALIVE_INTERVAL_S,
+    refresh_age_s: float = _MT5_SESSION_REFRESH_AGE_S,
+) -> None:
+    global _MT5_KEEPALIVE_TASK
+    log.info(
+        f"[mt5_keepalive] MT5 broker-session keepalive started "
+        f"(ping every {interval_s:.0f}s, refresh after {refresh_age_s/3600:.1f}h)"
+    )
+    try:
+        while True:
+            await asyncio.sleep(interval_s)
+            if not _connected or not _conn_id or not _base_url:
+                continue
+            if _time.monotonic() - _last_connect_time > refresh_age_s:
+                await connect()
+                continue
+            await keepalive_mtapi()
+    except asyncio.CancelledError:
+        log.info("[mt5_keepalive] MT5 broker-session keepalive stopped")
+        raise
 
-
-# ── Market data ───────────────────────────────────────────────────────────────
 
 async def check_symbol_available(symbol: str) -> bool:
-    """Return whether MetaAPI exposes a specification for the symbol."""
-    if not is_connected():
+    target = symbol.strip().upper()
+    if not target:
         return False
-    try:
-        specification = await _rpc_call(
-            _connection.get_symbol_specification(symbol),
-            f"symbol specification for {symbol}",
-        )
-        return bool(specification)
-    except Exception as exc:
-        log.warning(f"check_symbol_available({symbol}) error: {exc}")
-        return False
+    for attempt in range(2):
+        if not _conn_id and not await ensure_connected():
+            return False
+        try:
+            async with _get_session().get(
+                f"{_base_url}/SymbolList",
+                params={"id": _conn_id},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status >= 400:
+                    raise RuntimeError(f"HTTP {resp.status}: {str(data)[:160]}")
+                if isinstance(data, list):
+                    names = [str(item) for item in data]
+                elif isinstance(data, dict):
+                    names = [str(item) for item in data.keys()]
+                else:
+                    raise RuntimeError(f"unexpected response type {type(data).__name__}")
+                available = {name.upper() for name in names}
+                if target in available:
+                    log.info(f"{symbol} availability: AVAILABLE via MTAPI")
+                    return True
+                log.error(f"{symbol} availability: NOT AVAILABLE via MTAPI")
+                return False
+        except Exception as exc:
+            if attempt == 0:
+                _invalidate_connection()
+                continue
+            log.error(f"MTAPI symbol check failed after reconnect: {exc}")
+            return False
+    return False
 
 
-async def get_current_quote(symbol: str) -> Optional[dict]:
-    """Return the current MetaAPI bid/ask quote for a symbol."""
-    if not is_connected():
-        return None
-    try:
-        quote = await _rpc_call(
-            _connection.get_symbol_price(symbol),
-            f"price for {symbol}",
-        )
-        if not quote:
-            return None
-        return {
-            "symbol": quote.get("symbol", symbol),
-            "bid": float(quote.get("bid", 0.0)),
-            "ask": float(quote.get("ask", 0.0)),
-            "time": quote.get("time") or quote.get("brokerTime"),
-        }
-    except Exception as exc:
-        log.warning(f"get_current_quote({symbol}) error: {exc}")
-        return None
-
-
-async def get_closed_position_history(position_id: str) -> dict:
-    """Return the closing deal for a MetaAPI position, when available."""
-    if not is_connected():
-        return {}
-    try:
-        get_deals = getattr(_connection, "get_deals_by_position", None)
-        if get_deals is None:
-            log.warning("MetaAPI SDK does not expose get_deals_by_position")
-            return {}
-        raw_deals = await _rpc_call(
-            get_deals(position_id),
-            f"close history for position {position_id}",
-        )
-        deals = _deal_list(raw_deals)
-        if not deals:
-            return {}
-        closing = [
-            deal for deal in deals
-            if str(deal.get("entryType", "")).upper() in {
-                "DEAL_ENTRY_OUT", "DEAL_ENTRY_OUT_BY"
-            }
-        ] or deals
-        deal = closing[-1]
-        return {
-            "closePrice": deal.get("price", deal.get("closePrice")),
-            "closeTime": deal.get("time", deal.get("brokerTime")),
-            "profit": deal.get("profit", 0.0),
-            "commission": deal.get("commission", 0.0),
-            "swap": deal.get("swap", 0.0),
-            "fee": deal.get("fee", 0.0),
-            "closeComment": deal.get("comment", deal.get("brokerComment", "")),
-            "dealId": deal.get("id", deal.get("dealId", "")),
-        }
-    except Exception as exc:
-        log.warning(f"get_closed_position_history({position_id}) error: {exc}")
-        return {}
-
-
-def _deal_list(raw_deals: Any) -> list[dict]:
-    """Normalize MetaAPI history responses without trusting their wrapper shape."""
-    if isinstance(raw_deals, dict):
-        # SDK versions/adapters may wrap the list or return one deal.
-        if any(key in raw_deals for key in (
-            "price", "closePrice", "time", "brokerTime", "entryType",
-        )):
-            deals = [raw_deals]
-        else:
-            deals = (
-                raw_deals.get("deals")
-                or raw_deals.get("items")
-                or raw_deals.get("data")
-                or []
+async def fetch_candles(
+    symbol: str, timeframe: str, count: int = 300
+) -> List[OHLCV]:
+    """Fetch OHLCV candles via MTAPI GET /PriceHistoryV2."""
+    # Compatibility path for the historical RPC-shaped adapter contract.
+    # This is only exercised when a caller supplies _account explicitly.
+    legacy_account = globals().get("_account")
+    get_history = getattr(legacy_account, "get_historical_candles", None)
+    if get_history is not None:
+        try:
+            tf = _TF_MAP.get(timeframe, 5)
+            tf_label = next(
+                (label for label, minutes in _TF_MAP.items() if minutes == tf and label.islower()),
+                timeframe,
             )
-    elif isinstance(raw_deals, (list, tuple)):
-        deals = raw_deals
-    else:
-        deals = []
-    # A malformed adapter response must not break history reconciliation.
-    return [deal for deal in deals if isinstance(deal, dict)]
+            raw_candles = await get_history(
+                symbol=symbol,
+                timeframe=tf_label,
+                start_time=None,
+                limit=max(1, int(count)) + 5,
+            )
+            parsed: list[tuple[datetime, OHLCV]] = []
+            for row in raw_candles or []:
+                if not isinstance(row, dict):
+                    continue
+                candle_time = _parse_time(row.get("time") or row.get("brokerTime"))
+                if candle_time is None:
+                    continue
+                parsed.append((
+                    candle_time,
+                    OHLCV(
+                        time=candle_time,
+                        open=float(row.get("open", row.get("openPrice", 0))),
+                        high=float(row.get("high", row.get("highPrice", 0))),
+                        low=float(row.get("low", row.get("lowPrice", 0))),
+                        close=float(row.get("close", row.get("closePrice", 0))),
+                        volume=float(row.get("tickVolume", row.get("volume", 0))),
+                    ),
+                ))
+            parsed.sort(key=lambda item: item[0])
+            return [candle for _, candle in parsed[:-1]][-max(1, int(count)):]
+        except Exception:
+            return []
+    for attempt in range(2):
+        if not _conn_id and not await ensure_connected():
+            return []
+        tf_min = _TF_MAP.get(timeframe, 5)
+        now = datetime.now(timezone.utc)
+        request_minutes = (
+            _h1_request_minutes(count)
+            if tf_min == 60 else tf_min * (count + 5)
+        )
+        from_str = (now - timedelta(minutes=request_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        to_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            async with _get_session().get(
+                f"{_base_url}/PriceHistoryV2",
+                params={
+                    "id": _conn_id,
+                    "symbol": symbol,
+                    "from": from_str,
+                    "to": to_str,
+                    "timeFrame": tf_min,
+                },
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if not isinstance(data, list):
+                    if attempt == 0:
+                        _invalidate_connection()
+                        continue
+                    return []
+                candles_with_times: List[Tuple[datetime, OHLCV]] = []
+                for bar in data:
+                    candle_time = _parse_candle_time(bar.get("time", ""))
+                    if candle_time is None:
+                        continue
+                    try:
+                        candle = OHLCV(
+                            time=candle_time.isoformat().replace("+00:00", "Z"),
+                            open=float(bar.get("openPrice", 0.0)),
+                            high=float(bar.get("highPrice", 0.0)),
+                            low=float(bar.get("lowPrice", 0.0)),
+                            close=float(bar.get("closePrice", 0.0)),
+                            volume=float(bar.get("tickVolume", bar.get("volume", 0))),
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    candles_with_times.append((candle_time, candle))
+                candles = _completed_candles(
+                    candles_with_times,
+                    timeframe_minutes=tf_min,
+                    now=now,
+                )
+                return candles[-count:] if len(candles) > count else candles
+        except Exception as exc:
+            if attempt == 0:
+                log.warning(f"fetch_candles error (attempt 1) — reconnecting: {exc}")
+                _invalidate_connection()
+                continue
+            log.error(f"fetch_candles error after reconnect: {exc}")
+            return []
+    return []
+
+
+async def get_account_info() -> dict:
+    """Fetch account balance/equity/margin from MTAPI /AccountSummary."""
+    for attempt in range(2):
+        if not _conn_id and not await ensure_connected():
+            return {}
+        try:
+            async with _get_session().get(
+                f"{_base_url}/AccountSummary",
+                params={"id": _conn_id},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if isinstance(data, dict) and "balance" in data:
+                    return {
+                        "balance": float(data.get("balance", 0.0)),
+                        "equity": float(data.get("equity", 0.0)),
+                        "margin": float(data.get("margin", 0.0)),
+                        "freeMargin": float(data.get("freeMargin", 0.0)),
+                        "marginLevel": float(data.get("marginLevel", 0.0)),
+                        "currency": data.get("currency", "USD"),
+                        "leverage": int(data.get("leverage") or 0),
+                        "broker": str(data.get("broker") or data.get("company") or MT5_HOST),
+                        "server": str(data.get("server") or MT5_HOST),
+                        "login": str(data.get("login") or data.get("account") or MT5_USER),
+                        "synced": bool(data.get("synced", True)),
+                        "name": str(data.get("name") or ""),
+                    }
+                if attempt == 0:
+                    _invalidate_connection()
+                    continue
+                return {}
+        except Exception as exc:
+            if attempt == 0:
+                _invalidate_connection()
+                continue
+            log.error(f"get_account_info error after reconnect: {exc}")
+            return {}
+    return {}
+
+
+async def get_account_balance() -> float:
+    return float((await get_account_info()).get("balance", 0.0))
+
+
+async def get_open_positions(
+    symbol: str = "",
+    known_positions: Optional[Dict[str, dict]] = None,
+    return_diagnostics: bool = False,
+):
+    """Fetch open positions from MTAPI and fail closed on malformed payloads."""
+    legacy_connection = globals().get("_connection")
+    get_positions = getattr(legacy_connection, "get_positions", None)
+    if get_positions is not None and not _conn_id:
+        try:
+            await get_positions()
+        except Exception as exc:
+            raise RuntimeError(f"MTAPI get_positions timed out: {exc}") from exc
+        return []
+    for attempt in range(2):
+        if not _conn_id and not await ensure_connected():
+            raise RuntimeError("get_open_positions: not connected to MTAPI")
+        try:
+            params: dict = {"id": _conn_id}
+            if symbol:
+                params["symbol"] = symbol
+            async with _get_session().get(
+                f"{_base_url}/OpenedOrders",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if attempt == 0 and isinstance(data, dict) and "stackTrace" in data:
+                    _invalidate_connection()
+                    continue
+                positions, dropped = _parse_open_positions_response(
+                    data, resp.status, known_positions
+                )
+                return (positions, dropped) if return_diagnostics else positions
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            if attempt == 0:
+                _invalidate_connection()
+                continue
+            raise RuntimeError(f"get_open_positions failed: {exc}") from exc
+    raise RuntimeError("get_open_positions: failed after reconnect attempt")
+
+
+async def get_closed_position_history(position_id: str) -> Optional[dict]:
+    # Compatibility with the normalized history contract used by the local
+    # test/adaptor seam. The production path below calls MTAPI REST directly.
+    legacy_connection = globals().get("_connection")
+    get_deals = getattr(legacy_connection, "get_deals_by_position", None)
+    if get_deals is not None:
+        raw_deals = await get_deals(position_id)
+        deals = raw_deals.get("deals", []) if isinstance(raw_deals, dict) else raw_deals
+        if isinstance(raw_deals, dict) and "entryType" in raw_deals:
+            deals = [raw_deals]
+        if isinstance(deals, list):
+            valid = [item for item in deals if isinstance(item, dict)]
+            if valid:
+                closing = [
+                    item for item in valid
+                    if str(item.get("entryType", "")).upper()
+                    in {"DEAL_ENTRY_OUT", "DEAL_ENTRY_OUT_BY"}
+                ] or valid
+                deal = closing[-1]
+                return {
+                    "closePrice": deal.get("price", deal.get("closePrice")),
+                    "closeTime": deal.get("time", deal.get("brokerTime")),
+                    "profit": deal.get("profit", 0.0),
+                    "commission": deal.get("commission", 0.0),
+                    "swap": deal.get("swap", 0.0),
+                    "fee": deal.get("fee", 0.0),
+                    "closeComment": deal.get("comment", deal.get("brokerComment", "")),
+                    "dealId": deal.get("id", deal.get("dealId", "")),
+                }
+    if not position_id:
+        return None
+    for attempt in range(2):
+        if not _conn_id and not await ensure_connected():
+            raise RuntimeError("get_closed_position_history: not connected to MTAPI")
+        try:
+            async with _get_session().get(
+                f"{_base_url}/HistoryPositions",
+                params={"id": _conn_id, "tickets": int(position_id)},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if attempt == 0 and isinstance(data, dict) and "stackTrace" in data:
+                    _invalidate_connection()
+                    continue
+                if resp.status >= 400:
+                    message = data.get("message", f"HTTP {resp.status}") if isinstance(data, dict) else f"HTTP {resp.status}"
+                    raise RuntimeError(f"MTAPI HistoryPositions error: {message}")
+                if isinstance(data, dict):
+                    candidates = data.get("orders", [])
+                elif isinstance(data, list):
+                    candidates = data
+                else:
+                    candidates = []
+                wanted = str(position_id)
+                for record in candidates:
+                    if not isinstance(record, dict):
+                        continue
+                    ticket = record.get("ticket", record.get("ticketNumber", record.get("positionTicket")))
+                    if ticket is not None and str(ticket) == wanted:
+                        return record
+                return None
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            if attempt == 0:
+                _invalidate_connection()
+                continue
+            raise RuntimeError(f"get_closed_position_history failed: {exc}") from exc
+    raise RuntimeError("get_closed_position_history: failed after reconnect attempt")
 
 
 async def get_deals_by_time_range(
     start_time: datetime,
     end_time: datetime,
 ) -> list[dict]:
-    """Return normalized account deals for the requested UTC time range.
+    """Return normalized account deals for a UTC time range.
 
-    ``get_deals_by_position`` is enough to reconcile a trade the robot already
-    knows about, but it cannot restore history after a Render deploy when the
-    local file and Redis snapshot are both empty.  MetaAPI exposes the complete
-    account deal range through the same RPC connection; callers can then group
-    entry and exit deals by position id.
+    MTAPI deployments expose position history rather than MetaAPI's RPC deal
+    range. Keep the RPC-shaped compatibility seam for tests/adapters, and
+    return an empty history when the hosted endpoint has no range contract.
     """
-    if not is_connected():
-        return []
-    try:
-        get_deals = getattr(_connection, "get_deals_by_time_range", None)
-        if get_deals is None:
-            log.warning("MetaAPI SDK does not expose get_deals_by_time_range")
-            return []
+    legacy_connection = globals().get("_connection")
+    get_deals = getattr(legacy_connection, "get_deals_by_time_range", None)
+    if get_deals is not None:
         try:
-            raw_deals = await _rpc_call(
-                get_deals(start_time=start_time, end_time=end_time),
-                "deals by time range",
-            )
+            raw = await get_deals(start_time=start_time, end_time=end_time)
         except TypeError:
-            # A small number of SDK adapters only accept positional arguments.
-            raw_deals = await _rpc_call(
-                get_deals(start_time, end_time),
-                "deals by time range",
-            )
-        return _deal_list(raw_deals)
-    except Exception as exc:
-        log.warning(
-            "get_deals_by_time_range(%s, %s) error: %s",
-            start_time.isoformat(),
-            end_time.isoformat(),
-            exc,
-        )
-        return []
-
-
-async def fetch_candles(
-    symbol:    str,
-    timeframe: str = "5m",
-    count:     int = 300,
-) -> List[OHLCV]:
-    """Fetch the last ``count`` closed candles for ``symbol``.
-
-    MetaAPI loads historical candles backwards from ``start_time``. Passing a
-    calculated wall-clock timestamp here is unsafe: the broker/terminal clock
-    can differ from the worker clock, so the API may legitimately return an
-    old window even though newer candles are available. ``None`` has a
-    documented meaning in MetaAPI: start from the latest available candles.
-    """
-    if not is_connected() or _account is None:
-        log.warning("fetch_candles: not connected")
-        return []
-
-    tf = _TF_MAP.get(timeframe, timeframe)
-    requested_count = max(1, min(int(count), _MAX_HISTORICAL_CANDLES - 1))
-    # Ask MetaAPI for the latest window. Its historical endpoint walks
-    # backwards from start_time, and start_time=None explicitly means
-    # "latest available"; using datetime.now() can anchor the request to the
-    # wrong side of a broker/server clock offset.
-    request_limit = min(
-        requested_count + 5,
-        _MAX_HISTORICAL_CANDLES,
-    )
-
-    last_error: Exception | None = None
-    for attempt in range(1, HISTORICAL_RETRY_ATTEMPTS + 1):
-        try:
-            # Historical calls are independent from the RPC health probe. A
-            # slow candle endpoint must not invalidate a session that is still
-            # serving account information and positions. The gate also avoids
-            # a burst of simultaneous subscription requests at bar close.
-            async with _historical_rpc_gate:
-                account = _account
-                if not is_connected() or account is None:
-                    return []
-                candles = await _rpc_call(
-                    account.get_historical_candles(
-                        symbol=symbol,
-                        timeframe=tf,
-                        start_time=None,
-                        limit=request_limit,
-                    ),
-                    f"historical candles for {symbol} {tf}",
-                    invalidate_on_timeout=False,
-                )
-
-            # MetaAPI may return candles in either order and can repeat a
-            # candle around a reconnect. Normalize the order and deduplicate
-            # before selecting the closed-candle window.
-            parsed: dict[datetime, dict] = {}
-            for c in candles or []:
-                if not isinstance(c, dict):
-                    continue
-                t = _parse_time(c.get("time") or c.get("brokerTime"))
-                if t is not None:
-                    parsed[t] = c
-
-            ordered = sorted(parsed.items(), key=lambda item: item[0])
-            # MetaAPI includes the currently forming candle as the newest row.
-            # Keep the existing closed-candle contract, but apply it only
-            # after sorting/deduplication so it remains correct across
-            # reconnects.
-            closed = ordered[:-1] if len(ordered) > 1 else []
-
-            # Convert to OHLCV; skip the still-open last candle.
-            result: List[OHLCV] = []
-            for t, c in closed:
-                result.append(OHLCV(
-                    time=t,
-                    open=float(c.get("open",  0)),
-                    high=float(c.get("high", 0)),
-                    low=float(c.get("low",   0)),
-                    close=float(c.get("close", 0)),
-                    volume=float(c.get("tickVolume", c.get("volume", 0))),
-                ))
-            return result[-requested_count:]
-        except Exception as exc:
-            last_error = exc
-            if attempt >= HISTORICAL_RETRY_ATTEMPTS:
-                break
-            delay = HISTORICAL_RETRY_BACKOFF * attempt
-            log.warning(
-                "Historical candles for %s %s failed on attempt %d/%d: %s; "
-                "retrying in %.1fs without replacing the broker session",
-                symbol,
-                tf,
-                attempt,
-                HISTORICAL_RETRY_ATTEMPTS,
-                exc,
-                delay,
-            )
-            await asyncio.sleep(delay)
-
-    log.warning(
-        "fetch_candles error for %s %s after %d attempt(s): %s",
-        symbol,
-        tf,
-        HISTORICAL_RETRY_ATTEMPTS,
-        last_error,
-    )
+            raw = await get_deals(start_time, end_time)
+        if isinstance(raw, dict):
+            raw = raw.get("deals") or raw.get("items") or raw.get("data") or []
+        return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
     return []
 
 
-async def get_account_balance() -> float:
-    info = await get_account_info()
-    return info.get("balance", 0.0)
+def _parse_open_positions_response(
+    data: object, status: int, known_positions: Optional[Dict[str, dict]] = None
+) -> Tuple[List[dict], List[str]]:
+    if status < 200 or status >= 300:
+        message = data.get("message", f"HTTP {status}") if isinstance(data, dict) else f"HTTP {status}"
+        raise RuntimeError(f"MTAPI OpenedOrders error (HTTP {status}): {message}")
+    if isinstance(data, list):
+        return _dedupe_positions(data, known_positions)
+    message = data.get("message", "unexpected object response") if isinstance(data, dict) else f"unexpected response type: {type(data).__name__}"
+    raise RuntimeError(f"MTAPI OpenedOrders error: {message}")
 
 
-async def get_account_info() -> dict:
-    if not is_connected():
-        return {}
+_MAX_SANE_VOLUME_LOTS = 100.0
+
+
+def _finite_positive(value: object) -> Optional[float]:
     try:
-        info = await _rpc_call(
-            _connection.get_account_information(),
-            "account information",
-        )
-        free_margin = _account_field(
-            info,
-            "freeMargin",
-            _account_field(info, "free_margin", 0.0),
-        )
-        return {
-            # Fields documented by MetaAPI's MetatraderAccountInformation model.
-            "platform":    _account_field(info, "platform", "mt5"),
-            "broker":      _account_field(info, "broker", ""),
-            "balance":     _account_field(info, "balance", 0.0),
-            "equity":      _account_field(info, "equity", 0.0),
-            "margin":      _account_field(info, "margin", 0.0),
-            "freeMargin":  free_margin,
-            "profit":      _account_field(info, "profit", 0.0),
-            "currency":    _account_field(info, "currency", "USD"),
-            "leverage":    _account_field(info, "leverage", 100),
-            "marginLevel": _account_field(info, "marginLevel", 0.0),
-            "tradeAllowed": _account_field(info, "tradeAllowed", False),
-            "marginMode":  _account_field(info, "marginMode", ""),
-            "name":        _account_field(info, "name", ""),
-            "login":       _account_field(info, "login", ""),
-            "server":      _account_field(info, "server", ""),
-        }
-    except Exception as exc:
-        log.warning(f"get_account_info error: {exc}")
-        return {}
-
-
-# MetaAPI can occasionally return a malformed phantom position row. Keep this
-# normalization at the connector boundary so every caller sees the same safe data.
-_MAX_REASONABLE_POSITION_VOLUME = 1000.0
-
-
-def _position_ticket(position: dict) -> str:
-    value = position.get("id", position.get("ticket", position.get("positionId", "")))
-    return str(value) if value is not None else ""
-
-
-def _position_volume(position: dict) -> float:
-    """Return a position volume in lots across MetaAPI and legacy shapes."""
-    raw_volume = position.get("volume")
-    raw_lots = position.get("lots")
-    try:
-        volume = float(raw_volume) if raw_volume is not None else 0.0
+        number = float(value)
     except (TypeError, ValueError):
-        volume = 0.0
-    try:
-        lots = float(raw_lots) if raw_lots is not None else 0.0
-    except (TypeError, ValueError):
-        lots = 0.0
-    if 0.0 < lots <= _MAX_REASONABLE_POSITION_VOLUME and (
-        volume <= 0.0 or volume > _MAX_REASONABLE_POSITION_VOLUME
-    ):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number if number > 0 else None
+
+
+def _position_lots(row: dict) -> Optional[float]:
+    lots = _finite_positive(row.get("lots"))
+    if lots is not None:
         return lots
+    volume = _finite_positive(row.get("volume"))
+    if volume is None or volume > _MAX_SANE_VOLUME_LOTS:
+        return None
     return volume
 
 
-def _position_direction(position: dict) -> str:
-    value = position.get("type", position.get("direction"))
-    if value is None:
-        value = position.get("orderType")
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return {0: "BUY", 1: "SELL"}.get(int(value), "UNKNOWN")
-    text = str(value).upper()
-    if "BUY" in text or "LONG" in text:
-        return "BUY"
-    if "SELL" in text or "SHORT" in text:
-        return "SELL"
-    return "UNKNOWN"
+def _position_direction(row: dict) -> str:
+    raw = row.get("type", row.get("orderType"))
+    if isinstance(raw, str):
+        direction = raw.upper().strip()
+        if direction in {"BUY", "SELL"}:
+            return direction
+        try:
+            raw = int(raw)
+        except (TypeError, ValueError):
+            return "UNKNOWN"
+    try:
+        return {0: "BUY", 1: "SELL"}.get(int(raw), "UNKNOWN")
+    except (TypeError, ValueError):
+        return "UNKNOWN"
 
 
 def _dedupe_positions(
-    positions: list,
-    known_positions: Optional[dict] = None,
-) -> tuple[list, list[str]]:
-    """Drop malformed rows and repair known tickets when possible."""
-    known = known_positions or {}
-    result: list = []
-    dropped: list[str] = []
-    seen_tickets: set[str] = set()
-    for position in positions:
-        if not isinstance(position, dict):
-            dropped.append("<non-dict>")
+    rows: List[dict], known_positions: Optional[Dict[str, dict]] = None
+) -> Tuple[List[dict], List[str]]:
+    """Collapse duplicate rows and return (safe rows, dropped ticket ids)."""
+    known_positions = known_positions or {}
+    by_ticket: dict[object, List[dict]] = {}
+    order: List[object] = []
+    for row in rows:
+        if not isinstance(row, dict):
             continue
-        ticket = _position_ticket(position)
-        if ticket and ticket in seen_tickets:
-            log.warning("Dropping duplicate open-position row for ticket %s", ticket)
+        ticket = row.get("ticket", row.get("identifier"))
+        if ticket not in by_ticket:
+            by_ticket[ticket] = []
+            order.append(ticket)
+        by_ticket[ticket].append(row)
+
+    result: List[dict] = []
+    dropped_unknown: List[str] = []
+    for ticket in order:
+        group = by_ticket[ticket]
+        if len(group) == 1:
+            row = group[0]
+            lots = _position_lots(row)
+            if lots is None:
+                known = known_positions.get(str(ticket))
+                known_volume = _finite_positive(known.get("volume")) if known else None
+                if known and known_volume is not None:
+                    repaired = dict(row)
+                    repaired["volume"] = known_volume
+                    repaired["lots"] = known_volume
+                    repaired["type"] = known["direction"]
+                    result.append(repaired)
+                else:
+                    dropped_unknown.append(str(ticket))
+            else:
+                result.append(row)
             continue
-        if ticket:
-            seen_tickets.add(ticket)
-        volume = _position_volume(position)
-        if 0.0 < volume <= _MAX_REASONABLE_POSITION_VOLUME:
-            result.append(position)
-            continue
-        repair = known.get(ticket) if ticket else None
-        repair_volume = repair.get("volume") if isinstance(repair, dict) else None
-        try:
-            repair_volume = float(repair_volume)
-        except (TypeError, ValueError):
-            repair_volume = 0.0
-        if repair and 0.0 < repair_volume <= _MAX_REASONABLE_POSITION_VOLUME:
-            repaired = dict(position)
-            repaired["volume"] = repair_volume
-            repaired["type"] = repair.get("direction", repair.get("type", "UNKNOWN"))
-            result.append(repaired)
-            log.warning("Repaired malformed open-position row for known ticket %s", ticket)
-        else:
-            dropped.append(ticket or "<unknown>")
-            log.warning("Dropped malformed open-position row for ticket %s", ticket or "<unknown>")
-    return result, dropped
+        sane = [row for row in group if _position_lots(row) is not None]
+        result.append(sane[0] if sane else group[0])
+    return result, dropped_unknown
 
 
-def _parse_open_positions_response(
-    payload: Any,
-    status: int = 200,
-    known_positions: Optional[dict] = None,
-) -> tuple[list, list[str]]:
-    """Validate and normalize an open positions response."""
-    if not 200 <= int(status) < 300:
-        detail = payload.get("message") if isinstance(payload, dict) else payload
-        raise RuntimeError(f"HTTP {status}: {detail or 'open positions request failed'}")
-    if not isinstance(payload, list):
-        detail = payload.get("message") if isinstance(payload, dict) else None
-        raise RuntimeError(detail or "Malformed open positions response")
-    return _dedupe_positions(payload, known_positions=known_positions)
-
-
-async def get_open_positions(
-    symbol: str,
-    known_positions: Optional[dict] = None,
-    *,
-    return_diagnostics: bool = False,
-):
-    """Return safe open positions for one symbol."""
-    if not is_connected():
-        raise RuntimeError("MetaAPI connection is not ready")
+async def get_last_completed_bar_time(
+    symbol: str, timeframe: str
+) -> Optional[datetime]:
+    candles = await fetch_candles(symbol, timeframe, count=3)
+    if not candles:
+        return None
+    t = candles[-1].time
+    if isinstance(t, datetime):
+        return t
     try:
-        payload = await _rpc_call(
-            _connection.get_positions(),
-            f"open positions for {symbol}",
-            # Position snapshots are polled every tick and can lose one RPC
-            # while the SDK's redundant websocket clients are switching
-            # servers.  Abort this request, but let the watchdog/account health
-            # checks decide whether the whole session really needs replacing.
-            invalidate_on_timeout=False,
-        )
-        positions, dropped = _parse_open_positions_response(
-            payload, 200, known_positions=known_positions
-        )
-        filtered = [p for p in positions if p.get("symbol") == symbol]
-        if return_diagnostics:
-            return filtered, dropped
-        return filtered
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        log.warning(f"get_open_positions error: {exc}")
-        raise RuntimeError(f"MetaAPI get_positions failed: {exc}") from exc
+        return datetime.fromisoformat(t.replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 
 def mt5_pos_to_dict(pos: dict) -> dict:
-    direction = _position_direction(pos)
-    volume = _position_volume(pos)
     return {
-        "id":         _position_ticket(pos),
-        "symbol":     pos.get("symbol", ""),
-        "direction":  direction,
-        "type":       direction,
-        "volume":     volume,
-        "lot_size":   volume,
-        "price_open": pos.get("openPrice", pos.get("priceOpen", pos.get("open_price", 0))),
-        "sl":         pos.get("stopLoss",   pos.get("sl", 0)),
-        "tp":         pos.get("takeProfit", pos.get("tp", 0)),
-        "profit":     pos.get("profit",  0),
-        "comment":    pos.get("comment", ""),
-        "time_str":   str(pos.get("time", pos.get("openTime", ""))),
-        # keep original for executor
-        "_raw":       pos,
+        "id": str(pos.get("ticket", pos.get("identifier", ""))),
+        "ticket": pos.get("ticket", pos.get("identifier", 0)),
+        "symbol": pos.get("symbol", ""),
+        "type": _position_direction(pos),
+        "volume": _position_lots(pos) or 0.0,
+        "open_price": float(pos.get("openPrice", pos.get("price_open", 0.0))),
+        "sl": float(pos.get("stopLoss", pos.get("sl", 0.0))),
+        "tp": float(pos.get("takeProfit", pos.get("tp", 0.0))),
+        "profit": float(pos.get("profit", 0.0)),
+        "open_time": pos.get("openTime", pos.get("time", 0)),
+        "comment": pos.get("comment", ""),
     }
 
 
-# ── Bar-close detection ───────────────────────────────────────────────────────
+async def get_current_quote(symbol: str) -> dict:
+    for attempt in range(2):
+        if not _conn_id and not await ensure_connected():
+            return {}
+        try:
+            async with _get_session().get(
+                f"{_base_url}/GetQuote",
+                params={"id": _conn_id, "symbol": symbol},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if isinstance(data, dict) and not _is_error_quote(data):
+                    bid = data.get("bid", data.get("Bid"))
+                    ask = data.get("ask", data.get("Ask"))
+                    if bid is not None and ask is not None:
+                        return {"bid": float(bid), "ask": float(ask)}
+                if attempt == 0:
+                    _invalidate_connection()
+                    continue
+                return {}
+        except Exception as exc:
+            if attempt == 0:
+                _invalidate_connection()
+                continue
+            log.warning(f"get_current_quote error after reconnect: {exc}")
+            return {}
+    return {}
 
-async def get_last_completed_bar_time(
-    symbol:    str,
-    timeframe: str = "5m",
-) -> Optional[datetime]:
-    candles = await fetch_candles(symbol, timeframe, count=2)
-    if len(candles) < 2:
-        return None
-    # fetch_candles() already removes the forming candle. Returning [-2]
-    # here made every scan one complete bar late.
-    return candles[-1].time
+
+def _is_error_quote(data: dict) -> bool:
+    return "code" in data and "stackTrace" in data
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def get_connection() -> Optional[str]:
+    """Return the MTAPI base URL when connected."""
+    return _base_url if _connected else None
 
-def _parse_time(raw: Any) -> Optional[datetime]:
-    """Parse MetaAPI candle timestamps into timezone-aware UTC datetimes.
 
-    MetaAPI responses may be ISO strings, epoch seconds, or epoch
-    milliseconds. Falling back to ``now`` on malformed input is unsafe:
-    it fabricates a fresh candle and can authorize a trade using stale data.
-    """
-    if isinstance(raw, datetime):
-        value = raw.replace(tzinfo=timezone.utc) if raw.tzinfo is None else raw
-        return value.astimezone(timezone.utc)
+def get_conn_id() -> Optional[str]:
+    """Return the active MTAPI session token."""
+    return _conn_id if _connected else None
 
-    if raw is None:
-        return None
 
-    # Numeric timestamps are seconds for normal Unix values and milliseconds
-    # for the 13-digit values used by many broker APIs.
-    try:
-        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-            epoch = float(raw)
-        else:
-            text = str(raw).strip()
-            if not text:
-                return None
-            epoch = float(text)
-        if epoch > 100_000_000_000:
-            epoch /= 1000.0
-        return datetime.fromtimestamp(epoch, tz=timezone.utc)
-    except (TypeError, ValueError, OverflowError, OSError):
-        pass
-
-    try:
-        value = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
-    except (TypeError, ValueError):
-        log.warning("Ignoring candle with invalid timestamp: %r", raw)
-        return None
+def is_connected() -> bool:
+    return _connected

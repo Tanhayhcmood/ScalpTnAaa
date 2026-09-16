@@ -258,10 +258,13 @@ async def _status(req: web.Request):
             "_data_fresh": False,
             "_data_age_seconds": -1,
             "diagnostics": {
-                "metaapi_token_configured": bool(os.environ.get("METAAPI_TOKEN")),
-                "metaapi_account_configured": bool(os.environ.get("METAAPI_ACCOUNT_ID")),
-                "broker_connection": "metaapi",
-                "diagnostic_revision": "env-recheck-2",
+                "mtapi_url_configured": bool(os.environ.get("MTAPI_URL")),
+                "mt5_host": os.environ.get("MT5_HOST", ""),
+                "mt5_port": os.environ.get("MT5_PORT", ""),
+                "mt5_user_configured": bool(os.environ.get("MT5_USER")),
+                "mt5_password_configured": bool(os.environ.get("MT5_PASSWORD")),
+                "broker_connection": "mt5.mtapi.io",
+                "diagnostic_revision": "direct-mtapi",
             },
         }),
         content_type="application/json",
@@ -588,18 +591,18 @@ async def _progress_log(request):
 
 async def _run_robot_once():
     global _robot_status
-    from live_trading.config import METAAPI_TOKEN, METAAPI_ACCOUNT_ID
     from live_trading.logger import get_logger
     from live_trading.trading.live_loop import GoldScalperLive
-    from live_trading.mt5.connector import disconnect as _metaapi_disconnect
+    from live_trading.mt5.connector import disconnect as _mtapi_disconnect
 
     log = get_logger()
 
-    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+    from live_trading.config import MTAPI_URL, MT5_HOST, MT5_USER, MT5_PASSWORD
+    if not MTAPI_URL or not MT5_HOST or not MT5_USER or not MT5_PASSWORD:
         _robot_status = "CONFIG_ERROR"
         raise RuntimeError(
-            "METAAPI_TOKEN and METAAPI_ACCOUNT_ID must be set — "
-            "cannot start the MetaAPI trading engine."
+            "MTAPI_URL, MT5_HOST, MT5_USER, and MT5_PASSWORD must be set — "
+            "cannot start the MTAPI trading engine."
         )
 
     _robot_status = "STARTING"
@@ -618,13 +621,13 @@ async def _run_robot_once():
         # while paused) is fixed directly in live_loop.py's paused branch, so
         # no artificial bound is needed here.
         ok = await engine.start()
-        # engine.start() returns False when the MetaAPI connection or startup fails.
+        # engine.start() returns False when the MTAPI connection or startup fails.
         # Without this check a False return is treated as a clean exit,
         # bypassing supervisor backoff and leaving _robot_status as RUNNING.
         if not ok:
             raise RuntimeError(
                 "GoldScalperLive.start() returned False — "
-                "MetaAPI connection or engine startup failed."
+                "MTAPI connection or engine startup failed."
             )
     except Exception:
         # DIAGNOSTIC: persist the full traceback to an always-writable path so
@@ -640,7 +643,7 @@ async def _run_robot_once():
     finally:
         _robot_status = "STOPPED"
         try:
-            await _metaapi_disconnect()
+            await _mtapi_disconnect()
         except Exception:
             pass
 

@@ -5,16 +5,11 @@
 #   pip install -r live_trading/requirements.txt
 #
 # Verify:
-#   python -c "import metaapi_cloud_sdk; print('OK')"
+#   python -c "import aiohttp; print('OK')"
 #
 # Audit date: 2026-07-24
 
-# ── MetaAPI.cloud SDK — MT5 connectivity with full broker database ────────────
-# Replaces the mtapi.io bridge. Set METAAPI_TOKEN + METAAPI_ACCOUNT_ID on Render.
-# Free tier: https://metaapi.cloud
-metaapi-cloud-sdk==29.1.1
-
-# ── Async HTTP — used for panel HTTP calls / health checks ───────────────────
+# ── Async HTTP — official MTAPI REST calls and panel health checks ───────────
 aiohttp==3.9.5
 
 # ── Async file writes — used for atomic state file updates ───────────────────

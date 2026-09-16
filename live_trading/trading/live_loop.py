@@ -1,13 +1,13 @@
 """
-Live Trading Loop — async M5 candle-close event handler via mt5rest bridge.
+Live Trading Loop — async candle-close event handler via official MTAPI REST.
 
 Flow per tick:
   1. Wait for next M5 candle close
-  2. Fetch 300 closed candles via mt5rest bridge
+  2. Fetch 300 closed candles via official MTAPI REST
   3. Run decision engine (all 7 signal engines)
   4. Gate: RiskGuardian circuit breakers (daily loss / drawdown)
   5. Gate: max open positions + trade allowed + Telegram not paused
-  6. Place order via mt5rest executor (with slippage control)
+  6. Place order via MTAPI executor (with slippage control)
   7. Write robot_state.json for Telegram panel
 
 Resilience improvements over baseline:
@@ -30,7 +30,6 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from live_trading.config import (
-    METAAPI_TOKEN, METAAPI_ACCOUNT_ID,
     SYMBOL, TIMEFRAME, CANDLE_WINDOW, RISK_PERCENT,
     MAX_OPEN_TRADES, COMMENT,
     BAR_CHECK_INTERVAL, RECONNECT_DELAY, SYNC_TIMEOUT, RPC_CALL_TIMEOUT,
@@ -256,7 +255,7 @@ class GoldScalperLive:
             "closed_positions": 0,
         }
 
-        # Risk Guardian — initialized after mt5rest bridge connects
+        # Risk Guardian — initialized after the MTAPI broker connection
         self.guardian = RiskGuardian(
             daily_loss_limit_pct=DAILY_LOSS_LIMIT_PCT,
             max_drawdown_pct=MAX_DRAWDOWN_PCT,
@@ -308,7 +307,7 @@ class GoldScalperLive:
 
     async def start(self) -> bool:
         log.info("=" * 60)
-        log.info("  GoldScalperPro v4 — LIVE TRADING ENGINE (MetaAPI)")
+        log.info("  GoldScalperPro v4 — LIVE TRADING ENGINE (MTAPI)")
         log.info(f"  Symbol: {SYMBOL}  |  Trade TFs: {chr(44).join(TRADE_TIMEFRAMES)} (highest first)")
         log.info(f"  Max positions: {MAX_OPEN_TRADES}")
         log.info(f"  Min confirmations: {MIN_CONFIRMATIONS}")
@@ -332,18 +331,18 @@ class GoldScalperLive:
         connected = await connect_with_retry(max_attempts=12, retry_delay=30.0)
         if not connected:
             log.error(
-                "MetaAPI connection failure after all retry attempts. "
-                "Check METAAPI_TOKEN and METAAPI_ACCOUNT_ID."
+                "MTAPI connection failure after all retry attempts. "
+                "Check MTAPI_URL, MT5_HOST, MT5_USER, and MT5_PASSWORD."
             )
             self._write_state("DISCONNECTED",
-                              extra={"error": "MetaAPI connection failed after retries"})
+                              extra={"error": "MTAPI connection failed after retries"})
             return False  # non-False return signals failure to main.py for sys.exit(1)
 
         # ── Read-only broker checks — no order is placed here ──────────────────
         if not await check_symbol_available(SYMBOL):
             self._write_state(
                 "DISCONNECTED",
-                extra={"error": f"{SYMBOL} is not available through MetaAPI"},
+                extra={"error": f"{SYMBOL} is not available through MTAPI"},
             )
             return False
 
@@ -362,12 +361,12 @@ class GoldScalperLive:
                 "was returned; the market may be closed"
             )
 
-        # One serialized watchdog owns all proactive MetaAPI health checks and
+        # One serialized watchdog owns all proactive MTAPI health checks and
         # reconnects.  Older versions started three independent keepalive
         # tasks, which sent overlapping account-info requests and could make a
         # transient packet loss look like a full broker disconnect.
         self._watchdog_task = asyncio.create_task(
-            start_connection_watchdog(interval_seconds=30.0), name="metaapi_watchdog"
+            start_connection_watchdog(interval_seconds=30.0), name="mt5_watchdog"
         )
         try:
             # ── Guardian state restore (VB-02) ───────────────────────────────────
@@ -559,12 +558,7 @@ class GoldScalperLive:
                     continue
 
                 # ── Reconnect with exponential backoff ────────────────────────
-                ok = await ensure_connected(
-                    METAAPI_TOKEN,
-                    METAAPI_ACCOUNT_ID,
-                    SYNC_TIMEOUT,
-                    attempt=self._reconnect_attempts + 1,
-                )
+                ok = await ensure_connected(attempt=self._reconnect_attempts + 1)
                 _checkpoint(f"loop#{self.loop_count} ensure_connected -> {ok}")
                 if not ok:
                     self._reconnect_attempts += 1
@@ -968,11 +962,7 @@ class GoldScalperLive:
                     "Account data unavailable (attempt 1) — "
                     "reconnecting and retrying before declaring DISCONNECTED …"
                 )
-                await ensure_connected(
-                    METAAPI_TOKEN,
-                    METAAPI_ACCOUNT_ID,
-                    SYNC_TIMEOUT,
-                )
+                await ensure_connected()
                 acc_info = await get_account_info()
             if not acc_info or "balance" not in acc_info or "equity" not in acc_info:
                 self._set_trade_permission(
