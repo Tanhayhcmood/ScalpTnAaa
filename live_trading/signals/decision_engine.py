@@ -89,20 +89,26 @@ def _allow_without_smc_for_quality(
 def _range_confirmation_gate(
     entry_filter: EntryFilterResult,
     min_confirmations: int,
+    price_action_standalone: bool = False,
 ) -> tuple[bool, str]:
     """Apply the RANGE confirmation floor without changing vote semantics.
 
     RANGE keeps its separate edge, fresh sweep, reversal, R:R, and session
     limits. Its signal vote still follows the same equal-weight N-of-4
-    consensus as ordinary entries, but the dedicated range playbook still
-    applies the configured confirmation floor; all other RANGE safeguards
+    consensus as ordinary entries. An explicit standalone Price Action policy
+    may reduce this floor to one aligned PA vote; all other RANGE safeguards
     remain mandatory.
     """
-    if entry_filter.confirmation_count < min_confirmations:
+    effective_min_confirmations = (
+        1
+        if price_action_standalone and entry_filter.price_action
+        else min_confirmations
+    )
+    if entry_filter.confirmation_count < effective_min_confirmations:
         return (
             False,
             f"RANGE entry blocked: {entry_filter.confirmation_count}/"
-            f"{min_confirmations} confirmations",
+            f"{effective_min_confirmations} confirmations",
         )
     return True, ""
 
@@ -287,7 +293,9 @@ def run_decision_engine(
     # entry.
     if is_range_regime:
         range_votes_ok, range_votes_reason = _range_confirmation_gate(
-            ef, range_min_confirmations
+            ef,
+            range_min_confirmations,
+            price_action_standalone=price_action_standalone,
         )
         if not range_votes_ok:
             return _make_neutral(
@@ -346,7 +354,11 @@ def run_decision_engine(
             smc=smc,
             pa=pa,
             confirmation_count=ef.confirmation_count,
-            min_confirmations=range_min_confirmations,
+            min_confirmations=(
+                1
+                if price_action_standalone and ef.price_action
+                else range_min_confirmations
+            ),
             edge_atr_distance=range_edge_atr_distance,
             strict_filters=range_entry_filters_enabled,
         )

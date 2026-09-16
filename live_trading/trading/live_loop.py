@@ -1266,19 +1266,27 @@ class GoldScalperLive:
             return
 
         # Final defense-in-depth check for RANGE.  The structural RANGE
-        # filters may be disabled for telemetry-only operation, but the
-        # minimum confirmation floor is never optional.  Keep this immediately
-        # before the remaining entry gates so an inconsistent decision object
-        # cannot reach the order executor.
+        # filters may be disabled for telemetry-only operation.  An explicit
+        # standalone Price Action policy may lower only the confirmation floor
+        # to one aligned PA vote; all other entry gates remain mandatory.
+        _range_confirmation_floor = (
+            1
+            if (
+                PRICE_ACTION_STANDALONE
+                and decision.entry_filter is not None
+                and decision.entry_filter.price_action
+            )
+            else RANGE_MIN_CONFIRMATIONS
+        )
         if (
             decision.regime == "RANGE"
             and decision.entry_filter is not None
-            and decision.entry_filter.confirmation_count < RANGE_MIN_CONFIRMATIONS
+            and decision.entry_filter.confirmation_count < _range_confirmation_floor
         ):
             _range_confirmation_reason = (
                 f"RANGE entry blocked: "
                 f"{decision.entry_filter.confirmation_count}/"
-                f"{RANGE_MIN_CONFIRMATIONS} confirmations"
+                f"{_range_confirmation_floor} confirmations"
             )
             self._set_trade_permission(
                 False,

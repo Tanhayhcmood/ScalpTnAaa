@@ -76,9 +76,9 @@ services:
       # reversal, and at least two aligned strategy confirmations.
       - key: RANGE_ENTRY_FILTERS_ENABLED
         value: "true"
-      # A single Price Action vote cannot bypass the two-confirmation floor.
+      # A directional Price Action signal may authorize an entry by itself.
       - key: PRICE_ACTION_STANDALONE
-        value: "false"
+        value: "true"
       - key: MAX_RANGE_TRADES_PER_SESSION
         value: "2"
       - key: MAX_OPEN_TRADES

@@ -55,5 +55,19 @@ def test_range_rejects_one_confirmation_when_two_are_required():
     assert "1/2 confirmations" in reason
 
 
+def test_standalone_price_action_can_satisfy_two_vote_range_floor():
+    result = EntryFilterResult(
+        allowed=True, direction="BUY", confirmation_count=1,
+        smc=False, trend=False, price_action=True, wyckoff=False,
+    )
+    allowed, reason = _range_confirmation_gate(
+        result,
+        2,
+        price_action_standalone=True,
+    )
+    assert allowed is True
+    assert reason == ""
+
+
 def test_non_range_regime_keeps_global_confirmation_setting():
     assert _effective_min_confirmations(2, "WEAK_TREND_BULL", False) == 2
