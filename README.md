@@ -150,6 +150,7 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 |----------|----------|-------------|
 | `MT5_HOST` / `MT5_PORT` | **YES** | Broker server name and port |
 | `MT5_USER` / `MT5_PASSWORD` | **YES (secret)** | Broker login used by the MT5 terminal inside the container |
+| `UserKey` | **YES (secret)** | Fixed 14-day trial key from `https://users.mtapi.io`; set it manually in Render and do not regenerate it |
 
 ---
 

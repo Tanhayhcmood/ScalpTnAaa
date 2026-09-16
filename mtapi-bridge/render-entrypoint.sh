@@ -62,6 +62,15 @@
 #   skipped entirely so local development and non-Render deployments are
 #   unaffected.
 
+# mt5rest can fall back to a generated trial identity when its license key is
+# absent. That identity is not stable across container restarts and causes
+# `UserKey not found` at trial.mtapi.io. Require the operator-provided static
+# key instead of allowing that fallback.
+if [ -z "${UserKey:-}" ]; then
+    echo "[render-entrypoint] ERROR: UserKey is required; set the fixed trial key from users.mtapi.io in Render." >&2
+    exit 78
+fi
+
 _PORT="${PORT:-80}"
 _SELF_KEEPALIVE_INTERVAL=480  # 8 minutes — well under Render's 15-min threshold
 # Minimum seconds a child must run for code=0 to be treated as intentional shutdown.

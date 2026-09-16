@@ -30,6 +30,8 @@ services:
         sync: false
       - key: MT5_PASSWORD
         sync: false
+      # Static 14-day trial key from users.mtapi.io. Render prompts for this
+      # once and preserves it; the container refuses to generate a replacement.
       - key: UserKey
         sync: false
 

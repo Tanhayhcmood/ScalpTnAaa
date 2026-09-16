@@ -32,7 +32,9 @@ RUN apt-get update -qq \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Stage 2: final mt5rest image with Render PORT proxy ───────────────────────
-FROM timurila/mt5rest:26.09.03-07.19
+# Verified working Docker Hub tag. Pin the immutable digest so a future
+# `latest` update cannot change the bridge underneath a running deployment.
+FROM timurila/mt5rest:26.09.10-15.08@sha256:e0129efc592c845f16b57900e427ed0144079485f33e9eaf2892a59b63fb1612
 
 # mt5rest/.NET watches its JSON configuration files for reloads. Render's
 # shared container limit can exhaust inotify instances during Wine/.NET
