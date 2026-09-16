@@ -1490,17 +1490,17 @@ class GoldScalperLive:
             return
 
         if result.success:
-              if (
-                  decision.regime == "RANGE"
-                  and not RANGE_REQUIRE_EDGE_POSITION
-                  and decision.entry_filter is not None
-              ):
-                  log.info(
-                      "RANGE mode trade allowed "
-                      f"(relaxed: confirmations={decision.entry_filter.confirmation_count}, "
-                      "edge_check=disabled)"
-                  )
-              self._set_trade_permission(
+            if (
+                decision.regime == "RANGE"
+                and not RANGE_REQUIRE_EDGE_POSITION
+                and decision.entry_filter is not None
+            ):
+                log.info(
+                    "RANGE mode trade allowed "
+                    f"(relaxed: confirmations={decision.entry_filter.confirmation_count}, "
+                    "edge_check=disabled)"
+                )
+            self._set_trade_permission(
                 True,
                 "ORDER_PLACED",
                 ["Order accepted by MetaAPI"],
