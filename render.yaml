@@ -103,7 +103,7 @@ services:
       # be at resistance, with a fresh same-direction sweep, a closed-candle
       # reversal, and at least two aligned strategy confirmations.
       - key: RANGE_ENTRY_FILTERS_ENABLED
-        value: "false"
+        value: "true"
       # A single Price Action vote cannot bypass the two-confirmation floor.
       - key: PRICE_ACTION_STANDALONE
         value: "false"
@@ -137,7 +137,7 @@ services:
       - key: TRADE_TIMEFRAMES
         value: "M20,M15,M10,1m"
       - key: QUALITY_ADX_MIN
-        value: "10"
+        value: "12"
       - key: BAR_CHECK_INTERVAL
         value: "10"
       # MTF/H1 is intentionally disabled for the standalone Price Action

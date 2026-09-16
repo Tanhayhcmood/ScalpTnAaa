@@ -74,6 +74,11 @@ class TestConfigDefaults:
         assert cfg.RANGE_MIN_CONFIRMATIONS == 2
         assert isinstance(cfg.RANGE_MIN_CONFIRMATIONS, int)
 
+    def test_quality_adx_min_default_is_balanced(self):
+        cfg = _reload_config({})
+        assert cfg.QUALITY_ADX_MIN == 12.0
+        assert isinstance(cfg.QUALITY_ADX_MIN, float)
+
     def test_price_action_standalone_is_disabled_by_default(self):
         cfg = _reload_config({})
         assert cfg.PRICE_ACTION_STANDALONE is False

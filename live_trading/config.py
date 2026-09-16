@@ -184,9 +184,8 @@ RANGE_MIN_CONFIRMATIONS = _int("RANGE_MIN_CONFIRMATIONS", 2, lo=1, hi=4)
 RANGE_MIN_RR = _float("RANGE_MIN_RR", 1.5, lo=1.0, hi=10.0)
 RANGE_EDGE_ATR_DISTANCE = _float("RANGE_EDGE_ATR_DISTANCE", 0.25, lo=0.05, hi=2.0)
 RANGE_RISK_PERCENT = _float("RANGE_RISK_PERCENT", 0.5, lo=0.01, hi=10.0)
-# When false, the RANGE regime remains eligible but its Option 2-specific
-# confirmations (Wyckoff/PA/edge/sweep/reversal) are informational only.
-# Core signal, confidence, sizing, stop, position, and risk gates remain active.
+# When false, only the optional structural RANGE checks are relaxed. The
+# minimum confirmation floor remains mandatory in all cases.
 RANGE_ENTRY_FILTERS_ENABLED = os.getenv(
     "RANGE_ENTRY_FILTERS_ENABLED", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -213,11 +212,9 @@ REQUIRE_SMC_PRICE_ACTION_WYCKOFF = os.getenv(
 # for controlled testing while the MTF, R:R, quality, broker, and risk gates
 # remain active.
 CONF_HARD_MIN     = _float("CONF_HARD_MIN",      40.0, lo=0.0, hi=100.0)
-# QUALITY_ADX_MIN: minimum ADX value required to confirm trend momentum.
-# Below this threshold the quality filter rejects the signal as "low momentum".
-# 10 is a softer floor for M5 gold. It allows developing moves while the
-# confidence, structure, MTF, R:R, broker, and risk gates remain active.
-QUALITY_ADX_MIN   = _float("QUALITY_ADX_MIN",    10.0, lo=5.0,  hi=40.0)
+# QUALITY_ADX_MIN: minimum ADX value required to confirm usable momentum.
+# 12 blocks very weak/choppy entries without requiring a fully developed trend.
+QUALITY_ADX_MIN   = _float("QUALITY_ADX_MIN",    12.0, lo=5.0,  hi=40.0)
 # Maximum age of the structure event that can authorize a new entry.
 # 300 bars on M5 is roughly 25 hours and is too permissive for scalping;
 # the default 24 closed bars keeps BOS/CHoCH actionable for about two hours.

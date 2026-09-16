@@ -194,7 +194,7 @@ def apply_quality_filter(
     if late:
         reasons.append("Late entry: price over-extended from EMA50 or BOS/CHoCH is stale")
 
-    # ADX momentum check — configurable via QUALITY_ADX_MIN env var (default 15).
+    # ADX momentum check — configurable via QUALITY_ADX_MIN env var (default 12).
     # Set higher (e.g. 20) for stricter momentum confirmation,
     # set lower (e.g. 10) to allow weaker-trend entries.
     low_mom = adx_val < QUALITY_ADX_MIN
