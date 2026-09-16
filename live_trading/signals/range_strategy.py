@@ -80,8 +80,9 @@ def evaluate_range_entry(
     breakout candle cannot move the boundary and accidentally qualify itself.
     When ``strict_filters`` is false, the range context is still calculated
     for telemetry and capital sizing, but Option 2's edge/sweep/reversal
-    gates are not entry blockers. The minimum confirmation floor is always
-    enforced.
+    gates are not entry blockers. When require_edge_position is false, only
+    the edge-position check is bypassed; sweep/reversal behavior still follows
+    strict_filters. The minimum confirmation floor is always enforced.
     """
     neutral = RangeContext(
         valid=False,
@@ -123,45 +124,37 @@ def evaluate_range_entry(
     reversal = _reversal_candle(pa, direction)
     correct_edge = location == ("SUPPORT" if direction == "BUY" else "RESISTANCE")
     if confirmation_count < min_confirmations:
-        valid = False
-        reason = (
-            f"RANGE entry blocked: {confirmation_count}/{min_confirmations} "
-            "confirmations"
-        )
-    elif not strict_filters:
-        valid = True
-        reason = (
-            f"RANGE {direction} accepted: strict Option 2 filters disabled "
-            "(edge/sweep/reversal telemetry retained)"
-        )
-    else:
-        valid = (
-            correct_edge
-            and sweep
-            and reversal
-            and confirmation_count >= min_confirmations
-        )
-
-        if not correct_edge:
-            reason = (
-                f"RANGE entry blocked: price is in the {location.lower()}, "
-                f"not at the {('support' if direction == 'BUY' else 'resistance')} edge"
-            )
-        elif not sweep:
-            reason = "RANGE entry blocked: no fresh same-direction Liquidity Sweep"
-        elif not reversal:
-            reason = "RANGE entry blocked: no closed-candle reversal pattern"
-        elif confirmation_count < min_confirmations:
-            reason = (
-                f"RANGE entry blocked: {confirmation_count}/{min_confirmations} "
-                "confirmations"
-            )
-        else:
-            reason = (
-                f"RANGE {direction} accepted: edge + Liquidity Sweep + reversal "
-                f"+ {confirmation_count} confirmations"
-            )
-
+          valid = False
+          reason = (
+              f"RANGE entry blocked: {confirmation_count}/{min_confirmations} "
+              "confirmations"
+          )
+      elif not strict_filters:
+          valid = True
+          reason = (
+              f"RANGE {direction} accepted: strict Option 2 filters disabled "
+              "(edge/sweep/reversal telemetry retained)"
+          )
+      elif require_edge_position and not correct_edge:
+          valid = False
+          reason = (
+              f"RANGE entry blocked: price is in the {location.lower()}, "
+              f"not at the {('support' if direction == 'BUY' else 'resistance')} edge"
+          )
+      elif not sweep:
+          valid = False
+          reason = "RANGE entry blocked: no fresh same-direction Liquidity Sweep"
+      elif not reversal:
+          valid = False
+          reason = "RANGE entry blocked: no closed-candle reversal pattern"
+      else:
+          valid = True
+          edge_status = "edge" if require_edge_position else "edge check disabled"
+          reason = (
+              f"RANGE {direction} accepted: {edge_status} + "
+              f"Liquidity Sweep + reversal + {confirmation_count} confirmations"
+          )
+    
     return RangeContext(
         valid=valid,
         direction=direction if valid else "NEUTRAL",  # type: ignore[arg-type]
