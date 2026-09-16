@@ -45,5 +45,15 @@ def test_range_rejects_zero_confirmations():
     assert "0/1 confirmations" in reason
 
 
+def test_range_rejects_one_confirmation_when_two_are_required():
+    result = EntryFilterResult(
+        allowed=False, direction="NEUTRAL", confirmation_count=1,
+        smc=True, trend=False, price_action=False, wyckoff=False,
+    )
+    allowed, reason = _range_confirmation_gate(result, 2)
+    assert not allowed
+    assert "1/2 confirmations" in reason
+
+
 def test_non_range_regime_keeps_global_confirmation_setting():
     assert _effective_min_confirmations(2, "WEAK_TREND_BULL", False) == 2

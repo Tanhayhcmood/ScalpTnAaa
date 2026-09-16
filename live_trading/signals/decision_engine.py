@@ -281,7 +281,11 @@ def run_decision_engine(
         ),
         price_action_standalone=price_action_standalone,
     )
-    if is_range_regime and range_entry_filters_enabled:
+    # The RANGE confirmation floor is mandatory even when the optional
+    # structural filters (edge, sweep, reversal) are disabled.  Those filters
+    # may be informational, but a single strategy vote must never authorize an
+    # entry.
+    if is_range_regime:
         range_votes_ok, range_votes_reason = _range_confirmation_gate(
             ef, range_min_confirmations
         )

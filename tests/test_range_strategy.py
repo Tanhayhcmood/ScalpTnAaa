@@ -75,7 +75,7 @@ def _candles() -> list[OHLCV]:
     ]
 
 
-def test_range_buy_requires_edge_sweep_reversal_and_one_confirmation():
+def test_range_buy_requires_edge_sweep_reversal_and_one_confirmation_when_configured():
     result = evaluate_range_entry(
         _candles(), "BUY", _smc("BUY", 20), _pa(True), 1, 1
     )
@@ -85,7 +85,7 @@ def test_range_buy_requires_edge_sweep_reversal_and_one_confirmation():
     assert result.reversal_candle
 
 
-def test_range_buy_accepts_one_confirmation_when_other_range_gates_pass():
+def test_relaxed_range_filters_still_require_two_confirmations():
     result = evaluate_range_entry(
         _candles(), "BUY", _smc("BUY", 20), _pa(True), 1, 1
     )
@@ -137,6 +137,6 @@ def test_relaxed_range_filters_keep_context_without_blocking():
         min_confirmations=2,
         strict_filters=False,
     )
-    assert result.valid
+    assert not result.valid
     assert result.location == "MIDDLE"
-    assert "strict Option 2 filters disabled" in result.reason
+    assert "1/2 confirmations" in result.reason

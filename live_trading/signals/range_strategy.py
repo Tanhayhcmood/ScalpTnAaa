@@ -79,8 +79,9 @@ def evaluate_range_entry(
     The range is measured from the candles before the signal candle so a
     breakout candle cannot move the boundary and accidentally qualify itself.
     When ``strict_filters`` is false, the range context is still calculated
-    for telemetry and capital sizing, but Option 2's edge/sweep/reversal and
-    confirmation gates are not entry blockers.
+    for telemetry and capital sizing, but Option 2's edge/sweep/reversal
+    gates are not entry blockers. The minimum confirmation floor is always
+    enforced.
     """
     neutral = RangeContext(
         valid=False,
@@ -121,11 +122,17 @@ def evaluate_range_entry(
     sweep = _latest_sweep(smc, direction, len(candles) - 1)
     reversal = _reversal_candle(pa, direction)
     correct_edge = location == ("SUPPORT" if direction == "BUY" else "RESISTANCE")
-    if not strict_filters:
+    if confirmation_count < min_confirmations:
+        valid = False
+        reason = (
+            f"RANGE entry blocked: {confirmation_count}/{min_confirmations} "
+            "confirmations"
+        )
+    elif not strict_filters:
         valid = True
         reason = (
             f"RANGE {direction} accepted: strict Option 2 filters disabled "
-            "(edge/sweep/reversal/confirmation telemetry retained)"
+            "(edge/sweep/reversal telemetry retained)"
         )
     else:
         valid = (

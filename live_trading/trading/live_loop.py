@@ -1266,6 +1266,36 @@ class GoldScalperLive:
             )
             return
 
+        # Final defense-in-depth check for RANGE.  The structural RANGE
+        # filters may be disabled for telemetry-only operation, but the
+        # minimum confirmation floor is never optional.  Keep this immediately
+        # before the remaining entry gates so an inconsistent decision object
+        # cannot reach the order executor.
+        if (
+            decision.regime == "RANGE"
+            and decision.entry_filter is not None
+            and decision.entry_filter.confirmation_count < RANGE_MIN_CONFIRMATIONS
+        ):
+            _range_confirmation_reason = (
+                f"RANGE entry blocked: "
+                f"{decision.entry_filter.confirmation_count}/"
+                f"{RANGE_MIN_CONFIRMATIONS} confirmations"
+            )
+            self._set_trade_permission(
+                False,
+                "RANGE_CONFIRMATIONS_BLOCKED",
+                [_range_confirmation_reason],
+            )
+            log.error(
+                "Order blocked by final RANGE confirmation safety check: "
+                f"{_range_confirmation_reason}"
+            )
+            self._write_state(
+                "SCANNING", acc_info, decision, pos,
+                extra=self._guardian_extra(gs),
+            )
+            return
+
         candidate_strategy_slots = strategy_slots_for_decision(decision)
         slots_available, slot_reason = available_for_strategy_slots(
             pos_dicts,
