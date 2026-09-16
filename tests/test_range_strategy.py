@@ -112,24 +112,23 @@ def test_range_blocks_middle_of_range_even_with_confirmations():
 
 
 def test_range_edge_check_is_disabled_by_default():
-      candles = _candles()
-      candles[-1] = OHLCV(
-          time=candles[-1].time,
-          open=105.0,
-          high=106.0,
-          low=104.0,
-          close=105.5,
-          volume=100.0,
-      )
-      result = evaluate_range_entry(
-          candles, "BUY", _smc("BUY", 20), _pa(True), 1, 1
-      )
-      assert result.valid
-      assert result.location == "MIDDLE"
-      assert "edge check disabled" in result.reason
+    candles = _candles()
+    candles[-1] = OHLCV(
+        time=candles[-1].time,
+        open=105.0,
+        high=106.0,
+        low=104.0,
+        close=105.5,
+        volume=100.0,
+    )
+    result = evaluate_range_entry(
+        candles, "BUY", _smc("BUY", 20), _pa(True), 1, 1
+    )
+    assert result.valid
+    assert result.location == "MIDDLE"
+    assert "edge check disabled" in result.reason
 
-
-    def test_range_blocks_stale_liquidity_sweep():
+def test_range_blocks_stale_liquidity_sweep():
     result = evaluate_range_entry(
         _candles(), "BUY", _smc("BUY", 10), _pa(True), 2, 2
     )
