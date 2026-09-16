@@ -26,9 +26,9 @@ services:
       # service is renamed, a stale value makes the free-tier keepalive ping a
       # different service and the robot can be suspended for inactivity.
       - key: MTAPI_URL
-        value: "https://mt5.mtapi.io"
+        value: "https://goldscalper-mtapi-c3a1.onrender.com"
       - key: MT5_HOST
-        value: "52.18.32.194"
+        value: "AMarkets-Demo"
       - key: MT5_PORT
         value: "443"
       - key: MT5_USER

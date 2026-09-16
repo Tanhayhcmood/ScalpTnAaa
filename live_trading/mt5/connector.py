@@ -1,18 +1,18 @@
 """
 MTAPI MT5 REST Connector – GoldScalperPro v4
 
-Connects directly to the official MTAPI hosted REST API.  The token returned
-by ``/Connect`` is held in memory and passed as ``id`` to every later request.
+Connects directly to the MTAPI REST API. The token returned by ``/ConnectEx``
+is held in memory and passed as ``id`` to every later request.
 
 Required env vars:
     MTAPI_URL     – normally https://mt5.mtapi.io
-    MT5_HOST      – broker host/IP accepted by MTAPI
+    MT5_HOST      – broker server name accepted by MTAPI
     MT5_PORT      – broker port, normally 443
     MT5_USER      – MT5 account login number
     MT5_PASSWORD  – MT5 account password
 
 MTAPI endpoints used:
-    GET  /Connect          – authenticate with broker, returns session token
+    GET  /ConnectEx        – authenticate with broker server name, returns session token
     GET  /Disconnect       – close connection
     GET  /ConnectionStatus – check live connection
     GET  /AccountSummary   – balance, equity, margin
@@ -75,12 +75,18 @@ def _connect_params(
     host: str,
     port: int = 443,
 ) -> dict[str, object]:
-    """Build query parameters for the official MTAPI ``/Connect`` endpoint."""
+    """Build query parameters for MTAPI's server-name ``/ConnectEx`` endpoint.
+
+    The host/IP ``/Connect`` path has been returning a disposed-socket error
+    immediately after sending the login. ``/ConnectEx`` keeps the broker server
+    name and lets MTAPI resolve the correct cluster member.
+    """
     return {
         "user": user,
         "password": password,
-        "host": host,
-        "port": port,
+        "server": host,
+        "connectTimeoutClusterMemberSeconds": 30,
+        "connectToNearestByPing": "true",
         "connectTimeoutSeconds": 60,
         "errorReplyStatusCode": 400,
     }
@@ -216,8 +222,14 @@ async def _wait_for_broker_ready(
         delay = min(delay * 1.5, _CONNECT_READY_POLL_MAX_S)
 
 
-async def connect(*args, **kwargs) -> bool:
-    """Connect directly to MT5 through mt5.mtapi.io using GET /Connect."""
+async def _connect_unlocked() -> bool:
+    """Perform one MTAPI connection attempt.
+
+    Callers must use ``connect()`` rather than invoking this helper directly.
+    Keeping the HTTP handshake under the reconnect lock prevents a watchdog,
+    retry loop, or manual reconnect from replacing the same broker session
+    concurrently.
+    """
     global _connected, _base_url, _conn_id, _last_connect_time
 
     base = MTAPI_URL.rstrip("/") if MTAPI_URL else ""
@@ -225,10 +237,10 @@ async def connect(*args, **kwargs) -> bool:
     user = MT5_USER.strip() if MT5_USER else ""
     password = MT5_PASSWORD.strip() if MT5_PASSWORD else ""
     if not base:
-        log.error("MTAPI_URL is not set. Set it to https://mt5.mtapi.io.")
+        log.error("MTAPI_URL is not set. Set it to the MTAPI REST base URL.")
         return False
     if not user or not password or not host:
-        log.error("MT5_USER, MT5_PASSWORD, and MT5_HOST must be set for MTAPI /Connect.")
+        log.error("MT5_USER, MT5_PASSWORD, and MT5_HOST must be set for MTAPI /ConnectEx.")
         return False
 
     previous_conn_id = _conn_id
@@ -237,23 +249,28 @@ async def connect(*args, **kwargs) -> bool:
     sess = _get_session()
     try:
         log.info(
-            f"MTAPI connection attempt: {base}/Connect "
+            "MTAPI /ConnectEx request prepared: "
+            f"account={user[:3]}*** host={host} port={MT5_PORT} "
+            f"password_configured={bool(password)} (value redacted)"
+        )
+        log.info(
+            f"MTAPI connection attempt: {base}/ConnectEx "
             f"(host={host}, port={MT5_PORT}, account={user[:3]}***)"
         )
         async with sess.get(
-            f"{base}/Connect",
+            f"{base}/ConnectEx",
             params=_connect_params(user, password, host, MT5_PORT),
             timeout=aiohttp.ClientTimeout(total=SYNC_TIMEOUT),
         ) as resp:
             raw = await resp.text()
-            log.debug(f"MTAPI /Connect response ({resp.status}): [response received]")
+            log.debug(f"MTAPI /ConnectEx response ({resp.status}): [response received]")
             if resp.status != 200:
-                log.error(f"MTAPI /Connect failed (status={resp.status}): {raw[:300]}")
+                log.error(f"MTAPI /ConnectEx failed (status={resp.status}): {raw[:300]}")
                 _connected = False
                 return False
             conn_id = raw.strip().strip('"')
             if not conn_id or len(conn_id) < 10:
-                log.error(f"MTAPI /Connect returned an unexpected token: {raw[:200]}")
+                log.error(f"MTAPI /ConnectEx returned an unexpected token: {raw[:200]}")
                 _connected = False
                 return False
             if not await _wait_for_broker_ready(base, conn_id):
@@ -293,28 +310,43 @@ async def connect(*args, **kwargs) -> bool:
         return False
 
 
+async def connect(*args, **kwargs) -> bool:
+    """Connect through MTAPI with one serialized broker handshake."""
+    lock = _get_reconnect_lock()
+    async with lock:
+        if (
+            _connected
+            and _conn_id
+            and _time.monotonic() - _last_connect_time < _CONNECT_GRACE_PERIOD
+        ):
+            return True
+        return await _connect_unlocked()
+
+
 async def disconnect() -> None:
     """Close the MTAPI connection and release the HTTP session."""
     global _connected, _session, _conn_id, _base_url
-    conn_id, base_url, session = _conn_id, _base_url, _session
-    _connected, _conn_id, _base_url = False, "", ""
-    if conn_id and base_url and session and not session.closed:
-        try:
-            async with session.get(
-                f"{base_url}/Disconnect",
-                params={"id": conn_id},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as response:
-                if response.status >= 400:
-                    log.warning(f"MT5 disconnect request returned HTTP {response.status}")
-        except Exception as exc:
-            log.warning(f"MT5 disconnect request failed: {exc}")
-    if session and not session.closed:
-        try:
-            await session.close()
-        except Exception as exc:
-            log.warning(f"MT5 HTTP session close failed: {exc}")
-    _session = None
+    lock = _get_reconnect_lock()
+    async with lock:
+        conn_id, base_url, session = _conn_id, _base_url, _session
+        _connected, _conn_id, _base_url = False, "", ""
+        if conn_id and base_url and session and not session.closed:
+            try:
+                async with session.get(
+                    f"{base_url}/Disconnect",
+                    params={"id": conn_id},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as response:
+                    if response.status >= 400:
+                        log.warning(f"MT5 disconnect request returned HTTP {response.status}")
+            except Exception as exc:
+                log.warning(f"MT5 disconnect request failed: {exc}")
+        if session and not session.closed:
+            try:
+                await session.close()
+            except Exception as exc:
+                log.warning(f"MT5 HTTP session close failed: {exc}")
+        _session = None
 
 
 async def keepalive_mtapi() -> bool:
@@ -398,14 +430,9 @@ async def ensure_connected(*args, **kwargs) -> bool:
         except Exception:
             pass
     _connected = False
-    lock = _get_reconnect_lock()
-    if lock.locked():
-        async with lock:
-            return _connected
-    async with lock:
-        if _connected and _time.monotonic() - _last_connect_time < _CONNECT_GRACE_PERIOD:
-            return True
-        return await connect_with_retry(max_attempts=3, retry_delay=30.0)
+    # connect() owns the lock and rechecks state after waiting for any other
+    # handshake to finish. Avoid holding the lock across retry sleeps.
+    return await connect_with_retry(max_attempts=3, retry_delay=30.0)
 
 
 async def start_connection_watchdog(interval_seconds: float = 30.0) -> None:

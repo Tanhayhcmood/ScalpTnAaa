@@ -605,6 +605,11 @@ async def _run_robot_once():
             "cannot start the MTAPI trading engine."
         )
 
+    print(
+        f"[config] MT5 password configured: {bool(MT5_PASSWORD)} "
+        "(value redacted)",
+        flush=True,
+    )
     _robot_status = "STARTING"
     global _current_engine
     engine = GoldScalperLive()

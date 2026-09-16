@@ -5,8 +5,8 @@ All settings are read from environment variables so they can be changed
 on Render without touching code.
 
 Required:
-    MTAPI_URL          – official MTAPI REST base URL
-    MT5_HOST           – broker host/IP accepted by MTAPI
+    MTAPI_URL          – MTAPI REST base URL
+    MT5_HOST           – broker server name accepted by MTAPI
     MT5_USER           – MT5 account login number
     MT5_PASSWORD       – MT5 account password
 """
@@ -133,9 +133,9 @@ def _timeframe(name: str, default: str) -> str:
     return val
 
 
-# ── Official MTAPI REST connection ────────────────────────────────────────────
-# /Connect returns an in-memory session token. No UserKey, API key, bridge,
-# MetaAPI account, or self-hosted MT5 service is used.
+# ── MTAPI REST connection ─────────────────────────────────────────────────────
+# /ConnectEx returns an in-memory session token using the broker server name.
+# No MetaAPI account or self-hosted MT5 terminal is required by the robot.
 MTAPI_URL      = os.getenv("MTAPI_URL", "https://mt5.mtapi.io").rstrip("/")
 MT5_HOST       = os.getenv("MT5_HOST", "AMarkets-Demo").strip()
 MT5_PORT      = _int("MT5_PORT", 443, lo=1, hi=65535)
