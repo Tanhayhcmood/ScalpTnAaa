@@ -1185,6 +1185,24 @@ class GoldScalperLive:
         # Compatibility telemetry for the panel; the adaptive trailing engine
         # reads the per-timeframe cache above.
         self._last_atr = self._last_atr_by_timeframe.get(tf, 0.0)
+        # Compute ATR in price units using a 5-bar average True Range.
+        # A single-candle TR makes the displayed ATR jump on every wick,
+        # misleading the panel operator.  Keep this snapshot value separate
+        # from the per-timeframe ATR cache used by adaptive trailing.
+        _snap_trs = [
+            max(
+                candles[i].high - candles[i].low,
+                abs(candles[i].high - candles[i - 1].close),
+                abs(candles[i].low - candles[i - 1].close),
+            )
+            for i in range(1, len(candles))
+        ]
+        _snap_win = min(5, len(_snap_trs))
+        _snap_atr = (
+            round(sum(_snap_trs[-_snap_win:]) / _snap_win, 4)
+            if _snap_trs
+            else 0.0
+        )
         # Build normalized account_info for the snapshot (snake_case keys to
         # match what telegram_panel's mt5_service expects).
         _snap_account_info = {
