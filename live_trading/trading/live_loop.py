@@ -45,8 +45,10 @@ from live_trading.config import (
     DAILY_LOSS_LIMIT_PCT, MAX_DRAWDOWN_PCT, SLIPPAGE_POINTS,
     STATE_FILE, GUARDIAN_STATE_FILE,
     HISTORY_LOOKBACK_DAYS, HISTORY_SYNC_INTERVAL,
-    TRAIL_ENABLED, TRAIL_ACTIVATION_R, TRAIL_STEP_R,
-    TRAIL_LOCK_BUFFER_R, TRAIL_ATR_GAP_MULT, TRAIL_MIN_STEP_PRICE,
+    TRAIL_ENABLED, TRAIL_ATR_PERIOD, TRAIL_NORMAL_MULTIPLIER,
+    TRAIL_TIGHT_MULTIPLIER, TRAIL_EXHAUSTION_CONFIRM_COUNT,
+    TRAIL_MOMENTUM_LOOKBACK, TRAIL_BODY_SHRINK_RATIO,
+    TRAIL_VOLUME_SHRINK_RATIO, TRAIL_MIN_STEP_PRICE,
     MTF_ENABLED, MTF_TIMEFRAME, MTF_CANDLE_WINDOW,
     MTF_OPPOSITION_THRESHOLD, MTF_DRY_RUN,
     TRADE_TIMEFRAMES,
@@ -54,9 +56,8 @@ from live_trading.config import (
 )
 from live_trading.logger import get_logger
 from live_trading.risk.guardian import RiskGuardian, GuardianStatus
-from live_trading.risk.trailing_stop import (
-    TrailingConfig, compute_staircase_sl, should_apply, r_multiple_of,
-    stage_for_r,
+from live_trading.risk.adaptive_trailing_stop import (
+    AdaptiveTrailingConfig, atr, compute_adaptive_trail, should_apply,
 )
 from live_trading.signals.decision_engine import run_decision_engine, DecisionResult, describe_strategy
 from live_trading.signals.mtf_filter import (
@@ -286,16 +287,19 @@ class GoldScalperLive:
         # "Connection Lost" alert — we retry once silently first.
         self._consecutive_acc_failures: int = 0
 
-        # ── Staircase Trailing Stop ──────────────────────────────────────────
+        # ── Adaptive ATR Trailing Stop ────────────────────────────────────────
         # Toggleable at runtime via the Telegram panel's "Auto Trail" switch
         # (routed through the update_risk command — see _process_commands).
         self.trailing_enabled: bool = TRAIL_ENABLED
-        self._trailing_cfg = TrailingConfig(
+        self._trailing_cfg = AdaptiveTrailingConfig(
             enabled=TRAIL_ENABLED,
-            activation_r=TRAIL_ACTIVATION_R,
-            step_r=TRAIL_STEP_R,
-            lock_buffer_r=TRAIL_LOCK_BUFFER_R,
-            atr_gap_mult=TRAIL_ATR_GAP_MULT,
+            atr_period=TRAIL_ATR_PERIOD,
+            normal_multiplier=TRAIL_NORMAL_MULTIPLIER,
+            tight_multiplier=TRAIL_TIGHT_MULTIPLIER,
+            exhaustion_confirm_count=TRAIL_EXHAUSTION_CONFIRM_COUNT,
+            momentum_lookback=TRAIL_MOMENTUM_LOOKBACK,
+            body_shrink_ratio=TRAIL_BODY_SHRINK_RATIO,
+            volume_shrink_ratio=TRAIL_VOLUME_SHRINK_RATIO,
             min_step_price=TRAIL_MIN_STEP_PRICE,
         )
         # Baseline for EACH currently open position, keyed by str(ticket id):
@@ -310,10 +314,13 @@ class GoldScalperLive:
         # every other open position's SL sat frozen at its entry level
         # forever, no matter how far price ran in its favour. Keying by
         # ticket lets every open position get its own independent staircase.
-        self._trail_baselines: dict = {}  # {str(ticket): {"id", "direction", "entry", "risk_distance"}}
+        self._trail_baselines: dict = {}  # includes the entry timeframe
         self._last_trailing_statuses: dict = {}  # {str(ticket): status-dict}, for panel telemetry
-        # Cached ATR (price units) from the last completed bar — reused by the
-        # trailing engine between bars so it doesn't need its own candle fetch.
+        # Cached closed candles per trade timeframe. The trailing engine runs
+        # between bars and must use the timeframe on which each position opened.
+        self._last_candles_by_timeframe: dict[str, list] = {}
+        self._last_atr_by_timeframe: dict[str, float] = {}
+        # Kept as a compatibility telemetry value for the panel.
         self._last_atr: float = 0.0
         self._trailing_sync_reason: str = "initial"
 
@@ -899,6 +906,11 @@ class GoldScalperLive:
         if len(candles) < 50:
             log.warning(f"Only {len(candles)} candles returned — skipping bar")
             return
+        # Keep the latest closed window for adaptive trailing on this exact
+        # trade timeframe. A single global ATR is incorrect when M1/M5/M15
+        # positions are open together.
+        self._last_candles_by_timeframe[tf] = list(candles)
+        self._last_atr_by_timeframe[tf] = atr(candles, TRAIL_ATR_PERIOD)
 
         # The bar detector and the signal fetch are separate broker requests.
         # A reconnect can make the detector see a fresh timestamp while the
@@ -1170,22 +1182,9 @@ class GoldScalperLive:
             "CANDLE_TELEMETRY %s",
             json.dumps(_strategy_telemetry, sort_keys=True, default=str),
         )
-        # Compute ATR in price units using a 5-bar average True Range.
-        # A single-candle TR (trs[-1]) makes the displayed ATR jump on every
-        # wick, misleading the panel operator.  Using the same 5-bar window
-        # as market_regime._calc_atr_values (fixed in Fix 1) keeps both
-        # values consistent.
-        _snap_trs = [
-            max(candles[i].high - candles[i].low,
-                abs(candles[i].high - candles[i - 1].close),
-                abs(candles[i].low  - candles[i - 1].close))
-            for i in range(1, len(candles))
-        ]
-        _snap_win = min(5, len(_snap_trs))
-        _snap_atr = round(sum(_snap_trs[-_snap_win:]) / _snap_win, 4) if _snap_trs else 0.0
-        # Cached for the staircase trailing engine, which runs between bars
-        # (every BAR_CHECK_INTERVAL) and has no candle fetch of its own.
-        self._last_atr = _snap_atr
+        # Compatibility telemetry for the panel; the adaptive trailing engine
+        # reads the per-timeframe cache above.
+        self._last_atr = self._last_atr_by_timeframe.get(tf, 0.0)
         # Build normalized account_info for the snapshot (snake_case keys to
         # match what telegram_panel's mt5_service expects).
         _snap_account_info = {
@@ -1585,6 +1584,7 @@ class GoldScalperLive:
                 "direction":     decision.direction,
                 "entry":         tp_params.entry_price,
                 "risk_distance": abs(tp_params.entry_price - tp_params.stop_loss),
+                "timeframe":     tf,
             }
             # Build a synthetic position so the Telegram panel reflects the
             # newly opened trade immediately rather than waiting up to 5 min
@@ -1754,21 +1754,16 @@ class GoldScalperLive:
 
             direction = str(baseline["direction"]).upper()
             current_price = quote["bid"] if direction == "BUY" else quote["ask"]
-            candidate_sl = compute_staircase_sl(
+            timeframe = str(baseline.get("timeframe") or TIMEFRAME)
+            candles = self._last_candles_by_timeframe.get(timeframe, [])
+            decision = compute_adaptive_trail(
                 direction=direction,
-                entry=baseline["entry"],
-                risk_distance=baseline["risk_distance"],
                 current_price=current_price,
-                atr=self._last_atr,
+                candles=candles,
                 cfg=self._trailing_cfg,
             )
-            r_now = r_multiple_of(
-                direction,
-                baseline["entry"],
-                baseline["risk_distance"],
-                current_price,
-            )
-            stage, threshold = stage_for_r(r_now, self._trailing_cfg)
+            candidate_sl = decision.candidate_sl
+            previous_status = self._last_trailing_statuses.get(pos_id, {})
             applicable = should_apply(
                 direction,
                 pos["sl"],
@@ -1777,28 +1772,63 @@ class GoldScalperLive:
             )
             action = "MODIFY" if applicable else "HOLD"
             reason_text = (
-                "stage reached"
+                "adaptive distance ready"
                 if candidate_sl is not None
-                else "threshold not reached"
+                else "insufficient ATR/candle data"
             )
             self._last_trailing_statuses[pos_id] = {
                 "active": candidate_sl is not None,
-                "stage": stage,
-                "threshold": threshold,
-                "r_multiple": r_now,
+                "mode": decision.mode,
+                "timeframe": timeframe,
+                "atr": decision.atr,
+                "multiplier": decision.multiplier,
+                "trail_distance": decision.distance,
+                "exhaustion_confirmations": list(decision.exhaustion.active),
                 "current_sl": pos["sl"],
                 "candidate_sl": candidate_sl,
                 "action": action,
                 "reason": reason_text,
                 "sync_reason": self._trailing_sync_reason,
             }
+            if (
+                previous_status.get("mode") == "NORMAL"
+                and decision.mode == "TIGHTENING"
+            ):
+                log.info(
+                    "Adaptive trailing switch: ticket=%s mode=NORMAL->TIGHTENING "
+                    "timeframe=%s indicators=%s new_distance=%.5f "
+                    "atr=%.5f multiplier=%.3f",
+                    pos_id,
+                    timeframe,
+                    ",".join(decision.exhaustion.active),
+                    decision.distance,
+                    decision.atr,
+                    decision.multiplier,
+                )
+            elif (
+                previous_status.get("mode") == "TIGHTENING"
+                and decision.mode == "NORMAL"
+            ):
+                log.info(
+                    "Adaptive trailing switch: ticket=%s mode=TIGHTENING->NORMAL "
+                    "timeframe=%s indicators=%s new_distance=%.5f "
+                    "atr=%.5f multiplier=%.3f",
+                    pos_id,
+                    timeframe,
+                    ",".join(decision.exhaustion.active) or "none",
+                    decision.distance,
+                    decision.atr,
+                    decision.multiplier,
+                )
             log.info(
-                "Trailing update: ticket=%s profit/R=%.3f threshold=%s "
-                "stage=%s reason=%s action=%s",
+                "Adaptive trailing update: ticket=%s mode=%s timeframe=%s "
+                "atr=%.5f distance=%.5f indicators=%s reason=%s action=%s",
                 pos_id,
-                r_now,
-                threshold,
-                stage,
+                decision.mode,
+                timeframe,
+                decision.atr,
+                decision.distance,
+                ",".join(decision.exhaustion.active) or "none",
                 reason_text,
                 action,
             )
@@ -1815,35 +1845,36 @@ class GoldScalperLive:
                 return
             if result.success:
                 self._last_trailing_statuses[pos_id].update(
-                    {"action": "MODIFIED", "reason": "stage lock advanced"}
+                    {"action": "MODIFIED", "reason": "adaptive stop advanced"}
                 )
                 log_trade(self.trade_history, {
                     "position_id": pos["id"],
                     "action": "TRAIL_SL",
                     "direction": direction,
-                    "r_multiple": r_now,
-                    "threshold": threshold,
-                    "stage": stage,
+                    "mode": decision.mode,
+                    "timeframe": timeframe,
+                    "atr": decision.atr,
+                    "multiplier": decision.multiplier,
+                    "trail_distance": decision.distance,
+                    "exhaustion_confirmations": list(decision.exhaustion.active),
                     "old_sl": pos["sl"],
                     "new_sl": candidate_sl,
                 })
                 log.info(
-                    "Trailing update: ticket=%s profit/R=%.3f threshold=%s "
-                    "reason=stage lock advanced action=MODIFIED",
+                    "Adaptive trailing update: ticket=%s mode=%s "
+                    "reason=stop advanced action=MODIFIED",
                     pos_id,
-                    r_now,
-                    threshold,
+                    decision.mode,
                 )
             else:
                 self._last_trailing_statuses[pos_id].update(
                     {"action": "ERROR", "reason": result.message}
                 )
                 log.warning(
-                    "Trailing update: ticket=%s profit/R=%.3f threshold=%s "
+                    "Adaptive trailing update: ticket=%s mode=%s "
                     "reason=modify failed: %s action=ERROR",
                     pos_id,
-                    r_now,
-                    threshold,
+                    decision.mode,
                     result.message,
                 )
 
