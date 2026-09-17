@@ -148,7 +148,7 @@ METAAPI_ACCOUNT_ID = ""
 
 # ── Symbol & Timeframe ───────────────────────────────────────────────────────
 SYMBOL        = os.getenv("SYMBOL", "XAUUSD")
-TIMEFRAME     = _timeframe("TIMEFRAME", "1m")
+TIMEFRAME     = _timeframe("TIMEFRAME", "5m")
 CANDLE_WINDOW = _int("CANDLE_WINDOW", 300, lo=50, hi=5000)
 
 # ── Risk & Trade Rules ───────────────────────────────────────────────────────
