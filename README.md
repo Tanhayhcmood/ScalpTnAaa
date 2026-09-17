@@ -106,8 +106,8 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `ROBOT_COMMAND_TOKEN` | **YES (secret)** | — | Shared secret for the panel→robot `/command` HTTP endpoint |
 | `REDIS_URL` | **YES (secret)** | — | Redis connection string (same instance as the panel, same region) |
 | `SYMBOL` | No | `XAUUSD` | Trading instrument (AMarkets reports gold as `XAUUSD`, not `XAUUSDb`) |
-| `TIMEFRAME` | No | `5m` | Primary trading timeframe |
-| `TRADE_TIMEFRAMES` | No | `M20,M15,M10,5m` | Multi-timeframe scan order, highest first |
+| `TIMEFRAME` | No | `5m` | Primary M5 detection/context timeframe |
+| `TRADE_TIMEFRAMES` | No | `1m` | M1 entry scan timeframe |
 | `CANDLE_WINDOW` | No | `300` | Bars fetched per candle request |
 | `RISK_PERCENT` | No | `1.0` | Risk per trade (% of balance) |
 | `MIN_CONFIRMATIONS` | No | `2` | Every ordinary entry requires two aligned engine confirmations |
