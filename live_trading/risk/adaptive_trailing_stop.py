@@ -6,7 +6,8 @@ and, optionally, volume.  The live loop owns persistence, logging, and broker
 modification requests.
 
 The trail uses ATR for its normal distance and switches to a smaller distance
-when at least ``exhaustion_confirm_count`` of these independent signals agree:
+only after the trade has earned enough favourable movement and at least two of
+these independent signals agree:
 
 * consecutive contraction of recent candle bodies,
 * momentum weakening through MACD histogram or directional RSI slope,
@@ -32,6 +33,8 @@ class AdaptiveTrailingConfig:
     body_shrink_ratio: float = 0.8
     volume_baseline_period: int = 10
     volume_shrink_ratio: float = 0.8
+    min_profit_atr_multiple: float = 1.5
+    min_tight_distance_atr: float = 1.0
     min_step_price: float = 0.05
 
 
@@ -55,6 +58,9 @@ class AdaptiveTrailDecision:
     distance: float
     candidate_sl: Optional[float]
     exhaustion: ExhaustionSignals
+    floating_profit_price: float
+    floating_profit_atr_multiple: float
+    tightening_eligible: bool
 
 
 def _read(candle: Any, name: str, default: float = 0.0) -> float:
@@ -217,15 +223,44 @@ def compute_adaptive_trail(
     current_price: float,
     candles: Sequence[Any],
     cfg: AdaptiveTrailingConfig,
+    entry_price: Optional[float] = None,
 ) -> AdaptiveTrailDecision:
     """Compute a ratchetable stop candidate from the latest closed candles."""
     current_atr = atr(candles, cfg.atr_period)
     exhaustion = detect_exhaustion(candles, direction, cfg)
-    enough_confirmation = exhaustion.active_count >= max(1, cfg.exhaustion_confirm_count)
-    mode = "TIGHTENING" if enough_confirmation else "NORMAL"
-    multiplier = cfg.tight_multiplier if enough_confirmation else cfg.normal_multiplier
-    distance = current_atr * multiplier
     is_buy = str(direction).upper() == "BUY"
+    floating_profit_price = 0.0
+    if entry_price is not None:
+        favorable_move = (
+            float(current_price) - float(entry_price)
+            if is_buy
+            else float(entry_price) - float(current_price)
+        )
+        floating_profit_price = round(max(0.0, favorable_move), 8)
+    floating_profit_atr_multiple = (
+        floating_profit_price / current_atr if current_atr > 0.0 else 0.0
+    )
+
+    # Tightening is intentionally never configurable below 2-of-3.  A single
+    # weakening momentum signal is not enough to pull the stop closer.
+    required_confirmations = max(2, min(3, int(cfg.exhaustion_confirm_count)))
+    enough_confirmation = exhaustion.active_count >= required_confirmations
+    enough_profit = (
+        current_atr > 0.0
+        and floating_profit_atr_multiple
+        >= max(0.0, float(cfg.min_profit_atr_multiple))
+    )
+    tightening_eligible = enough_confirmation and enough_profit
+    mode = "TIGHTENING" if tightening_eligible else "NORMAL"
+    raw_multiplier = cfg.tight_multiplier if tightening_eligible else cfg.normal_multiplier
+    # Keep an absolute ATR floor in tightening mode, even if a smaller
+    # tight_multiplier is configured.
+    multiplier = (
+        max(raw_multiplier, float(cfg.min_tight_distance_atr))
+        if tightening_eligible
+        else raw_multiplier
+    )
+    distance = current_atr * multiplier
     candidate = None
     if current_atr > 0.0 and distance > 0.0:
         candidate = round(current_price - distance if is_buy else current_price + distance, 8)
@@ -236,6 +271,9 @@ def compute_adaptive_trail(
         distance=round(distance, 8),
         candidate_sl=candidate,
         exhaustion=exhaustion,
+        floating_profit_price=floating_profit_price,
+        floating_profit_atr_multiple=round(floating_profit_atr_multiple, 8),
+        tightening_eligible=tightening_eligible,
     )
 
 

@@ -135,9 +135,11 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `TRAIL_ATR_PERIOD` | No | `14` | ATR period used by adaptive trailing on each trade timeframe |
 | `TRAIL_NORMAL_MULTIPLIER` | No | `2.0` | Normal trailing distance multiplier (`ATR × multiplier`) |
 | `TRAIL_TIGHT_MULTIPLIER` | No | `0.9` | Tightening multiplier after exhaustion confirmation |
-| `TRAIL_EXHAUSTION_CONFIRM_COUNT` | No | `2` | Number of exhaustion signal families required (1–3) |
+| `TRAIL_EXHAUSTION_CONFIRM_COUNT` | No | `2` | Number of exhaustion signal families required (2–3; tightening never uses fewer than 2) |
 | `TRAIL_MOMENTUM_LOOKBACK` | No | `3` | Bars used for MACD/RSI momentum slope |
 | `TRAIL_BODY_SHRINK_RATIO` / `TRAIL_VOLUME_SHRINK_RATIO` | No | `0.8` | Recent-to-baseline contraction threshold for candle bodies/volume |
+| `TRAIL_MIN_PROFIT_ATR` | No | `1.5` | Minimum favourable floating movement in ATR multiples before tightening |
+| `TRAIL_MIN_DISTANCE_ATR` | No | `1.0` | Absolute minimum stop distance in ATR multiples during tightening |
 | `TRAIL_MIN_STEP_PRICE` | No | `0.05` | Minimum favourable stop improvement before a broker modification |
 | `STATE_FILE` / `MT5_SNAPSHOT` / `COMMANDS_FILE` / `GUARDIAN_STATE_FILE` / `LOG_FILE` | No | `/tmp/...` | Local file paths — ephemeral, real cross-restart durability comes from Redis (see Architecture above) |
 

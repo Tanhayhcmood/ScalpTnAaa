@@ -48,7 +48,8 @@ from live_trading.config import (
     TRAIL_ENABLED, TRAIL_ATR_PERIOD, TRAIL_NORMAL_MULTIPLIER,
     TRAIL_TIGHT_MULTIPLIER, TRAIL_EXHAUSTION_CONFIRM_COUNT,
     TRAIL_MOMENTUM_LOOKBACK, TRAIL_BODY_SHRINK_RATIO,
-    TRAIL_VOLUME_SHRINK_RATIO, TRAIL_MIN_STEP_PRICE,
+    TRAIL_VOLUME_SHRINK_RATIO, TRAIL_MIN_PROFIT_ATR,
+    TRAIL_MIN_DISTANCE_ATR, TRAIL_MIN_STEP_PRICE,
     MTF_ENABLED, MTF_TIMEFRAME, MTF_CANDLE_WINDOW,
     MTF_OPPOSITION_THRESHOLD, MTF_DRY_RUN,
     TRADE_TIMEFRAMES,
@@ -300,6 +301,8 @@ class GoldScalperLive:
             momentum_lookback=TRAIL_MOMENTUM_LOOKBACK,
             body_shrink_ratio=TRAIL_BODY_SHRINK_RATIO,
             volume_shrink_ratio=TRAIL_VOLUME_SHRINK_RATIO,
+            min_profit_atr_multiple=TRAIL_MIN_PROFIT_ATR,
+            min_tight_distance_atr=TRAIL_MIN_DISTANCE_ATR,
             min_step_price=TRAIL_MIN_STEP_PRICE,
         )
         # Baseline for EACH currently open position, keyed by str(ticket id):
@@ -1761,6 +1764,7 @@ class GoldScalperLive:
                 current_price=current_price,
                 candles=candles,
                 cfg=self._trailing_cfg,
+                entry_price=baseline["entry"],
             )
             candidate_sl = decision.candidate_sl
             previous_status = self._last_trailing_statuses.get(pos_id, {})
@@ -1771,11 +1775,23 @@ class GoldScalperLive:
                 self._trailing_cfg.min_step_price,
             )
             action = "MODIFY" if applicable else "HOLD"
-            reason_text = (
-                "adaptive distance ready"
-                if candidate_sl is not None
-                else "insufficient ATR/candle data"
-            )
+            if candidate_sl is None:
+                reason_text = "insufficient ATR/candle data"
+            elif (
+                decision.mode == "NORMAL"
+                and decision.exhaustion.active_count
+                >= max(2, min(3, self._trailing_cfg.exhaustion_confirm_count))
+                and not decision.tightening_eligible
+            ):
+                reason_text = (
+                    "tightening waiting for profit %.2f ATR (current %.2f ATR)"
+                    % (
+                        self._trailing_cfg.min_profit_atr_multiple,
+                        decision.floating_profit_atr_multiple,
+                    )
+                )
+            else:
+                reason_text = "adaptive distance ready"
             self._last_trailing_statuses[pos_id] = {
                 "active": candidate_sl is not None,
                 "mode": decision.mode,
@@ -1784,6 +1800,9 @@ class GoldScalperLive:
                 "multiplier": decision.multiplier,
                 "trail_distance": decision.distance,
                 "exhaustion_confirmations": list(decision.exhaustion.active),
+                "floating_profit": pos.get("profit", 0.0),
+                "floating_profit_price": decision.floating_profit_price,
+                "floating_profit_atr": decision.floating_profit_atr_multiple,
                 "current_sl": pos["sl"],
                 "candidate_sl": candidate_sl,
                 "action": action,
@@ -1797,11 +1816,15 @@ class GoldScalperLive:
                 log.info(
                     "Adaptive trailing switch: ticket=%s mode=NORMAL->TIGHTENING "
                     "timeframe=%s indicators=%s new_distance=%.5f "
-                    "atr=%.5f multiplier=%.3f",
+                    "floating_profit=%.2f floating_profit_price=%.5f "
+                    "profit_atr=%.3f atr=%.5f multiplier=%.3f",
                     pos_id,
                     timeframe,
                     ",".join(decision.exhaustion.active),
                     decision.distance,
+                    pos.get("profit", 0.0),
+                    decision.floating_profit_price,
+                    decision.floating_profit_atr_multiple,
                     decision.atr,
                     decision.multiplier,
                 )
@@ -1822,10 +1845,15 @@ class GoldScalperLive:
                 )
             log.info(
                 "Adaptive trailing update: ticket=%s mode=%s timeframe=%s "
-                "atr=%.5f distance=%.5f indicators=%s reason=%s action=%s",
+                "floating_profit=%.2f floating_profit_price=%.5f "
+                "profit_atr=%.3f atr=%.5f distance=%.5f indicators=%s "
+                "reason=%s action=%s",
                 pos_id,
                 decision.mode,
                 timeframe,
+                pos.get("profit", 0.0),
+                decision.floating_profit_price,
+                decision.floating_profit_atr_multiple,
                 decision.atr,
                 decision.distance,
                 ",".join(decision.exhaustion.active) or "none",
