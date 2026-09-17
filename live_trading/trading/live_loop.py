@@ -2389,7 +2389,10 @@ class GoldScalperLive:
                         v = bool(payload["auto_trailing"])
                         self.trailing_enabled = v
                         self._trailing_cfg.enabled = v
-                        log.info(f"📐 Staircase trailing stop {'ENABLED' if v else 'DISABLED'} via Telegram")
+                        log.info(
+                            f"📐 Adaptive ATR trailing stop "
+                            f"{'ENABLED' if v else 'DISABLED'} via Telegram"
+                        )
                     log.info(f"🔧 Risk config updated via Telegram: {payload}")
                 except Exception as _upd_err:
                     log.warning(f"update_risk payload error: {_upd_err}")
@@ -2585,7 +2588,7 @@ class GoldScalperLive:
     # ── Trade history persistence (survives restarts) ─────────────────────────
 
     def _load_trailing_state(self) -> None:
-        """Restore immutable per-ticket R baselines from file or Redis."""
+        """Restore immutable per-ticket trailing baselines from file or Redis."""
         state = None
         try:
             from live_trading.redis_ipc import redis_read_state
