@@ -339,28 +339,27 @@ DAILY_LOSS_LIMIT_PCT = _float("DAILY_LOSS_LIMIT_PCT", 3.0,  lo=0.1, hi=100.0)
 MAX_DRAWDOWN_PCT     = _float("MAX_DRAWDOWN_PCT",      8.0,  lo=0.1, hi=50.0)
 SLIPPAGE_POINTS      = _int("SLIPPAGE_POINTS",         30,   lo=1,   hi=500)
 
-# ── Staircase Trailing Stop ───────────────────────────────────────────────────
-# The stop loss placed at trade entry never moved automatically before — a
-# trade could run deep into profit and still be stopped out at its original,
-# now far-too-generous level if price reversed. The staircase trailing engine
-# (live_trading/risk/trailing_stop.py) now ratchets the stop forward in
-# discrete steps, measured in multiples of the trade's own original risk (R),
-# as the trade advances — never backwards. All of it is env-configurable so
-# it can be tuned on Render without a code change.
+# ── Adaptive ATR Trailing Stop ─────────────────────────────────────────────────
+# Distance is ATR(period) * multiplier on the trade's timeframe. Once enough
+# independent exhaustion signals agree, the multiplier changes from normal to
+# tight mode. All values are environment-configurable on Render.
 TRAIL_ENABLED        = os.getenv("TRAIL_ENABLED", "true").lower() == "true"
-# R-multiple of profit required before the stop first moves off its entry level.
-TRAIL_ACTIVATION_R   = _float("TRAIL_ACTIVATION_R",   1.0,  lo=0.1, hi=10.0)
-# Size, in R-multiples, of each staircase step beyond activation.
-TRAIL_STEP_R         = _float("TRAIL_STEP_R",         0.5,  lo=0.05, hi=5.0)
-# Extra R-multiple locked in at every step so the stop locks real profit
-# (covers spread/slippage) instead of landing on exact break-even.
-TRAIL_LOCK_BUFFER_R  = _float("TRAIL_LOCK_BUFFER_R",  0.1,  lo=0.0, hi=2.0)
-# Safety floor: the stop is never placed closer to the live price than this
-# multiple of the current ATR, so a fast move can't ratchet the stop into
-# the middle of normal M5 noise.
-TRAIL_ATR_GAP_MULT   = _float("TRAIL_ATR_GAP_MULT",   0.5,  lo=0.0, hi=5.0)
-# Minimum price-unit improvement required before sending a modify request —
-# avoids spamming OrderModifySafe with no-op / sub-cent adjustments.
+TRAIL_ATR_PERIOD = _int("TRAIL_ATR_PERIOD", 14, lo=1, hi=100)
+TRAIL_NORMAL_MULTIPLIER = _float("TRAIL_NORMAL_MULTIPLIER", 2.0, lo=0.1, hi=5.0)
+TRAIL_TIGHT_MULTIPLIER = _float("TRAIL_TIGHT_MULTIPLIER", 0.9, lo=0.1, hi=3.0)
+TRAIL_EXHAUSTION_CONFIRM_COUNT = _int(
+    "TRAIL_EXHAUSTION_CONFIRM_COUNT", 2, lo=1, hi=3
+)
+TRAIL_MOMENTUM_LOOKBACK = _int("TRAIL_MOMENTUM_LOOKBACK", 3, lo=2, hi=20)
+TRAIL_BODY_SHRINK_RATIO = _float("TRAIL_BODY_SHRINK_RATIO", 0.8, lo=0.1, hi=1.0)
+TRAIL_VOLUME_SHRINK_RATIO = _float("TRAIL_VOLUME_SHRINK_RATIO", 0.8, lo=0.1, hi=1.0)
+if TRAIL_TIGHT_MULTIPLIER >= TRAIL_NORMAL_MULTIPLIER:
+    print(
+        "ERROR: TRAIL_TIGHT_MULTIPLIER must be smaller than "
+        "TRAIL_NORMAL_MULTIPLIER.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 TRAIL_MIN_STEP_PRICE = _float("TRAIL_MIN_STEP_PRICE", 0.05, lo=0.0, hi=100.0)
 
 # ── Wyckoff Calibration ──────────────────────────────────────────────────────
