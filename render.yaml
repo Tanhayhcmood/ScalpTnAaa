@@ -115,7 +115,7 @@ services:
       # TRADE_TIMEFRAMES / QUALITY_ADX_MIN are read by the live engine and
       # were set on the live service but missing from this manifest.
       - key: TRADE_TIMEFRAMES
-        value: "M20,M15,M10,M5,1m"
+        value: "1m"
       - key: QUALITY_ADX_MIN
         value: "12"
       - key: BAR_CHECK_INTERVAL

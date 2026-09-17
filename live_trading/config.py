@@ -290,7 +290,7 @@ OPTION_TWO_MIN_TIMEFRAMES = _int("OPTION_TWO_MIN_TIMEFRAMES", 2, lo=2, hi=10)
 # Recommended:  "M20,M15,M10,1m"  (4 TFs = ~2-4 entries/day per TF)
 # Conservative: "M15,1m"           (2 TFs = cleaner, fewer signals)
 # Aggressive:   "M20,M15,M10,1m"   (same as recommended)
-TRADE_TIMEFRAMES  = _trade_timeframes("TRADE_TIMEFRAMES", "M20,M15,M10,1m")
+TRADE_TIMEFRAMES  = _trade_timeframes("TRADE_TIMEFRAMES", "1m")
 
 
 
