@@ -42,7 +42,7 @@ services:
         value: XAUUSD
       # FIX: TIMEFRAME and CANDLE_WINDOW are now env-configurable (fix #4).
       - key: TIMEFRAME
-        value: "1m"
+        value: "5m"
       - key: CANDLE_WINDOW
         value: "300"
       # Option 2: keep the balanced 35% HTF confidence floor reproducible from the live Render environment.
