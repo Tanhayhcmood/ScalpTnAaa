@@ -185,7 +185,7 @@ TREND_MIN_CONFIRMATIONS = _int("TREND_MIN_CONFIRMATIONS", 2, lo=1, hi=4)
 RANGE_TRADING_ENABLED = os.getenv("RANGE_TRADING_ENABLED", "true").strip().lower() in {
     "1", "true", "yes", "on",
 }
-RANGE_MIN_CONFIRMATIONS = _int("RANGE_MIN_CONFIRMATIONS", 1, lo=1, hi=4)
+RANGE_MIN_CONFIRMATIONS = _int("RANGE_MIN_CONFIRMATIONS", 2, lo=1, hi=4)
 RANGE_MIN_RR = _float("RANGE_MIN_RR", 1.5, lo=1.0, hi=10.0)
 RANGE_EDGE_ATR_DISTANCE = _float("RANGE_EDGE_ATR_DISTANCE", 0.25, lo=0.05, hi=2.0)
 RANGE_RISK_PERCENT = _float("RANGE_RISK_PERCENT", 0.5, lo=0.01, hi=10.0)
@@ -202,11 +202,18 @@ RANGE_ENTRY_FILTERS_ENABLED = os.getenv(
 ).strip().lower() in {"1", "true", "yes", "on"}
 MAX_RANGE_TRADES_PER_SESSION = _int("MAX_RANGE_TRADES_PER_SESSION", 2, lo=1, hi=20)
 # When enabled, a directional Price Action signal may authorize the strategy
-# vote by itself. Keep this disabled when every entry must have two
-# independent confirmations.
+# vote by itself. This is intentionally independent of the other strategy
+# votes; confidence, quality, regime, R:R, position, and risk gates still
+# decide whether that PA setup can become a live order.
 PRICE_ACTION_STANDALONE = os.getenv(
-    "PRICE_ACTION_STANDALONE", "false"
+    "PRICE_ACTION_STANDALONE", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
+# Minimum diagnostic PA score for the independent entry path.  The regular
+# PA detector can expose early/weak setups for telemetry; standalone trading
+# requires a stronger local setup before it can bypass other strategy votes.
+PA_STANDALONE_MIN_SCORE = _float(
+    "PA_STANDALONE_MIN_SCORE", 0.30, lo=0.15, hi=1.0
+)
 # When enabled, every new trade must also have a same-direction Price Action signal.
 # Default false preserves existing behavior until explicitly enabled on Render.
 REQUIRE_PRICE_ACTION = os.getenv("REQUIRE_PRICE_ACTION", "false").strip().lower() in {

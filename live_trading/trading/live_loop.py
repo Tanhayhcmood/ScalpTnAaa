@@ -34,7 +34,7 @@ from live_trading.config import (
     MAX_OPEN_TRADES, COMMENT,
     BAR_CHECK_INTERVAL, RECONNECT_DELAY, SYNC_TIMEOUT, RPC_CALL_TIMEOUT,
     MIN_CONFIRMATIONS, TREND_MIN_CONFIRMATIONS,
-    PRICE_ACTION_STANDALONE, REQUIRE_PRICE_ACTION,
+    PRICE_ACTION_STANDALONE, PA_STANDALONE_MIN_SCORE, REQUIRE_PRICE_ACTION,
     REQUIRE_SMC_PRICE_ACTION_WYCKOFF, USE_ATR_HIGH_VOL_FILTER,
     CONF_HARD_MIN,
     RANGE_TRADING_ENABLED, RANGE_MIN_CONFIRMATIONS, RANGE_MIN_RR,
@@ -1144,6 +1144,7 @@ class GoldScalperLive:
                 "min_confirmations": MIN_CONFIRMATIONS,
                 "trend_min_confirmations": TREND_MIN_CONFIRMATIONS,
                 "price_action_standalone": bool(PRICE_ACTION_STANDALONE),
+                "pa_standalone_min_score": PA_STANDALONE_MIN_SCORE,
                 "require_price_action": bool(REQUIRE_PRICE_ACTION),
                 "confidence_hard_min": CONF_HARD_MIN,
                 "risk_percent": RISK_PERCENT,
@@ -2364,7 +2365,8 @@ class GoldScalperLive:
             clear_command("update_risk")
 
         # "update_strategy" — sent by Telegram panel strategy settings.
-        # Payload keys (all optional): min_confirmations (int).
+        # Payload keys (all optional): min_confirmations (int),
+        # price_action_standalone (bool).
         if cmds.get("update_strategy"):
             payload = cmds["update_strategy"]
             if isinstance(payload, dict):
@@ -2374,6 +2376,14 @@ class GoldScalperLive:
                     if "min_confirmations" in payload:
                         v = int(float(payload["min_confirmations"]))
                         _live_cfg.MIN_CONFIRMATIONS = v; _g["MIN_CONFIRMATIONS"] = v
+                    if "price_action_standalone" in payload:
+                        raw = payload["price_action_standalone"]
+                        if isinstance(raw, str):
+                            v = raw.strip().lower() in {"1", "true", "yes", "on"}
+                        else:
+                            v = bool(raw)
+                        _live_cfg.PRICE_ACTION_STANDALONE = v
+                        _g["PRICE_ACTION_STANDALONE"] = v
                     log.info(f"🔧 Strategy config updated via Telegram: {payload}")
                 except Exception as _upd_err:
                     log.warning(f"update_strategy payload error: {_upd_err}")

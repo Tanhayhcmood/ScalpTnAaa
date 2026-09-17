@@ -28,6 +28,7 @@ from live_trading.config import (
     CONF_HARD_MIN,
     MIN_CONFIRMATIONS,
     PRICE_ACTION_STANDALONE,
+    PA_STANDALONE_MIN_SCORE,
     RANGE_MIN_CONFIRMATIONS,
     REQUIRE_SMC_PRICE_ACTION_WYCKOFF,
     RANGE_ENTRY_FILTERS_ENABLED,
@@ -230,6 +231,7 @@ def run_decision_engine(
     range_require_edge_position: bool = RANGE_REQUIRE_EDGE_POSITION,
     timeframe: str = "M5",
     price_action_standalone: bool = PRICE_ACTION_STANDALONE,
+    pa_standalone_min_score: float = PA_STANDALONE_MIN_SCORE,
 ) -> DecisionResult:
 
     smc     = analyze_smc_structure(candles, timeframe=timeframe)
@@ -262,6 +264,32 @@ def run_decision_engine(
         regime.regime,
         _counter_trend,
     )
+
+    # Standalone mode is intentionally independent of SMC/Trend/Wyckoff, but
+    # it is not a blanket pass for every diagnostic PA pulse.  Require a
+    # meaningful local PA score before allowing that one strategy to select
+    # the direction on its own.  The later confidence, quality, regime, R:R,
+    # position, and risk gates remain unchanged.
+    if (
+        price_action_standalone
+        and pa.pa_signal in {"BUY", "SELL"}
+        and pa.pa_score < pa_standalone_min_score
+    ):
+        standalone_reason = (
+            f"Standalone Price Action score {pa.pa_score:.2f} < "
+            f"{pa_standalone_min_score:.2f} minimum"
+        )
+        return _make_neutral(
+            smc,
+            wyckoff,
+            pa,
+            trend,
+            [standalone_reason],
+            [standalone_reason],
+            regime_result=regime,
+            direction=pa.pa_signal,
+            candles=candles,
+        )
 
     # Entry filter — equal-weight N-of-4 consensus; no engine is mandatory.
     # RANGE has a narrower rule than ordinary regimes: SMC plus either
@@ -402,6 +430,7 @@ def run_decision_engine(
     conf_result  = calc_confidence(
         smc, wyckoff, pa, trend, regime, session, candidate,
         divergence_signal=divergence.signal,
+        price_action_standalone=price_action_standalone,
     )
 
     if conf_result.confidence < CONF_HARD_MIN:

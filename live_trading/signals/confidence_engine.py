@@ -16,7 +16,7 @@ from live_trading.config import CONF_HARD_MIN
 class ConfidenceComponents:
     smc_score:        float   # 0–35
     trend_score:      float   # 0–20
-    pa_score:         float   # 0–20
+    pa_score:         float   # 0–20 normally; up to 35 in standalone PA mode
     wyckoff_score:    float   # 0–15
     liquidity_score:  float   # 0–5
     volatility_score: float   # 0–5
@@ -252,10 +252,24 @@ def calc_confidence(
     candidate:        str,
     divergence_signal: str = "NEUTRAL",
     dxy_signal:        str = "NEUTRAL",
+    price_action_standalone: bool = False,
 ) -> ConfidenceResult:
     smc_s,  smc_r  = _calc_smc_score(smc, candidate)
     tr_s,   tr_r   = _calc_trend_score(trend, candidate)
     pa_s,   pa_r   = _calc_pa_score(pa, candidate)
+    if price_action_standalone and pa.pa_signal == candidate:
+        # In independent PA mode, the PA engine is the primary evidence
+        # source. Promote its bounded local score to the same 0–35 ceiling as
+        # structural confirmation, while retaining volatility and confidence
+        # gates below. This makes "standalone" genuinely usable without
+        # reducing the hard confidence floor or borrowing votes from another
+        # strategy.
+        standalone_pa = min(35.0, 28.0 + pa.pa_score * 20.0)
+        pa_s = max(pa_s, standalone_pa)
+        pa_r = pa_r + [
+            f"Standalone PA evidence {pa.pa_score:.2f} "
+            f"({standalone_pa:.1f} confidence points)"
+        ]
     wy_s,   wy_r   = _calc_wyckoff_score(wyckoff, candidate)
     liq_s,  liq_r  = _calc_liquidity_score(smc, candidate)
     vol_s,  vol_r  = _calc_volatility_score(regime, session)
