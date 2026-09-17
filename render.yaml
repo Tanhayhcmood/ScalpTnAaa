@@ -81,7 +81,7 @@ services:
       - key: PRICE_ACTION_STANDALONE
         value: "true"
       - key: PA_STANDALONE_MIN_SCORE
-        value: "0.30"
+        value: "0.24"
       - key: MAX_RANGE_TRADES_PER_SESSION
         value: "2"
       - key: MAX_OPEN_TRADES

@@ -212,7 +212,7 @@ PRICE_ACTION_STANDALONE = os.getenv(
 # PA detector can expose early/weak setups for telemetry; standalone trading
 # requires a stronger local setup before it can bypass other strategy votes.
 PA_STANDALONE_MIN_SCORE = _float(
-    "PA_STANDALONE_MIN_SCORE", 0.30, lo=0.15, hi=1.0
+    "PA_STANDALONE_MIN_SCORE", 0.24, lo=0.15, hi=1.0
 )
 # When enabled, every new trade must also have a same-direction Price Action signal.
 # Default false preserves existing behavior until explicitly enabled on Render.
