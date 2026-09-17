@@ -1025,6 +1025,45 @@ async def get_current_quote(symbol: str) -> dict:
     return {}
 
 
+async def get_symbol_params(symbol: str) -> dict:
+    """Fetch broker-provided symbol trading constraints from MTAPI.
+
+    MTAPI's ``/SymbolParams`` response contains ``symbolInfo`` (digits,
+    point/tick size) and ``symbolGroup``.  The latter exposes the broker's
+    minimum SL/TP distances as ``sl`` and ``tp`` points on current MTAPI
+    versions; newer versions may also expose explicit stops/freeze-level
+    fields.  Keep the raw response so callers can handle both shapes without
+    inventing broker defaults.
+    """
+    for attempt in range(2):
+        if not _conn_id and not await ensure_connected():
+            return {}
+        try:
+            async with _get_session().get(
+                f"{_base_url}/SymbolParams",
+                params={"id": _conn_id, "symbol": symbol},
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if (
+                    resp.status < 400
+                    and isinstance(data, dict)
+                    and not _is_error_quote(data)
+                ):
+                    return data
+                if attempt == 0:
+                    _invalidate_connection()
+                    continue
+                return {}
+        except Exception as exc:
+            if attempt == 0:
+                _invalidate_connection()
+                continue
+            log.warning(f"get_symbol_params error after reconnect: {exc}")
+            return {}
+    return {}
+
+
 def _is_error_quote(data: dict) -> bool:
     return "code" in data and "stackTrace" in data
 
