@@ -161,7 +161,8 @@ RISK_PERCENT      = _float("RISK_PERCENT",      1.0,  lo=0.01, hi=10.0)
 # Confidence policy:
 # - NORMAL_MIN_CONFIDENCE applies to every non-RANGE market regime.
 # - RANGE_MIN_CONFIDENCE applies to the dedicated RANGE playbook.
-# - CONF_HARD_MIN and OPTION_TWO_MIN_CONFIDENCE are the global and MTF gates.
+# - CONF_HARD_MIN is the global confidence floor.
+# - MTF_OPPOSITION_THRESHOLD is the independent HTF opposition gate.
 # Keep these aligned when the operator wants one confidence threshold across
 # both live entry modes.
 NORMAL_MIN_CONFIDENCE = _float("NORMAL_MIN_CONFIDENCE", 40.0, lo=0.0, hi=100.0)
@@ -241,20 +242,31 @@ ALLOW_HEDGED_POSITIONS = os.getenv(
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 USE_ATR_HIGH_VOL_FILTER = os.getenv("USE_ATR_HIGH_VOL_FILTER", "false").lower() == "true"
-# ── Multi-Timeframe (HTF) Filter ─────────────────────────────────────────────
-# MTF_ENABLED       : enable/disable the HTF alignment gate (default on).
-#                     Set to "false" to revert to M5-only behaviour instantly.
+# ── Multi-Timeframe (HTF) negative filter ────────────────────────────────────
+# MTF_ENABLED       : enable the HTF opposition check (default on).
+#                     It is a negative-only filter: ordinary entries remain
+#                     allowed unless HTF opposition is clearly strong.
 # MTF_TIMEFRAME     : the Higher TimeFrame to use for bias detection.
 #                     "H1" is the recommended default for M5 scalping of gold.
-#                     Supported: M1 M5 M15 M30 H1 H4 D1 (same set as TIMEFRAME).
 # MTF_CANDLE_WINDOW : number of HTF bars to fetch (needs ≥ 210 for EMA-200).
-#                     300 gives a comfortable margin without excessive latency.
-MTF_ENABLED       = os.getenv("MTF_ENABLED",   "true").lower() == "true"
-MTF_TIMEFRAME     = _timeframe("MTF_TIMEFRAME",  "H1")
-MTF_CANDLE_WINDOW = _int("MTF_CANDLE_WINDOW",    300, lo=50, hi=1000)
-# Option 2: a trade needs a real HTF confirmation, a matching entry
-# timeframe, and at least 35% confidence. Changing this requires an explicit
-# Render env override.
+MTF_ENABLED       = os.getenv("MTF_ENABLED", "true").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+MTF_TIMEFRAME     = _timeframe("MTF_TIMEFRAME", "H1")
+MTF_CANDLE_WINDOW = _int("MTF_CANDLE_WINDOW", 300, lo=50, hi=1000)
+# Only strong opposition at or above this Trend Engine score can be rejected.
+# This is intentionally separate from all confidence/confirmation settings so
+# operators can tune the HTF safety threshold without changing the code.
+MTF_OPPOSITION_THRESHOLD = _float(
+    "MTF_OPPOSITION_THRESHOLD", 55.0, lo=0.0, hi=100.0
+)
+# Start in observation mode. The filter computes and logs would_block but does
+# not reject orders until the operator explicitly sets this to false on Render.
+MTF_DRY_RUN = os.getenv("MTF_DRY_RUN", "true").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+# Deprecated compatibility settings retained for panel/config consumers. They
+# no longer act as MTF approval gates.
 OPTION_TWO_MIN_CONFIDENCE = _float("OPTION_TWO_MIN_CONFIDENCE", 40.0, lo=0.0, hi=100.0)
 OPTION_TWO_MIN_TIMEFRAMES = _int("OPTION_TWO_MIN_TIMEFRAMES", 2, lo=2, hi=10)
 

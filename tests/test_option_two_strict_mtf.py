@@ -1,107 +1,80 @@
-"""Option 2: strict higher-timeframe confirmation tests."""
+"""Smoke tests for the negative-only higher-timeframe opposition filter."""
 
-from live_trading.signals.mtf_filter import MtfBias, mtf_allows_trade
+from live_trading.signals.mtf_filter import (
+    MtfBias,
+    evaluate_mtf_opposition,
+    mtf_allows_trade,
+)
 
 
-def _bias(
-    direction: str = "BUY",
-    regime: str = "STRONG_TREND_BULL",
-) -> MtfBias:
+def _bias(trend: str, trend_score: float) -> MtfBias:
+    direction = {
+        "BULLISH": "BUY",
+        "BEARISH": "SELL",
+        "NEUTRAL": "NEUTRAL",
+    }[trend]
     return MtfBias(
         direction=direction,  # type: ignore[arg-type]
-        trend="BULLISH" if direction == "BUY" else "BEARISH",
+        trend=trend,  # type: ignore[arg-type]
         smc_signal=direction,
-        regime=regime,
-        strength="STRONG",
+        regime="STRONG_TREND_BULL" if trend == "BULLISH" else "STRONG_TREND_BEAR",
+        strength="STRONG" if abs(trend_score) >= 55 else "WEAK",
+        trend_score=trend_score,
         reasoning=["test"],
     )
 
 
-def test_option_two_allows_aligned_entry_at_exact_49_percent_floor():
+def test_strong_bullish_htf_blocks_sell():
+    check = evaluate_mtf_opposition(
+        _bias("BULLISH", 82.0),
+        "SELL",
+        opposition_threshold=55.0,
+    )
+    assert check.htf_trend == "BUY"
+    assert check.opposition_strength == 82.0
+    assert check.would_block is True
+
+
+def test_strong_bearish_htf_blocks_buy():
+    check = evaluate_mtf_opposition(
+        _bias("BEARISH", -78.0),
+        "BUY",
+        opposition_threshold=55.0,
+    )
+    assert check.htf_trend == "SELL"
+    assert check.opposition_strength == 78.0
+    assert check.would_block is True
+
+
+def test_neutral_htf_does_not_block_by_default():
+    check = evaluate_mtf_opposition(
+        _bias("NEUTRAL", 0.0),
+        "SELL",
+        opposition_threshold=55.0,
+    )
+    assert check.htf_trend == "NEUTRAL"
+    assert check.opposition_strength == 0.0
+    assert check.would_block is False
+
+
+def test_weak_opposition_preserves_existing_entry_path():
+    check = evaluate_mtf_opposition(
+        _bias("BULLISH", 42.0),
+        "SELL",
+        opposition_threshold=55.0,
+    )
+    assert check.would_block is False
     assert mtf_allows_trade(
-        _bias(), "BUY", confidence=49.0, confirmed_timeframes=2
+        _bias("BULLISH", 42.0),
+        "SELL",
+        opposition_threshold=55.0,
     ) == (True, "")
 
 
-def test_option_two_blocks_confidence_below_49_percent():
-    allowed, reason = mtf_allows_trade(
-        _bias(), "BUY", confidence=48.9, confirmed_timeframes=2
-    )
-    assert not allowed
-    assert "confidence" in reason.lower()
-
-
-def test_option_two_blocks_neutral_htf():
-    allowed, reason = mtf_allows_trade(
-        _bias(direction="NEUTRAL", regime="RANGE"),
-        "BUY",
-        confidence=90.0,
-        confirmed_timeframes=2,
-    )
-    assert not allowed
-    assert "neutral" in reason.lower()
-
-
-def test_option_two_blocks_range_htf_even_when_directional():
-    allowed, reason = mtf_allows_trade(
-        _bias(direction="BUY", regime="RANGE"),
-        "BUY",
-        confidence=90.0,
-        confirmed_timeframes=2,
-    )
-    assert not allowed
-    assert "range" in reason.lower()
-
-
-def test_option_three_blocks_directional_bias_with_neutral_h1_trend():
-    bias = _bias(direction="BUY", regime="LOW_VOLATILITY")
-    bias.trend = "NEUTRAL"
-
-    allowed, reason = mtf_allows_trade(
-        bias,
-        "BUY",
-        confidence=90.0,
-        confirmed_timeframes=2,
-    )
-
-    assert not allowed
-    assert "neutral" in reason.lower()
-
-
-def test_option_three_blocks_neutral_h1_regime_even_when_directional():
-    allowed, reason = mtf_allows_trade(
-        _bias(direction="SELL", regime="NEUTRAL"),
+def test_threshold_is_configurable():
+    check = evaluate_mtf_opposition(
+        _bias("BULLISH", 42.0),
         "SELL",
-        confidence=90.0,
-        confirmed_timeframes=2,
+        opposition_threshold=40.0,
     )
-
-    assert not allowed
-    assert "neutral" in reason.lower()
-
-
-def test_option_two_blocks_missing_htf_data():
-    allowed, reason = mtf_allows_trade(
-        None, "BUY", confidence=90.0, confirmed_timeframes=0
-    )
-    assert not allowed
-    assert "unavailable" in reason.lower()
-
-
-def test_option_two_blocks_opposing_htf_regardless_of_strength():
-    allowed, reason = mtf_allows_trade(
-        _bias(direction="SELL", regime="WEAK_TREND_BEAR"),
-        "BUY",
-        confidence=90.0,
-        confirmed_timeframes=2,
-    )
-    assert not allowed
-    assert "wants buy" in reason.lower()
-
-
-def test_option_two_requires_two_timeframe_confirmations():
-    allowed, reason = mtf_allows_trade(
-        _bias(), "BUY", confidence=90.0, confirmed_timeframes=1
-    )
-    assert not allowed
-    assert "timeframe" in reason.lower()
+    assert check.would_block is True

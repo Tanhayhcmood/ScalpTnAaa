@@ -48,7 +48,7 @@ from live_trading.config import (
     TRAIL_ENABLED, TRAIL_ACTIVATION_R, TRAIL_STEP_R,
     TRAIL_LOCK_BUFFER_R, TRAIL_ATR_GAP_MULT, TRAIL_MIN_STEP_PRICE,
     MTF_ENABLED, MTF_TIMEFRAME, MTF_CANDLE_WINDOW,
-    OPTION_TWO_MIN_CONFIDENCE, OPTION_TWO_MIN_TIMEFRAMES,
+    MTF_OPPOSITION_THRESHOLD, MTF_DRY_RUN,
     TRADE_TIMEFRAMES,
     ALLOW_HEDGED_POSITIONS,
 )
@@ -59,7 +59,11 @@ from live_trading.risk.trailing_stop import (
     stage_for_r,
 )
 from live_trading.signals.decision_engine import run_decision_engine, DecisionResult, describe_strategy
-from live_trading.signals.mtf_filter import compute_mtf_bias, mtf_allows_trade, MtfBias
+from live_trading.signals.mtf_filter import (
+    compute_mtf_bias,
+    evaluate_mtf_opposition,
+    MtfBias,
+)
 from live_trading.signals.h1_validator import validate_h1_candles
 from live_trading.signals.wyckoff_engine import calibrate_wyckoff, set_calibrated_config
 from live_trading.mt5.connector import (
@@ -325,8 +329,8 @@ class GoldScalperLive:
         log.info(f"  Trend min confirmations: {TREND_MIN_CONFIRMATIONS}")
         log.info(
             f"  MTF: {'ON' if MTF_ENABLED else 'OFF'} "
-            f"(min confidence={OPTION_TWO_MIN_CONFIDENCE:.1f}%, "
-            f"min timeframes={OPTION_TWO_MIN_TIMEFRAMES})"
+            f"(opposition threshold={MTF_OPPOSITION_THRESHOLD:.1f}, "
+            f"dry-run={'on' if MTF_DRY_RUN else 'off'})"
         )
         log.info(f"  Risk per trade: {RISK_PERCENT:.2f}%")
         log.info(f"  Daily loss limit: {DAILY_LOSS_LIMIT_PCT}%  |  "
@@ -1147,11 +1151,14 @@ class GoldScalperLive:
             "mtf": {
                 "enabled": bool(MTF_ENABLED),
                 "timeframe": MTF_TIMEFRAME,
+                "dry_run": bool(MTF_DRY_RUN),
+                "opposition_threshold": MTF_OPPOSITION_THRESHOLD,
                 "direction": htf_bias.direction if htf_bias else "NEUTRAL",
                 "trend": htf_bias.trend if htf_bias else "NEUTRAL",
                 "smc": htf_bias.smc_signal if htf_bias else "NEUTRAL",
                 "regime": htf_bias.regime if htf_bias else "RANGE",
                 "strength": htf_bias.strength if htf_bias else "WEAK",
+                "trend_score": htf_bias.trend_score if htf_bias else 0.0,
                 "data_available": htf_bias is not None,
                 "data_reason": htf_data_reason or "",
                 "gate": "PENDING",
@@ -1381,31 +1388,45 @@ class GoldScalperLive:
                 )
                 return
 
-        # 8b. Gate: Option 2 strict HTF confirmation.
-        # A valid entry needs both the active entry timeframe and the HTF to
-        # agree, at least 49% confidence, and a non-RANGE directional HTF.
-        # This is deliberately fail-closed: a fetch/analysis failure produces
-        # htf_bias=None and therefore cannot accidentally open a trade.
+        # 8b. Gate: negative-only HTF opposition check.
+        # MTF must not become a second positive-confirmation strategy.  The
+        # existing decision, confidence, quality, and risk gates remain the
+        # source of approval; MTF can only reject clear strong opposition.
         if MTF_ENABLED:
-            _mtf_ok, _mtf_reason = mtf_allows_trade(
+            _mtf_check = evaluate_mtf_opposition(
                 htf_bias,
                 decision.direction,
-                confidence=decision.confidence,
-                confirmed_timeframes=2 if htf_bias is not None else 0,
-                min_confidence=(
-                    CONF_HARD_MIN
-                    if decision.regime == "RANGE"
-                    else OPTION_TWO_MIN_CONFIDENCE
+                opposition_threshold=MTF_OPPOSITION_THRESHOLD,
+            )
+            _would_block = _mtf_check.would_block
+            _is_hard_block = _would_block and not MTF_DRY_RUN
+            self._last_candle_telemetry.setdefault("mtf", {}).update({
+                "htf_trend": _mtf_check.htf_trend,
+                "candidate": _mtf_check.candidate,
+                "opposition_strength": _mtf_check.opposition_strength,
+                "would_block": _would_block,
+                "gate": (
+                    "BLOCKED"
+                    if _is_hard_block
+                    else "DRY_RUN_WOULD_BLOCK"
+                    if _would_block
+                    else "ALLOWED"
                 ),
-                min_timeframes=OPTION_TWO_MIN_TIMEFRAMES,
-                allow_range_regime=decision.regime == "RANGE",
+                "gate_reason": _mtf_check.reason,
+            })
+            log.info(
+                "MTF check: candidate=%s htf_trend=%s "
+                "opposition_strength=%.1f threshold=%.1f would_block=%s%s",
+                _mtf_check.candidate,
+                _mtf_check.htf_trend,
+                _mtf_check.opposition_strength,
+                _mtf_check.threshold,
+                str(_would_block).lower(),
+                " (dry_run)" if MTF_DRY_RUN else "",
             )
-            self._last_candle_telemetry.setdefault("mtf", {})["gate"] = (
-                "ALLOWED" if _mtf_ok else "BLOCKED"
-            )
-            self._last_candle_telemetry["mtf"]["gate_reason"] = _mtf_reason
-            if not _mtf_ok:
-                self._set_trade_permission(False, "MTF_BLOCKED", [_mtf_reason])
+            if _is_hard_block:
+                _mtf_reason = f"MTF BLOCK: {_mtf_check.reason}"
+                self._set_trade_permission(False, "MTF_HARD_BLOCKED", [_mtf_reason])
                 log.info(f"⛔  {_mtf_reason}")
                 _mtf_extra = {
                     **self._guardian_extra(gs),
@@ -1415,10 +1436,13 @@ class GoldScalperLive:
                         "smc":       htf_bias.smc_signal if htf_bias else "NEUTRAL",
                         "regime":    htf_bias.regime if htf_bias else "RANGE",
                         "strength":  htf_bias.strength if htf_bias else "WEAK",
+                        "trend_score": htf_bias.trend_score if htf_bias else 0.0,
                         "reasoning": htf_bias.reasoning if htf_bias else [
-                             htf_data_reason or "HTF bias unavailable — strict HTF block"
+                             htf_data_reason or "HTF bias unavailable — no opposition measured"
                         ],
                         "blocked":   _mtf_reason,
+                        "opposition_strength": _mtf_check.opposition_strength,
+                        "threshold": _mtf_check.threshold,
                     },
                 }
                 self._write_state("SCANNING", acc_info, decision, pos, extra=_mtf_extra)

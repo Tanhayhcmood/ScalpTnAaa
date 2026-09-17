@@ -3,39 +3,12 @@ Multi-Timeframe (HTF) Filter — GoldScalperPro v4
 
 Computes a Higher TimeFrame directional bias by reusing the existing
 Trend, SMC, Wyckoff, and Regime engines on HTF candles (default H1).
-The live loop uses this bias as an additional trade gate:
 
-  • Only BUY entries allowed when HTF bias is BUY.
-  • Only SELL entries allowed when HTF bias is SELL.
-  • NEUTRAL or RANGE HTF → entry blocked.
-  • An unavailable HTF bias → entry blocked (fail-closed).
-  • The entry must have at least 49% confidence and two confirmed
-    timeframes (the HTF plus the active entry timeframe).
-
-Design principles:
-  • Safety first: any fetch/analysis error → NEUTRAL → trade is blocked.
-    A missing HTF confirmation must never be treated as approval.
-  • Additive: zero changes to any existing signal engine or decision logic.
-    This module is a pure add-on — it imports from the existing engines but
-    never modifies them.
-  • Fail-safe precedence: Trend must be non-NEUTRAL for a bias to be issued.
-    If Trend is neutral but SMC has a strong signal, we stay NEUTRAL rather
-    than issuing a bias from SMC alone (SMC is noisier on higher timeframes
-    without the EMA anchor).
-  • Conflict suppression: if Trend and SMC actively disagree, bias = NEUTRAL.
-    A conflicted HTF means the market is transitioning — entry is blocked.
-  • Configurable: MTF_ENABLED / MTF_TIMEFRAME / MTF_CANDLE_WINDOW env vars.
-  • Transparent: all reasoning is recorded in MtfBias.reasoning for logging
-    and panel display.
-
-Typical usage (inside live_loop._on_new_bar):
-
-    htf_candles = await fetch_candles(SYMBOL, MTF_TIMEFRAME, MTF_CANDLE_WINDOW)
-    htf_bias    = compute_mtf_bias(htf_candles)          # never raises
-    allowed, reason = mtf_allows_trade(htf_bias, decision.direction)
-    if not allowed:
-        log.info(f"MTF BLOCK: {reason}")
-        return
+The live loop uses this module as a *negative* filter.  A normal entry keeps
+its existing approval path; MTF only rejects an entry when the higher-timeframe
+trend is clearly and strongly opposite to the candidate direction.  This is
+intentional: a neutral, transitioning, unavailable, or weakly opposing HTF
+must not turn MTF into a rare positive-confirmation requirement.
 """
 from __future__ import annotations
 
@@ -85,6 +58,21 @@ class MtfBias:
     ema50:      float = 0.0
     ema100:     float = 0.0
     ema200:     float = 0.0
+    # Signed Trend Engine score (-100..100).  The absolute value is the
+    # opposition strength used by the negative-only MTF gate.
+    trend_score: float = 0.0
+
+
+@dataclass(frozen=True)
+class MtfOppositionCheck:
+    """Decision telemetry for the negative-only MTF gate."""
+
+    candidate: str
+    htf_trend: str
+    opposition_strength: float
+    threshold: float
+    would_block: bool
+    reason: str
 
 
 def _neutral(reason: str) -> MtfBias:
@@ -214,10 +202,73 @@ def compute_mtf_bias(htf_candles: List[OHLCV]) -> MtfBias:
         ema50=trend.ema50,
         ema100=trend.ema100,
         ema200=trend.ema200,
+        trend_score=trend.score,
     )
 
 
-# ── Gate helper ───────────────────────────────────────────────────────────────
+# ── Negative-only gate ─────────────────────────────────────────────────────────
+
+def evaluate_mtf_opposition(
+    bias: Optional[MtfBias],
+    candidate: str,
+    opposition_threshold: float = 55.0,
+) -> MtfOppositionCheck:
+    """Measure whether the HTF trend is strongly opposite to ``candidate``.
+
+    ``opposition_threshold`` is deliberately the only blocking threshold.
+    Missing/neutral/weak HTF context has zero opposition strength and therefore
+    preserves the existing entry path.
+    """
+    candidate = str(candidate).upper()
+    threshold = max(0.0, min(100.0, float(opposition_threshold)))
+    htf_trend = "NEUTRAL"
+
+    if bias is not None:
+        if bias.trend == "BULLISH":
+            htf_trend = "BUY"
+        elif bias.trend == "BEARISH":
+            htf_trend = "SELL"
+
+    opposition_strength = 0.0
+    if (
+        candidate in {"BUY", "SELL"}
+        and htf_trend in {"BUY", "SELL"}
+        and candidate != htf_trend
+        and bias is not None
+    ):
+        opposition_strength = round(
+            max(0.0, min(100.0, abs(float(bias.trend_score)))), 1
+        )
+
+    would_block = (
+        candidate in {"BUY", "SELL"}
+        and htf_trend in {"BUY", "SELL"}
+        and candidate != htf_trend
+        and opposition_strength >= threshold
+    )
+    if would_block:
+        reason = (
+            f"strong HTF opposition: candidate={candidate} "
+            f"htf_trend={htf_trend} strength={opposition_strength:.1f}"
+        )
+    elif htf_trend == "NEUTRAL":
+        reason = "no directional HTF trend to oppose the candidate"
+    elif candidate == htf_trend:
+        reason = "candidate is aligned with the HTF trend"
+    else:
+        reason = (
+            f"HTF opposition is below threshold: "
+            f"{opposition_strength:.1f} < {threshold:.1f}"
+        )
+
+    return MtfOppositionCheck(
+        candidate=candidate,
+        htf_trend=htf_trend,
+        opposition_strength=opposition_strength,
+        threshold=threshold,
+        would_block=would_block,
+        reason=reason,
+    )
 
 def mtf_allows_trade(
     bias: Optional[MtfBias],
@@ -227,107 +278,18 @@ def mtf_allows_trade(
     min_confidence: float = 49.0,
     min_timeframes: int = 2,
     allow_range_regime: bool = False,
+    opposition_threshold: float = 55.0,
 ) -> tuple[bool, str]:
+    """Compatibility wrapper for callers that expect an ``(allowed, reason)``.
+
+    The old confidence, timeframe, and RANGE arguments are retained so older
+    integrations do not break, but MTF no longer uses them as approval gates.
     """
-    Check whether a proposed M5 trade is aligned with the HTF bias.
-
-    Parameters
-    ----------
-    bias          : MtfBias | None
-        The result of compute_mtf_bias().  None is treated as NEUTRAL.
-    m5_direction  : str
-        The active entry timeframe decision engine's proposed direction:
-        "BUY", "SELL",
-        or "NEUTRAL".
-    confidence    : float | None
-        Entry confidence percentage. Required for a strict approval.
-    confirmed_timeframes : int
-        Number of distinct timeframes agreeing on the direction. The HTF and
-        active entry timeframe count as two when both agree.
-    min_confidence : float
-        Minimum confidence percentage required for entry.
-    min_timeframes : int
-        Minimum number of confirming timeframes required.
-
-    Returns
-    -------
-    (allowed, reason)
-        allowed=True  → all Option 2 conditions are satisfied.
-        allowed=False → caller should block the trade; reason explains why.
-        When allowed=True, reason is an empty string.
-
-    This function NEVER raises.
-    """
-    if bias is None:
-        return False, "MTF BLOCK: HTF bias unavailable — confirmation required"
-
-    if m5_direction == "NEUTRAL":
-        return False, "MTF BLOCK: entry direction is NEUTRAL"
-
-    # A RANGE entry has its own edge/sweep/reversal gate on the active
-    # timeframe.  When H1 is also ranging, it is valid context rather than a
-    # reason to block every trade.  Directional H1 regimes still go through
-    # the normal alignment check below.
-    if allow_range_regime and bias.regime == "RANGE":
-        if confidence is None:
-            return False, "MTF BLOCK: confidence is unavailable"
-        if confidence < min_confidence:
-            return (
-                False,
-                f"MTF BLOCK: range confidence {confidence:.1f}% < "
-                f"{min_confidence:.1f}% minimum",
-            )
-        if confirmed_timeframes < min_timeframes:
-            return (
-                False,
-                f"MTF BLOCK: only {confirmed_timeframes} timeframe "
-                f"confirmation(s); {min_timeframes} required",
-            )
-        return True, "HTF RANGE accepted for dedicated edge/sweep/reversal play"
-
-    if bias.direction == "NEUTRAL":
-        return (
-            False,
-            f"MTF BLOCK: HTF is NEUTRAL [trend={bias.trend}, "
-            f"regime={bias.regime}]",
-        )
-
-    # Fail closed on the H1 trend/regime itself as well as on the public
-    # direction.  compute_mtf_bias() normally keeps these fields consistent,
-    # but this guard prevents a stale, partially populated, or future bias
-    # object from authorizing a trade while H1 is neutral or ranging.
-    if bias.trend == "NEUTRAL":
-        return (
-            False,
-            f"MTF BLOCK: HTF trend is NEUTRAL [regime={bias.regime}]",
-        )
-
-    if bias.regime in HTF_BLOCKED_REGIMES:
-        return False, f"MTF BLOCK: HTF regime is {bias.regime} — entry prohibited"
-
-    if m5_direction != bias.direction:
-        return (
-            False,
-            f"MTF BLOCK: entry wants {m5_direction} but HTF confirms "
-            f"{bias.direction} [trend={bias.trend}, SMC={bias.smc_signal}, "
-            f"regime={bias.regime}, strength={bias.strength}]",
-        )
-
-    if confidence is None:
-        return False, "MTF BLOCK: confidence is unavailable"
-
-    if confidence < min_confidence:
-        return (
-            False,
-            f"MTF BLOCK: confidence {confidence:.1f}% < "
-            f"{min_confidence:.1f}% minimum",
-        )
-
-    if confirmed_timeframes < min_timeframes:
-        return (
-            False,
-            f"MTF BLOCK: only {confirmed_timeframes} timeframe "
-            f"confirmation(s); {min_timeframes} required",
-        )
-
+    check = evaluate_mtf_opposition(
+        bias,
+        m5_direction,
+        opposition_threshold=opposition_threshold,
+    )
+    if check.would_block:
+        return False, f"MTF BLOCK: {check.reason}"
     return True, ""

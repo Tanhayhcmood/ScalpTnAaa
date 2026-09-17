@@ -123,8 +123,11 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `MAX_OPEN_TRADES` | No | `4` | Maximum simultaneous open positions (one per strategy slot) |
 | `ALLOW_HEDGED_POSITIONS` | No | `false` | Allow opposite BUY/SELL positions on the same symbol; keep disabled for one-way scalping |
 | `CONF_HARD_MIN` | No | `35` | Balanced confidence-engine hard floor |
-| `OPTION_TWO_MIN_CONFIDENCE` | No | `35` | MTF confidence floor for the HTF-confirmed entry gate |
-| `MTF_ENABLED` | No | `true` | Enable the Option 1/2 higher-timeframe entry blocker |
+| `MTF_ENABLED` | No | `true` | Enable the higher-timeframe negative-only opposition check |
+| `MTF_TIMEFRAME` | No | `H1` | Higher timeframe used for trend opposition |
+| `MTF_CANDLE_WINDOW` | No | `300` | Closed higher-timeframe bars fetched for analysis |
+| `MTF_OPPOSITION_THRESHOLD` | No | `55` | HTF Trend Engine score at which an opposite candidate is considered strongly opposed |
+| `MTF_DRY_RUN` | No | `true` | Log `would_block` decisions without rejecting orders; set to `false` after validation |
 | `QUALITY_ADX_MIN` | No | `12` | Balanced quality-filter ADX floor; blocks only very weak momentum |
 | `DAILY_LOSS_LIMIT_PCT` | No | `4.0` | Guardian: daily loss halt threshold |
 | `MAX_DRAWDOWN_PCT` | No | `12.0` | Guardian: drawdown halt threshold |
