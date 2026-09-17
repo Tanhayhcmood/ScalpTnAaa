@@ -8,6 +8,8 @@ from live_trading.signals.gold_engine import OHLCV
 from live_trading.signals.smc_engine import (
     SmcResult,
     analyze_smc_structure,
+    detect_order_block_fake_breakout,
+    get_latest_structure_event,
 )
 from live_trading.signals.wyckoff_engine import WyckoffResult, analyze_wyckoff
 from live_trading.signals.price_action_engine import PriceActionResult, analyze_price_action
@@ -38,9 +40,9 @@ from live_trading.config import (
 # 1.3 = profitable in expectancy even at 45% win rate (1.3 × 0.45 > 0.55).
 CONF_MARGINAL_RR = 1.3
 
-# SMC/Wyckoff/divergence remain available for telemetry, but the live entry
-# policy is deliberately limited to Price Action and EMA Trend. RANGE keeps
-# its non-signal structural safeguards.
+# All four engines have equal weight. The production entry floor is the
+# operator-selected N-of-4 consensus; no regime silently raises it to make
+# one strategy mandatory. RANGE keeps its separate structural safeguards.
 _CHOPPY_REGIMES = {"ACCUMULATION", "DISTRIBUTION", "HIGH_VOLATILITY"}
 
 
@@ -67,21 +69,29 @@ def _allow_without_smc_for_quality(
     effective_min_confirmations: int,
     price_action_standalone: bool,
 ) -> bool:
-    """Keep the quality gate aligned with the PA + Trend policy.
+    """Keep the quality gate aligned with the explicit PA standalone policy.
 
-    SMC is display-only, so an entry that passed the policy must never be
-    rejected merely because SMC is neutral.  The legacy arguments remain for
-    source compatibility with callers and tests.
+    The entry filter can authorize a directional PA vote by itself. This later
+    quality gate must honor that same policy; other strategies still require
+    the configured confirmation floor before proceeding without SMC direction.
     """
-    del effective_min_confirmations, price_action_standalone
-    return bool(entry_filter.allowed)
+    if price_action_standalone and entry_filter.price_action:
+        return True
+    return (
+        entry_filter.confirmation_count >= effective_min_confirmations
+        and (
+            entry_filter.smc
+            or entry_filter.trend
+            or entry_filter.price_action
+            or entry_filter.wyckoff
+        )
+    )
 
 
 def _range_confirmation_gate(
     entry_filter: EntryFilterResult,
     min_confirmations: int,
     price_action_standalone: bool = False,
-    entry_policy_only: bool = False,
 ) -> tuple[bool, str]:
     """Apply the RANGE confirmation floor without changing vote semantics.
 
@@ -91,11 +101,6 @@ def _range_confirmation_gate(
     may reduce this floor to one aligned PA vote; all other RANGE safeguards
     remain mandatory.
     """
-    if entry_policy_only:
-        if entry_filter.allowed:
-            return True, ""
-        return False, f"Entry policy blocked: {entry_filter.entry_reason}"
-
     effective_min_confirmations = (
         1
         if price_action_standalone and entry_filter.price_action
@@ -146,16 +151,23 @@ def _candidate_direction(
     trend: TrendResult,
     price_action_standalone: bool = False,
 ) -> str:
-    """Return the candidate from the two allowed entry engines only."""
-    del smc, wyckoff, price_action_standalone
-    pa_vote = pa.pa_signal if pa.pa_signal in {"BUY", "SELL"} else "NEUTRAL"
-    if pa_vote in {"BUY", "SELL"}:
-        return pa_vote
-    return (
-        "BUY" if trend.trend == "BULLISH"
-        else "SELL" if trend.trend == "BEARISH"
-        else "NEUTRAL"
+    """Return the unique direction with the most strategy votes."""
+    if price_action_standalone and pa.pa_signal in {"BUY", "SELL"}:
+        return pa.pa_signal
+    votes = (
+        smc.smc_signal,
+        "BUY" if trend.trend == "BULLISH" else
+        "SELL" if trend.trend == "BEARISH" else "NEUTRAL",
+        pa.pa_signal,
+        wyckoff.wyckoff_signal,
     )
+    buy_count = sum(vote == "BUY" for vote in votes)
+    sell_count = sum(vote == "SELL" for vote in votes)
+    if buy_count > sell_count:
+        return "BUY"
+    if sell_count > buy_count:
+        return "SELL"
+    return "NEUTRAL"
 
 
 def _make_neutral(
@@ -220,29 +232,11 @@ def run_decision_engine(
     price_action_standalone: bool = PRICE_ACTION_STANDALONE,
 ) -> DecisionResult:
 
-    # This is part of the requested policy, not an operator-tunable legacy
-    # switch.  Keep the parameter for compatibility with existing callers,
-    # but always enable PA standalone when evaluating the live robot.
-    price_action_standalone = True
-
     smc     = analyze_smc_structure(candles, timeframe=timeframe)
     wyckoff = analyze_wyckoff(candles)
     pa      = analyze_price_action(candles, timeframe=timeframe)
     trend   = analyze_trend(candles)
 
-    # SMC and Wyckoff are intentionally passed through for telemetry only.
-    # Their signals, votes, and legacy operator overrides cannot authorize or
-    # block an entry in this policy.
-    ef = apply_entry_filter(
-        smc_signal      = smc.smc_signal,
-        ema_trend       = trend.trend,
-        pa_signal       = pa.pa_signal,
-        wyckoff_signal  = wyckoff.wyckoff_signal,
-        min_confirmations = min_confirmations,
-        require_price_action = require_price_action,
-        require_smc_price_action_wyckoff = require_smc_price_action_wyckoff,
-        price_action_standalone=price_action_standalone,
-    )
     candidate = _candidate_direction(
         smc,
         wyckoff,
@@ -252,47 +246,59 @@ def run_decision_engine(
     )
     if candidate == "NEUTRAL":
         return _make_neutral(
-            smc, wyckoff, pa, trend,
-            [f"Entry policy blocked: {ef.entry_reason}"],
-            entry_filter=ef,
-            direction="NEUTRAL",
-            candles=candles,
+            smc, wyckoff, pa, trend, ["No unique strategy direction"]
         )
 
-    # Trend is used only as the second allowed engine.  A counter-trend
-    # candidate is not special-cased here; PA/Trend disagreement is a hard
-    # policy block regardless of market regime.
+    # Soft EMA gate — counter-trend trades are allowed but need 3 confirmations
     trend_dir = ("BUY" if trend.trend == "BULLISH" else
                  "SELL" if trend.trend == "BEARISH" else "NEUTRAL")
     _counter_trend = (candidate == "BUY" and trend_dir == "SELL") or \
                      (candidate == "SELL" and trend_dir == "BUY")
 
     # Detect regime early — needed to set the adaptive confirmation threshold.
-    regime = detect_market_regime(
-        candles,
-        trend,
-        wyckoff,
-        use_atr_high_vol,
-        use_wyckoff_phase=False,
-    )
+    regime = detect_market_regime(candles, trend, wyckoff, use_atr_high_vol)
     effective_min_confirmations = _effective_min_confirmations(
         min_confirmations,
         regime.regime,
         _counter_trend,
     )
 
-    # Entry filter — only the two allowed engines participate.  The legacy
-    # confirmation settings are retained in telemetry for compatibility, but
-    # they no longer turn this into an N-of-4 gate.
+    # Entry filter — equal-weight N-of-4 consensus; no engine is mandatory.
+    # RANGE has a narrower rule than ordinary regimes: SMC plus either
+    # Price Action or Wyckoff is sufficient; the global option-1 gate must
+    # not turn that dedicated two-confirmation playbook into a three-vote gate.
     is_range_regime = regime.regime == "RANGE"
-    # The RANGE playbook retains its edge/reversal/risk safeguards, but its
-    # confirmation gate must not reintroduce SMC/Wyckoff.
+    # A Trend-aligned entry is more exposed to a single transient EMA signal
+    # than a structure/price-action setup. Keep the ordinary operator floor,
+    # but require a second independent confirmation whenever Trend votes for
+    # the candidate direction. RANGE keeps its dedicated playbook unchanged.
+    if (
+        not is_range_regime
+        and trend_dir == candidate
+        and trend_min_confirmations > effective_min_confirmations
+    ):
+        effective_min_confirmations = trend_min_confirmations
+    ef = apply_entry_filter(
+        smc_signal      = smc.smc_signal,
+        ema_trend       = trend.trend,
+        pa_signal       = pa.pa_signal,
+        wyckoff_signal  = wyckoff.wyckoff_signal,
+        min_confirmations = effective_min_confirmations,
+        require_price_action = require_price_action and not is_range_regime,
+        require_smc_price_action_wyckoff = (
+            require_smc_price_action_wyckoff and not is_range_regime
+        ),
+        price_action_standalone=price_action_standalone,
+    )
+    # The RANGE confirmation floor is mandatory even when the optional
+    # structural filters (edge, sweep, reversal) are disabled.  Those filters
+    # may be informational, but a single strategy vote must never authorize an
+    # entry.
     if is_range_regime:
         range_votes_ok, range_votes_reason = _range_confirmation_gate(
             ef,
             range_min_confirmations,
             price_action_standalone=price_action_standalone,
-            entry_policy_only=True,
         )
         if not range_votes_ok:
             return _make_neutral(
@@ -304,11 +310,25 @@ def run_decision_engine(
             direction=candidate,
             candles=candles,
             )
-    elif not ef.allowed:
-        reason = (
-            f"Entry policy blocked: {ef.entry_reason} "
-            f"[PA={pa.pa_signal}, Trend={trend_dir}, regime={regime.regime}]"
-        )
+    elif not is_range_regime and not ef.allowed:
+        votes = (f"SMC={'✓' if ef.smc else '✗'}  "
+                 f"Trend={'✓' if ef.trend else '✗'}  "
+                 f"PA={'✓' if ef.price_action else '✗'}  "
+                 f"Wyckoff={'✓' if ef.wyckoff else '✗'}")
+        if (
+            require_smc_price_action_wyckoff
+            and not (ef.smc and ef.price_action and ef.wyckoff)
+        ):
+            reason = (
+                "Entry filter: Option 1 requires SMC + Price Action + Wyckoff — "
+                f"{votes}  [regime={regime.regime}]"
+            )
+        elif require_price_action and not ef.price_action:
+            reason = (f"Entry filter: Price Action confirmation required — "
+                      f"{votes}  [regime={regime.regime}]")
+        else:
+            reason = (f"Entry filter: only {ef.confirmation_count}/{effective_min_confirmations} "
+                      f"confirmations — {votes}  [regime={regime.regime}]")
         return _make_neutral(
             smc, wyckoff, pa, trend, [reason], [reason],
             regime_result=regime,
@@ -345,7 +365,6 @@ def run_decision_engine(
             edge_atr_distance=range_edge_atr_distance,
             strict_filters=range_entry_filters_enabled,
             require_edge_position=range_require_edge_position,
-            require_liquidity_sweep=False,
         )
         if not range_context.valid:
             return _make_neutral(
@@ -383,7 +402,6 @@ def run_decision_engine(
     conf_result  = calc_confidence(
         smc, wyckoff, pa, trend, regime, session, candidate,
         divergence_signal=divergence.signal,
-        entry_policy_only=True,
     )
 
     if conf_result.confidence < CONF_HARD_MIN:
@@ -402,9 +420,9 @@ def run_decision_engine(
         )
         return n
 
-    # SMC structure is telemetry-only for this policy.  In particular, do not
-    # let a stale/missing BOS or CHoCH turn into an entry block.
-    last_structure_bar = None
+    latest_structure = get_latest_structure_event(smc)
+    last_structure_bar = (latest_structure.bar_index
+                          if latest_structure is not None else None)
     # Feed the newest BOS/CHoCH bar through the existing quality-filter slot
     # so both event types share the same freshness gate.
     quality  = apply_quality_filter(candles, candidate, conf_result.confidence,
@@ -425,11 +443,55 @@ def run_decision_engine(
             entry_filter=ef,
         )
 
+    # Option 2 hard gate: a directional breakout that closes back inside its
+    # aligned Order Block is treated as a fake breakout.  Do not let this
+    # setup reach capital sizing or the order executor.  The existing quality
+    # result is reused so the panel receives the normal filter telemetry plus
+    # the explicit rejection flag.
+    fake_ob = detect_order_block_fake_breakout(candles, smc, candidate)
+    if fake_ob is not None:
+        fake_reason = (
+            f"Fake Breakout in {fake_ob.type.title()} Order Block "
+            f"[{fake_ob.low:.2f}, {fake_ob.high:.2f}] — entry blocked"
+        )
+        quality.allowed = False
+        quality.is_fake_breakout = True
+        quality.blocked_reasons.append(fake_reason)
+        return DecisionResult(
+            allowed=False, direction=candidate,  # type: ignore
+            confidence=conf_result.confidence, components=conf_result.components,
+            grade=conf_result.grade, regime=regime.regime,
+            regime_label=regime.rules.label, regime_rules=regime.rules,
+            quality_filter=quality,
+            blocked_reasons=[fake_reason],
+            reasoning=conf_result.reasoning + [fake_reason],
+            trade_params=None,
+            smc=smc, wyckoff=wyckoff, pa=pa, trend=trend,
+            entry_filter=ef,
+            divergence=divergence,
+            dxy_signal=dxy_signal,
+        )
+
     # Capital manager inputs
+    aligned_obs = [ob for ob in smc.order_blocks
+                   if ob.type == ("BULLISH" if candidate == "BUY" else "BEARISH")]
+    latest_ob = aligned_obs[-1] if aligned_obs else None
+
     entry = last_candle.close
 
-    # SMC order blocks, BOS/CHoCH, and equal levels remain visible in
-    # telemetry but cannot influence stop sizing or a downstream risk block.
+    # H-1 FIX: use most-recent directionally-valid BOS price as the SL anchor,
+    # not the global max/min across all time.
+    # BUY SL anchor: most recent SELL-BOS price below entry (= broken swing low)
+    # SELL SL anchor: most recent BUY-BOS price above entry (= broken swing high)
+    sell_bos_below = [b.price for b in smc.bos_signals if b.type == "SELL" and b.price < entry]
+    buy_bos_above  = [b.price for b in smc.bos_signals if b.type == "BUY"  and b.price > entry]
+
+    # H-2 FIX: populate support/resistance from SMC equal levels (previously always None).
+    # Equal lows = institutional demand / support; equal highs = supply / resistance.
+    eq_support    = (smc.equal_lows[-1].price
+                     if smc.equal_lows  and smc.equal_lows[-1].price  < entry else None)
+    eq_resistance = (smc.equal_highs[-1].price
+                     if smc.equal_highs and smc.equal_highs[-1].price > entry else None)
     range_support = (
         range_context.support
         if range_context is not None and range_context.support < entry
@@ -452,12 +514,12 @@ def run_decision_engine(
             else risk_percent
         ),
         take_profit_rr=range_min_rr if regime.regime == "RANGE" else FIXED_TP_RR,
-        order_block_top=None,
-        order_block_bottom=None,
-        swing_high=None,
-        swing_low=None,
-        support_level=range_support,
-        resistance_level=range_resistance,
+        order_block_top=latest_ob.high if latest_ob else None,
+        order_block_bottom=latest_ob.low if latest_ob else None,
+        swing_high=buy_bos_above[-1]  if buy_bos_above  else None,
+        swing_low=sell_bos_below[-1]  if sell_bos_below else None,
+        support_level=range_support or eq_support,
+        resistance_level=range_resistance or eq_resistance,
         take_profit_level=(
             range_resistance if candidate == "BUY" else range_support
         ),
@@ -550,8 +612,10 @@ def describe_strategy(decision: "DecisionResult") -> dict:
     """
     ef = decision.entry_filter
     _ENGINE_NAMES = {
+        "smc":          "Smart Money Concepts (structure)",
         "trend":        "Trend (EMA alignment)",
         "price_action": "Price Action",
+        "wyckoff":      "Wyckoff",
     }
     if ef is not None:
         confirmations = [
@@ -610,17 +674,13 @@ def describe_strategy(decision: "DecisionResult") -> dict:
 
     return {
         "direction":           decision.direction,
-        "allowed":             bool(decision.allowed),
-        "entry_reason":        (
-            ef.entry_reason if ef is not None else "BLOCKED_NO_SIGNAL"
-        ),
         "grade":               decision.grade,
         "confidence":          round(decision.confidence, 1),
         "regime":              decision.regime,
         "regime_label":        decision.regime_label,
         "confirmations":       confirmations,
         "confirmation_count":  confirmation_count,
-        "confirmation_total":  2,
+        "confirmation_total":  4,
         # Top signal-level reasons behind the confidence score (e.g. "BOS
         # confirmed", "Strong EMA alignment (50/100/200)", "Spring confirmed").
         "signals":             list(decision.reasoning[:6]),
@@ -636,11 +696,8 @@ def describe_strategy(decision: "DecisionResult") -> dict:
                 "wyckoff": decision.wyckoff.wyckoff_signal,
             },
             "confirmed": confirmation_count,
-            "total": 2,
-            "allowed": bool(decision.allowed),
-            "entry_reason": (
-                ef.entry_reason if ef is not None else "BLOCKED_NO_SIGNAL"
-            ),
+            "total": 4,
+            "allowed": bool(ef.allowed) if ef is not None else False,
         },
         "confidence_stage": {
             "total": round(components.total, 1),

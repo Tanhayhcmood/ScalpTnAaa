@@ -379,7 +379,7 @@ class MessageFormatter:
             regime_label = strategy.get("regime_label", "—")
             confirmations = strategy.get("confirmations") or []
             count = strategy.get("confirmation_count", len(confirmations))
-            total = strategy.get("confirmation_total", 2)
+            total = strategy.get("confirmation_total", 4)
             signals = strategy.get("signals") or []
 
             grade_icons = {"PRIME": "🥇", "HIGH": "🥈", "MARGINAL": "🥉"}

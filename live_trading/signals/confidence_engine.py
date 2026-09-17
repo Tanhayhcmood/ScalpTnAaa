@@ -252,15 +252,7 @@ def calc_confidence(
     candidate:        str,
     divergence_signal: str = "NEUTRAL",
     dxy_signal:        str = "NEUTRAL",
-    entry_policy_only: bool = False,
 ) -> ConfidenceResult:
-    """Calculate confidence while optionally isolating the live entry policy.
-
-    ``entry_policy_only`` keeps the legacy component calculations available
-    for telemetry, but removes SMC, Wyckoff, liquidity, and divergence from
-    the score used by the entry safety floor.  This prevents display-only
-    engines from indirectly changing ``allow/block`` through confidence.
-    """
     smc_s,  smc_r  = _calc_smc_score(smc, candidate)
     tr_s,   tr_r   = _calc_trend_score(trend, candidate)
     pa_s,   pa_r   = _calc_pa_score(pa, candidate)
@@ -274,12 +266,7 @@ def calc_confidence(
     # but deliberately do not evaluate it here.
     dxy_s, dxy_r = 0.0, []
 
-    if entry_policy_only:
-        # Only Price Action and EMA Trend may influence the live entry score.
-        # The excluded component values remain available in telemetry above.
-        raw_total = tr_s + pa_s + vol_s
-    else:
-        raw_total = smc_s + tr_s + pa_s + wy_s + liq_s + vol_s + div_s + dxy_s
+    raw_total  = smc_s + tr_s + pa_s + wy_s + liq_s + vol_s + div_s + dxy_s
     total_capped = round(min(100.0, max(0.0, raw_total)), 1)
 
     comp = ConfidenceComponents(

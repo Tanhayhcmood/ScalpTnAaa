@@ -1123,14 +1123,10 @@ class GoldScalperLive:
             "candle_time": last_c.time,
             "timeframe": tf,
             "entry_policy": {
-                "allowed_engines": ["price_action", "trend"],
-                "min_confirmations": 2,
-                "trend_min_confirmations": 2,
-                "price_action_standalone": True,
-                "require_price_action": False,
-                "entry_reason": _strategy_telemetry.get(
-                    "entry_reason", "BLOCKED_NO_SIGNAL"
-                ),
+                "min_confirmations": MIN_CONFIRMATIONS,
+                "trend_min_confirmations": TREND_MIN_CONFIRMATIONS,
+                "price_action_standalone": bool(PRICE_ACTION_STANDALONE),
+                "require_price_action": bool(REQUIRE_PRICE_ACTION),
                 "confidence_hard_min": CONF_HARD_MIN,
                 "risk_percent": RISK_PERCENT,
             },
@@ -1264,6 +1260,44 @@ class GoldScalperLive:
                 decision.blocked_reasons or ["No signal"],
             )
             log.info(f"No trade → {reasons}")
+            self._write_state(
+                "SCANNING", acc_info, decision, pos,
+                extra=self._guardian_extra(gs),
+            )
+            return
+
+        # Final defense-in-depth check for RANGE.  The structural RANGE
+        # filters may be disabled for telemetry-only operation.  An explicit
+        # standalone Price Action policy may lower only the confirmation floor
+        # to one aligned PA vote; all other entry gates remain mandatory.
+        _range_confirmation_floor = (
+            1
+            if (
+                PRICE_ACTION_STANDALONE
+                and decision.entry_filter is not None
+                and decision.entry_filter.price_action
+            )
+            else RANGE_MIN_CONFIRMATIONS
+        )
+        if (
+            decision.regime == "RANGE"
+            and decision.entry_filter is not None
+            and decision.entry_filter.confirmation_count < _range_confirmation_floor
+        ):
+            _range_confirmation_reason = (
+                f"RANGE entry blocked: "
+                f"{decision.entry_filter.confirmation_count}/"
+                f"{_range_confirmation_floor} confirmations"
+            )
+            self._set_trade_permission(
+                False,
+                "RANGE_CONFIRMATIONS_BLOCKED",
+                [_range_confirmation_reason],
+            )
+            log.error(
+                "Order blocked by final RANGE confirmation safety check: "
+                f"{_range_confirmation_reason}"
+            )
             self._write_state(
                 "SCANNING", acc_info, decision, pos,
                 extra=self._guardian_extra(gs),
