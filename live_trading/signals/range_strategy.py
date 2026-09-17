@@ -74,6 +74,7 @@ def evaluate_range_entry(
     edge_atr_distance: float = 0.25,
     strict_filters: bool = True,
     require_edge_position: bool = False,
+    require_liquidity_sweep: bool = True,
 ) -> RangeContext:
     """Evaluate the explicit range playbook using only closed candles.
 
@@ -142,7 +143,7 @@ def evaluate_range_entry(
             f"RANGE entry blocked: price is in the {location.lower()}, "
             f"not at the {('support' if direction == 'BUY' else 'resistance')} edge"
         )
-    elif not sweep:
+    elif require_liquidity_sweep and not sweep:
         valid = False
         reason = "RANGE entry blocked: no fresh same-direction Liquidity Sweep"
     elif not reversal:

@@ -1,14 +1,10 @@
-"""Exact option 1 entry-gate tests.
-
-Option 1 requires same-direction SMC + Price Action + Wyckoff.
-EMA is intentionally not a required vote for this option.
-"""
+"""Regression tests for the fixed Price Action + Trend entry policy."""
 
 from live_trading.signals.decision_engine import _allow_without_smc_for_quality
 from live_trading.signals.entry_filter import apply_entry_filter
 
 
-def test_option_one_allows_without_ema_when_three_required_engines_agree():
+def test_price_action_standalone_ignores_display_only_engines():
     result = apply_entry_filter(
         smc_signal="BUY",
         ema_trend="NEUTRAL",
@@ -20,10 +16,11 @@ def test_option_one_allows_without_ema_when_three_required_engines_agree():
 
     assert result.allowed is True
     assert result.direction == "BUY"
-    assert result.confirmation_count == 3
+    assert result.confirmation_count == 1
+    assert result.entry_reason == "PA_STANDALONE"
 
 
-def test_option_one_blocks_when_wyckoff_disagrees():
+def test_wyckoff_disagreement_does_not_block_aligned_pa_and_trend():
     result = apply_entry_filter(
         smc_signal="BUY",
         ema_trend="BULLISH",
@@ -33,11 +30,12 @@ def test_option_one_blocks_when_wyckoff_disagrees():
         require_smc_price_action_wyckoff=True,
     )
 
-    assert result.allowed is False
-    assert result.direction == "NEUTRAL"
+    assert result.allowed is True
+    assert result.direction == "BUY"
+    assert result.entry_reason == "PA+TREND_ALIGNED"
 
 
-def test_option_one_blocks_when_price_action_is_missing():
+def test_trend_only_is_blocked_even_when_display_only_engines_agree():
     result = apply_entry_filter(
         smc_signal="SELL",
         ema_trend="BEARISH",
@@ -48,7 +46,9 @@ def test_option_one_blocks_when_price_action_is_missing():
     )
 
     assert result.allowed is False
-    assert result.direction == "NEUTRAL"
+    assert result.direction == "SELL"
+    assert result.confirmation_count == 1
+    assert result.entry_reason == "BLOCKED_TREND_ONLY"
 
 
 def test_price_action_can_open_without_other_engine_votes():
@@ -70,7 +70,7 @@ def test_price_action_can_open_without_other_engine_votes():
     assert result.wyckoff is False
 
 
-def test_non_price_action_engine_still_needs_ordinary_confirmations():
+def test_display_only_engine_cannot_authorize_an_entry():
     result = apply_entry_filter(
         smc_signal="BUY",
         ema_trend="NEUTRAL",
@@ -82,7 +82,8 @@ def test_non_price_action_engine_still_needs_ordinary_confirmations():
 
     assert result.allowed is False
     assert result.direction == "NEUTRAL"
-    assert result.confirmation_count == 1
+    assert result.confirmation_count == 0
+    assert result.entry_reason == "BLOCKED_NO_SIGNAL"
 
 def test_price_action_standalone_reaches_quality_gate_without_two_confirmations():
     result = apply_entry_filter(

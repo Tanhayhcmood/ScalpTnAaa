@@ -8,7 +8,7 @@ from live_trading.signals.gold_engine import OHLCV
 from live_trading.signals.quality_filter import apply_quality_filter
 
 
-def test_any_two_non_smc_strategies_can_open_an_entry():
+def test_price_action_and_trend_can_open_when_aligned():
     result = apply_entry_filter(
         smc_signal="NEUTRAL",
         ema_trend="BULLISH",
@@ -23,6 +23,47 @@ def test_any_two_non_smc_strategies_can_open_an_entry():
     assert result.smc is False
     assert result.trend is True
     assert result.price_action is True
+    assert result.entry_reason == "PA+TREND_ALIGNED"
+
+
+def test_trend_alone_is_hard_blocked():
+    result = apply_entry_filter(
+        smc_signal="BUY",
+        ema_trend="BULLISH",
+        pa_signal="NEUTRAL",
+        wyckoff_signal="BUY",
+    )
+
+    assert result.allowed is False
+    assert result.direction == "BUY"
+    assert result.confirmation_count == 1
+    assert result.entry_reason == "BLOCKED_TREND_ONLY"
+
+
+def test_price_action_trend_conflict_is_hard_blocked():
+    result = apply_entry_filter(
+        smc_signal="BUY",
+        ema_trend="BEARISH",
+        pa_signal="BUY",
+        wyckoff_signal="BUY",
+    )
+
+    assert result.allowed is False
+    assert result.direction == "NEUTRAL"
+    assert result.entry_reason == "BLOCKED_CONFLICT"
+
+
+def test_no_allowed_engine_signal_is_blocked():
+    result = apply_entry_filter(
+        smc_signal="BUY",
+        ema_trend="NEUTRAL",
+        pa_signal="NEUTRAL",
+        wyckoff_signal="BUY",
+    )
+
+    assert result.allowed is False
+    assert result.confirmation_count == 0
+    assert result.entry_reason == "BLOCKED_NO_SIGNAL"
 
 
 def test_opposing_two_to_two_vote_is_blocked():
@@ -38,7 +79,7 @@ def test_opposing_two_to_two_vote_is_blocked():
     assert result.direction == "NEUTRAL"
 
 
-def test_single_strategy_vote_cannot_pass_two_confirmation_policy():
+def test_price_action_can_open_alone():
     result = apply_entry_filter(
         smc_signal="NEUTRAL",
         ema_trend="NEUTRAL",
@@ -48,9 +89,10 @@ def test_single_strategy_vote_cannot_pass_two_confirmation_policy():
         price_action_standalone=False,
     )
 
-    assert result.allowed is False
-    assert result.direction == "NEUTRAL"
+    assert result.allowed is True
+    assert result.direction == "BUY"
     assert result.confirmation_count == 1
+    assert result.entry_reason == "PA_STANDALONE"
 
 
 def test_candidate_direction_uses_the_consensus_not_smc_alone():
@@ -64,7 +106,7 @@ def test_candidate_direction_uses_the_consensus_not_smc_alone():
     assert result == "BUY"
 
 
-def test_candidate_direction_is_neutral_on_a_tie():
+def test_candidate_direction_ignores_display_only_engine_conflict():
     result = _candidate_direction(
         SimpleNamespace(smc_signal="BUY"),
         SimpleNamespace(wyckoff_signal="SELL"),
@@ -72,7 +114,7 @@ def test_candidate_direction_is_neutral_on_a_tie():
         SimpleNamespace(trend="BEARISH"),
     )
 
-    assert result == "NEUTRAL"
+    assert result == "BUY"
 
 
 def test_quality_filter_does_not_reintroduce_an_smc_mandate():

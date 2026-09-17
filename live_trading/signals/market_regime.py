@@ -126,6 +126,7 @@ def detect_market_regime(
     trend: TrendResult,
     wyckoff: WyckoffResult,
     use_atr_high_vol: bool = False,
+    use_wyckoff_phase: bool = True,
 ) -> RegimeResult:
     atr, atr_mean, atr_ratio = _calc_atr_values(candles, 20)
     adx = calc_adx(candles, 14)
@@ -160,10 +161,13 @@ def detect_market_regime(
             return make("WEAK_TREND_BULL", f"ADX {adx} — developing bull trend")
         return make("WEAK_TREND_BEAR", f"ADX {adx} — developing bear trend")
 
-    if wyckoff.phase == "ACCUMULATION":
+    # Wyckoff remains available for analysis and telemetry.  The live entry
+    # policy can disable its phase-driven regime so a display-only engine
+    # cannot change directional allow/block decisions.
+    if use_wyckoff_phase and wyckoff.phase == "ACCUMULATION":
         return make("ACCUMULATION", "Wyckoff Accumulation" +
                     (" + Spring" if wyckoff.spring else ""))
-    if wyckoff.phase == "DISTRIBUTION":
+    if use_wyckoff_phase and wyckoff.phase == "DISTRIBUTION":
         return make("DISTRIBUTION", "Wyckoff Distribution" +
                     (" + Upthrust" if wyckoff.upthrust else ""))
 

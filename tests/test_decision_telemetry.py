@@ -48,8 +48,8 @@ def test_regime_block_preserves_direction_regime_and_votes():
     entry_filter = EntryFilterResult(
         allowed=True,
         direction="SELL",
-        confirmation_count=2,
-        smc=True,
+        confirmation_count=1,
+        smc=False,
         trend=True,
         price_action=False,
         wyckoff=False,
@@ -88,8 +88,8 @@ def test_blocked_decision_telemetry_reports_aligned_confirmations():
     entry_filter = EntryFilterResult(
         allowed=True,
         direction="SELL",
-        confirmation_count=2,
-        smc=True,
+        confirmation_count=1,
+        smc=False,
         trend=True,
         price_action=False,
         wyckoff=False,
@@ -110,8 +110,7 @@ def test_blocked_decision_telemetry_reports_aligned_confirmations():
     ).describe_strategy(result)
 
     assert telemetry["direction"] == "SELL"
-    assert telemetry["confirmation_count"] == 2
+    assert telemetry["confirmation_count"] == 1
     assert telemetry["confirmations"] == [
-        "Smart Money Concepts (structure)",
         "Trend (EMA alignment)",
-    ]
+    ]  # PA is neutral; SMC is telemetry-only
