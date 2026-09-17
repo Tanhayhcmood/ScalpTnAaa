@@ -56,6 +56,7 @@ from live_trading.logger import get_logger
 from live_trading.risk.guardian import RiskGuardian, GuardianStatus
 from live_trading.risk.trailing_stop import (
     TrailingConfig, compute_staircase_sl, should_apply, r_multiple_of,
+    stage_for_r,
 )
 from live_trading.signals.decision_engine import run_decision_engine, DecisionResult, describe_strategy
 from live_trading.signals.mtf_filter import compute_mtf_bias, mtf_allows_trade, MtfBias
@@ -310,6 +311,7 @@ class GoldScalperLive:
         # Cached ATR (price units) from the last completed bar — reused by the
         # trailing engine between bars so it doesn't need its own candle fetch.
         self._last_atr: float = 0.0
+        self._trailing_sync_reason: str = "initial"
 
     # ── Entry point ───────────────────────────────────────────────────────────
 
@@ -336,6 +338,10 @@ class GoldScalperLive:
 
         # Restore trade history from previous session (survives restarts)
         self.trade_history = self._load_trade_history()
+        # Restore per-ticket entry/initial-SL baselines before the first broker
+        # sync.  These are persisted separately from trade history because the
+        # live SL changes while the original R baseline must never change.
+        self._load_trailing_state()
 
         connected = await connect_with_retry(max_attempts=12, retry_delay=30.0)
         if not connected:
@@ -507,6 +513,10 @@ class GoldScalperLive:
             _checkpoint("before calibrate_wyckoff")
             await self._sync_broker_trade_history(force=True)
             _checkpoint("after broker history sync")
+            await self._run_stage(
+                "startup trailing sync",
+                self._sync_trailing_positions("startup"),
+            )
             await self._calibrate_wyckoff()
             _checkpoint("after calibrate_wyckoff")
             # Write RUNNING state immediately after connect with real account data
@@ -587,6 +597,10 @@ class GoldScalperLive:
                 if self._reconnect_attempts > 0:
                     log.info(
                         f"✅ Reconnected after {self._reconnect_attempts} attempt(s)"
+                    )
+                    await self._run_stage(
+                        "reconnect trailing sync",
+                        self._sync_trailing_positions("reconnect"),
                     )
                     self._reconnect_attempts = 0
 
@@ -1629,6 +1643,7 @@ class GoldScalperLive:
                         "direction":     entry.get("direction", pos.get("type", "BUY")),
                         "entry":         float(entry["entry"]),
                         "risk_distance": risk,
+                        "initial_sl":    float(entry["sl"]),
                     }
                 break
         # Fallback: derive from the position's live snapshot.
@@ -1643,30 +1658,30 @@ class GoldScalperLive:
                 "direction":     pos.get("type", "BUY"),
                 "entry":         float(pos.get("open_price", 0.0)),
                 "risk_distance": risk,
+                "initial_sl":    float(pos.get("sl", 0.0)),
             }
         return None
 
+    async def _sync_trailing_positions(self, reason: str) -> None:
+        """Explicitly resync all open tickets after startup or reconnect."""
+        self._trailing_sync_reason = reason
+        log.info("Trailing sync: reason=%s", reason)
+        await self._manage_trailing_stop()
+
     async def _manage_trailing_stop(self) -> None:
-        """Check EVERY open position and ratchet each one's SL forward.
+        """Manage every open ticket independently on every loop tick.
 
-        Runs on every loop tick (every BAR_CHECK_INTERVAL seconds) — not just
-        on M5 candle close — so the stop reacts within seconds of price
-        moving through a staircase step, instead of waiting up to 5 minutes.
-
-        FIX: this previously looked only at raw_positions[0] — correct while
-        the robot truly ever had at most one open position, but silently
-        wrong the moment more than one position exists at once (e.g. a
-        MAX_OPEN_TRADES bypass, or positions carried over from before that
-        was fixed): every position after the first got no SL management at
-        all — its stop stayed exactly where it was placed at entry no
-        matter how deep into profit price ran. Every currently open position
-        now gets its own independent staircase, keyed by ticket.
+        Position modifications are gathered concurrently with
+        ``return_exceptions=True``.  A broker error for one ticket therefore
+        cannot prevent the other open positions from receiving their update.
         """
         if not self.trailing_enabled:
             return
 
         try:
-            raw_positions = await get_open_positions(SYMBOL, self._known_open_tickets())
+            raw_positions = await get_open_positions(
+                SYMBOL, self._known_open_tickets()
+            )
         except RuntimeError as exc:
             log.debug(f"Trailing check skipped — could not fetch positions: {exc}")
             return
@@ -1676,38 +1691,44 @@ class GoldScalperLive:
             self._last_trailing_statuses = {}
             return
 
-        # Drop baselines/status for any position that is no longer open
-        # (closed by SL/TP/manual close) so stale entries don't accumulate.
         live_ids = {str(mt5_pos_to_dict(raw)["id"]) for raw in raw_positions}
         self._trail_baselines = {
-            pid: b for pid, b in self._trail_baselines.items() if pid in live_ids
+            pid: baseline
+            for pid, baseline in self._trail_baselines.items()
+            if pid in live_ids
         }
         self._last_trailing_statuses = {
-            pid: s for pid, s in self._last_trailing_statuses.items() if pid in live_ids
+            pid: status
+            for pid, status in self._last_trailing_statuses.items()
+            if pid in live_ids
         }
 
         quote = await get_current_quote(SYMBOL)
         if not quote:
-            return  # no live price this tick — try again next tick
+            return
 
-        for raw in raw_positions:
-            pos = mt5_pos_to_dict(raw)
+        async def update_ticket(raw_position: dict) -> None:
+            pos = mt5_pos_to_dict(raw_position)
             pos_id = str(pos["id"])
-
             baseline = self._trail_baselines.get(pos_id)
             if not baseline:
                 baseline = self._restore_trail_baseline(pos)
                 if baseline:
                     self._trail_baselines[pos_id] = baseline
             if not baseline:
-                continue  # no reliable risk baseline for this one — never trail blind
+                self._last_trailing_statuses[pos_id] = {
+                    "active": False,
+                    "action": "SKIP",
+                    "reason": "missing baseline",
+                }
+                log.warning(
+                    "Trailing update: ticket=%s action=SKIP reason=missing baseline",
+                    pos_id,
+                )
+                return
 
-            direction = baseline["direction"]
-            # Close-side price: a BUY exits (and is stopped out) at the bid,
-            # a SELL exits at the ask — trailing off the wrong side would
-            # trail too aggressively by the full spread.
-            current_price = quote["bid"] if direction.upper() == "BUY" else quote["ask"]
-
+            direction = str(baseline["direction"]).upper()
+            current_price = quote["bid"] if direction == "BUY" else quote["ask"]
             candidate_sl = compute_staircase_sl(
                 direction=direction,
                 entry=baseline["entry"],
@@ -1716,37 +1737,102 @@ class GoldScalperLive:
                 atr=self._last_atr,
                 cfg=self._trailing_cfg,
             )
-
             r_now = r_multiple_of(
-                direction, baseline["entry"], baseline["risk_distance"], current_price,
+                direction,
+                baseline["entry"],
+                baseline["risk_distance"],
+                current_price,
+            )
+            stage, threshold = stage_for_r(r_now, self._trailing_cfg)
+            applicable = should_apply(
+                direction,
+                pos["sl"],
+                candidate_sl,
+                self._trailing_cfg.min_step_price,
+            )
+            action = "MODIFY" if applicable else "HOLD"
+            reason_text = (
+                "stage reached"
+                if candidate_sl is not None
+                else "threshold not reached"
             )
             self._last_trailing_statuses[pos_id] = {
-                "active":       candidate_sl is not None,
-                "r_multiple":   r_now,
-                "current_sl":   pos["sl"],
+                "active": candidate_sl is not None,
+                "stage": stage,
+                "threshold": threshold,
+                "r_multiple": r_now,
+                "current_sl": pos["sl"],
                 "candidate_sl": candidate_sl,
+                "action": action,
+                "reason": reason_text,
+                "sync_reason": self._trailing_sync_reason,
             }
+            log.info(
+                "Trailing update: ticket=%s profit/R=%.3f threshold=%s "
+                "stage=%s reason=%s action=%s",
+                pos_id,
+                r_now,
+                threshold,
+                stage,
+                reason_text,
+                action,
+            )
+            if not applicable:
+                return
 
-            if not should_apply(direction, pos["sl"], candidate_sl, self._trailing_cfg.min_step_price):
-                continue
-
-            result = await modify_position(pos["id"], candidate_sl, pos["tp"])
+            try:
+                result = await modify_position(pos["id"], candidate_sl, pos["tp"])
+            except Exception as exc:
+                self._last_trailing_statuses[pos_id].update(
+                    {"action": "ERROR", "reason": f"modify exception: {exc}"}
+                )
+                log.exception("Trailing update: ticket=%s action=ERROR", pos_id)
+                return
             if result.success:
-                log.info(
-                    f"📐 Trailing stop advanced — position {pos['id']}  "
-                    f"{direction}  +{r_now:.2f}R  SL {pos['sl']:.2f} → {candidate_sl:.2f}"
+                self._last_trailing_statuses[pos_id].update(
+                    {"action": "MODIFIED", "reason": "stage lock advanced"}
                 )
                 log_trade(self.trade_history, {
                     "position_id": pos["id"],
-                    "action":      "TRAIL_SL",
-                    "direction":   direction,
-                    "r_multiple":  r_now,
-                    "old_sl":      pos["sl"],
-                    "new_sl":      candidate_sl,
+                    "action": "TRAIL_SL",
+                    "direction": direction,
+                    "r_multiple": r_now,
+                    "threshold": threshold,
+                    "stage": stage,
+                    "old_sl": pos["sl"],
+                    "new_sl": candidate_sl,
                 })
+                log.info(
+                    "Trailing update: ticket=%s profit/R=%.3f threshold=%s "
+                    "reason=stage lock advanced action=MODIFIED",
+                    pos_id,
+                    r_now,
+                    threshold,
+                )
             else:
+                self._last_trailing_statuses[pos_id].update(
+                    {"action": "ERROR", "reason": result.message}
+                )
                 log.warning(
-                    f"Trailing stop modify failed for position {pos['id']}: {result.message}"
+                    "Trailing update: ticket=%s profit/R=%.3f threshold=%s "
+                    "reason=modify failed: %s action=ERROR",
+                    pos_id,
+                    r_now,
+                    threshold,
+                    result.message,
+                )
+
+        results = await asyncio.gather(
+            *(update_ticket(raw) for raw in raw_positions),
+            return_exceptions=True,
+        )
+        for raw, result in zip(raw_positions, results):
+            if isinstance(result, Exception):
+                ticket = mt5_pos_to_dict(raw).get("id")
+                log.exception(
+                    "Trailing update: ticket=%s action=ERROR reason=worker failure",
+                    ticket,
+                    exc_info=result,
                 )
 
     async def _reconcile_closed_trades(self) -> None:
@@ -2433,6 +2519,50 @@ class GoldScalperLive:
 
     # ── Trade history persistence (survives restarts) ─────────────────────────
 
+    def _load_trailing_state(self) -> None:
+        """Restore immutable per-ticket R baselines from file or Redis."""
+        state = None
+        try:
+            from live_trading.redis_ipc import redis_read_state
+            state = redis_read_state()
+        except Exception as exc:
+            log.debug("Trailing state Redis restore skipped: %s", exc)
+        if state is None:
+            try:
+                if os.path.exists(STATE_FILE):
+                    with open(STATE_FILE, "r", encoding="utf-8") as state_file:
+                        state = json.load(state_file)
+            except Exception as exc:
+                log.warning("Trailing state file restore failed: %s", exc)
+
+        trailing = state.get("trailing_stop", {}) if isinstance(state, dict) else {}
+        persisted = trailing.get("baselines", {}) if isinstance(trailing, dict) else {}
+        restored = {}
+        for ticket, baseline in (persisted.items() if isinstance(persisted, dict) else []):
+            if not isinstance(baseline, dict):
+                continue
+            try:
+                entry = float(baseline["entry"])
+                risk_distance = float(baseline["risk_distance"])
+                if risk_distance <= 0:
+                    continue
+                restored[str(ticket)] = {
+                    "id": str(baseline.get("id", ticket)),
+                    "direction": str(baseline["direction"]).upper(),
+                    "entry": entry,
+                    "risk_distance": risk_distance,
+                    "initial_sl": float(baseline.get("initial_sl", 0.0)),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+        self._trail_baselines.update(restored)
+        if restored:
+            log.info(
+                "Trailing baseline restore: tickets=%s source=%s",
+                ",".join(sorted(restored)),
+                "redis" if state and not os.path.exists(STATE_FILE) else "state",
+            )
+
     def _load_trade_history(self) -> List[dict]:
         """
         Restore trade history from the last written robot_state.json, falling
@@ -2550,11 +2680,13 @@ class GoldScalperLive:
             merged_extra.update(
                 self._guardian_extra(self._last_guardian_status)
             )
-        if self._last_trailing_statuses:
+        if self._trail_baselines or self._last_trailing_statuses:
             merged_extra["trailing_stop"] = {
                 "enabled": self.trailing_enabled,
-                # Keyed by position ticket id so the panel can show every
-                # open position's own staircase progress, not just one.
+                # Baselines are immutable per-ticket entry/risk snapshots.
+                # Persist them beside live telemetry so a restart cannot
+                # mistake a trailed SL for the original risk.
+                "baselines": dict(self._trail_baselines),
                 "positions": dict(self._last_trailing_statuses),
             }
         if extra:

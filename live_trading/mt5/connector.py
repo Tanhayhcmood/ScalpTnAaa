@@ -18,6 +18,7 @@ MTAPI endpoints used:
     GET  /AccountSummary   – balance, equity, margin
     GET  /OpenedOrders     – open positions
     GET  /HistoryPositions – completed positions by ticket
+    GET  /OrderHistory    – account order/deal history by UTC range
     GET  /PriceHistoryV2   – OHLCV candles (ISO datetime range)
     GET  /GetQuote         – current bid/ask price
     GET  /SymbolList       – verify the configured instrument is available
@@ -801,9 +802,9 @@ async def get_deals_by_time_range(
 ) -> list[dict]:
     """Return normalized account deals for a UTC time range.
 
-    MTAPI deployments expose position history rather than MetaAPI's RPC deal
-    range. Keep the RPC-shaped compatibility seam for tests/adapters, and
-    return an empty history when the hosted endpoint has no range contract.
+    MTAPI's real history endpoint is ``GET /OrderHistory?id=...&from=...&to=...``.
+    Keep the RPC-shaped compatibility seam for tests/adapters, but never
+    silently return an empty history on the production path.
     """
     legacy_connection = globals().get("_connection")
     get_deals = getattr(legacy_connection, "get_deals_by_time_range", None)
@@ -815,7 +816,60 @@ async def get_deals_by_time_range(
         if isinstance(raw, dict):
             raw = raw.get("deals") or raw.get("items") or raw.get("data") or []
         return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
-    return []
+
+    from_str = start_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    to_str = end_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for attempt in range(2):
+        if not _conn_id and not await ensure_connected():
+            raise RuntimeError("get_deals_by_time_range: not connected to MTAPI")
+        try:
+            async with _get_session().get(
+                f"{_base_url}/OrderHistory",
+                params={"id": _conn_id, "from": from_str, "to": to_str},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if attempt == 0 and isinstance(data, dict) and "stackTrace" in data:
+                    _invalidate_connection()
+                    continue
+                if resp.status >= 400:
+                    message = (
+                        data.get("message", f"HTTP {resp.status}")
+                        if isinstance(data, dict)
+                        else f"HTTP {resp.status}"
+                    )
+                    raise RuntimeError(f"MTAPI OrderHistory error: {message}")
+
+                if isinstance(data, list):
+                    rows = data
+                elif isinstance(data, dict):
+                    rows = (
+                        data.get("orders")
+                        or data.get("deals")
+                        or data.get("items")
+                        or data.get("history")
+                        or data.get("data")
+                        or []
+                    )
+                else:
+                    rows = []
+                if isinstance(rows, dict):
+                    rows = (
+                        rows.get("orders")
+                        or rows.get("deals")
+                        or rows.get("items")
+                        or rows.get("data")
+                        or []
+                    )
+                return [row for row in rows if isinstance(row, dict)]
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            if attempt == 0:
+                _invalidate_connection()
+                continue
+            raise RuntimeError(f"get_deals_by_time_range failed: {exc}") from exc
+    raise RuntimeError("get_deals_by_time_range: failed after reconnect attempt")
 
 
 def _parse_open_positions_response(

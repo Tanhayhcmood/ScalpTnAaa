@@ -4,6 +4,34 @@ from datetime import datetime, timezone
 
 import pytest
 
+from live_trading.risk.trailing_stop import (
+    TrailingConfig,
+    compute_staircase_sl,
+)
+
+
+def test_three_stage_trailing_locks_breakeven_half_r_and_one_r():
+    cfg = TrailingConfig(min_step_price=0.01)
+
+    assert compute_staircase_sl("BUY", 100.0, 10.0, 110.0, 0.0, cfg) == 101.0
+    assert compute_staircase_sl("BUY", 100.0, 10.0, 115.0, 0.0, cfg) == 105.0
+    assert compute_staircase_sl("BUY", 100.0, 10.0, 120.0, 0.0, cfg) == 110.0
+
+
+def test_atr_trail_cannot_weaken_one_r_lock():
+    cfg = TrailingConfig(atr_gap_mult=2.0, min_step_price=0.01)
+
+    # A wide ATR would put the raw ATR candidate below the 1R lock.
+    assert compute_staircase_sl("BUY", 100.0, 10.0, 120.0, 20.0, cfg) == 110.0
+    assert compute_staircase_sl("SELL", 100.0, 10.0, 80.0, 20.0, cfg) == 90.0
+
+
+def test_three_stage_trailing_is_directionally_symmetric():
+    cfg = TrailingConfig(min_step_price=0.01)
+
+    assert compute_staircase_sl("SELL", 100.0, 10.0, 90.0, 0.0, cfg) == 99.0
+    assert compute_staircase_sl("SELL", 100.0, 10.0, 85.0, 0.0, cfg) == 95.0
+    assert compute_staircase_sl("SELL", 100.0, 10.0, 80.0, 0.0, cfg) == 90.0
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
