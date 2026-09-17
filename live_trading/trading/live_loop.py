@@ -23,6 +23,7 @@ Resilience improvements over baseline:
 """
 import asyncio
 import json
+import math
 import os
 import re
 import sys
@@ -59,6 +60,9 @@ from live_trading.risk.guardian import RiskGuardian, GuardianStatus
 from live_trading.risk.adaptive_trailing_stop import (
     AdaptiveTrailingConfig, atr, compute_adaptive_trail, should_apply,
 )
+from live_trading.risk.capital_manager import (
+    LOT_DOLLAR_PER_UNIT, MAX_FIXED_LOT_RISK_USD, CapitalOutput,
+)
 from live_trading.signals.decision_engine import run_decision_engine, DecisionResult, describe_strategy
 from live_trading.signals.mtf_filter import (
     compute_mtf_bias,
@@ -74,6 +78,7 @@ from live_trading.mt5.connector import (
     check_symbol_available,
     get_open_positions, get_last_completed_bar_time,
     get_current_quote, get_closed_position_history, get_deals_by_time_range,
+    get_symbol_params,
     mt5_pos_to_dict,
 )
 from live_trading.mt5.executor import (
@@ -132,6 +137,276 @@ def _normalize_bar_time(value: object) -> Optional[datetime]:
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
     return parsed
+
+
+def _numeric_field(mapping: object, *keys: str) -> Optional[float]:
+    if not isinstance(mapping, dict):
+        return None
+    for key in keys:
+        value = mapping.get(key)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number) and number >= 0:
+            return number
+    return None
+
+
+def _broker_stop_constraints(symbol_params: dict) -> Optional[dict]:
+    """Normalize the broker's live symbol metadata for SL/TP validation.
+
+    MTAPI exposes the point size in ``symbolInfo`` and, on its current MT5
+    contract, the minimum SL/TP distances as ``symbolGroup.sl``/``tp``.
+    Some deployments also return explicit stops/freeze-level fields, so those
+    are preferred when present.  No broker distance is invented here.
+    """
+    info = symbol_params.get("symbolInfo") or {}
+    group = symbol_params.get("symbolGroup") or {}
+    mappings = (symbol_params, info, group)
+
+    digits_value = next(
+        (
+            value
+            for value in (
+                _numeric_field(info, "digits", "precision"),
+                _numeric_field(symbol_params, "digits", "precision"),
+            )
+            if value is not None
+        ),
+        None,
+    )
+    digits = int(digits_value) if digits_value is not None else 0
+    point = next(
+        (
+            value
+            for mapping in mappings
+            for value in (
+                _numeric_field(mapping, "points", "point"),
+                _numeric_field(mapping, "tickSize", "tick_size"),
+            )
+            if value is not None and value > 0
+        ),
+        None,
+    )
+    if point is None and digits > 0:
+        point = 10 ** (-digits)
+    if point is None or point <= 0:
+        return None
+
+    stops_level_points = next(
+        (
+            value
+            for mapping in mappings
+            for value in (
+                _numeric_field(
+                    mapping,
+                    "stopsLevel",
+                    "stopLevel",
+                    "stops_level",
+                    "stop_level",
+                ),
+            )
+            if value is not None
+        ),
+        None,
+    )
+    freeze_level_points = next(
+        (
+            value
+            for mapping in mappings
+            for value in (
+                _numeric_field(
+                    mapping,
+                    "freezeLevel",
+                    "freeze_level",
+                    "tradeFreezeLevel",
+                    "trade_freeze_level",
+                ),
+            )
+            if value is not None
+        ),
+        None,
+    )
+    sl_level_points = next(
+        (
+            value
+            for mapping in (group, info, symbol_params)
+            for value in (
+                _numeric_field(
+                    mapping,
+                    "sl",
+                    "stopLoss",
+                    "stopLossLevel",
+                    "slLevel",
+                ),
+            )
+            if value is not None
+        ),
+        None,
+    )
+    tp_level_points = next(
+        (
+            value
+            for mapping in (group, info, symbol_params)
+            for value in (
+                _numeric_field(
+                    mapping,
+                    "tp",
+                    "takeProfit",
+                    "takeProfitLevel",
+                    "tpLevel",
+                ),
+            )
+            if value is not None
+        ),
+        None,
+    )
+    if all(
+        value is None
+        for value in (
+            stops_level_points,
+            freeze_level_points,
+            sl_level_points,
+            tp_level_points,
+        )
+    ):
+        return None
+
+    all_level_points = [
+        value
+        for value in (
+            stops_level_points,
+            freeze_level_points,
+            sl_level_points,
+            tp_level_points,
+        )
+        if value is not None
+    ]
+    sl_required_points = max(
+        value
+        for value in (
+            stops_level_points,
+            freeze_level_points,
+            sl_level_points,
+        )
+        if value is not None
+    ) if any(
+        value is not None
+        for value in (
+            stops_level_points,
+            freeze_level_points,
+            sl_level_points,
+        )
+    ) else max(all_level_points)
+    tp_required_points = max(
+        value
+        for value in (
+            stops_level_points,
+            freeze_level_points,
+            tp_level_points,
+        )
+        if value is not None
+    ) if any(
+        value is not None
+        for value in (
+            stops_level_points,
+            freeze_level_points,
+            tp_level_points,
+        )
+    ) else max(all_level_points)
+    pip_size = point * 10 if digits in {3, 5} else point
+    return {
+        "digits": digits,
+        "point": point,
+        "pip_size": pip_size,
+        "stops_level_points": stops_level_points,
+        "freeze_level_points": freeze_level_points,
+        "sl_level_points": sl_level_points,
+        "tp_level_points": tp_level_points,
+        "sl_required_points": sl_required_points,
+        "tp_required_points": tp_required_points,
+        "sl_required_price": sl_required_points * point,
+        "tp_required_price": tp_required_points * point,
+    }
+
+
+def _rebase_order_prices(
+    trade_params: CapitalOutput,
+    direction: str,
+    quote: dict,
+    constraints: dict,
+) -> Optional[dict]:
+    """Re-anchor SL/TP to the quote immediately before OrderSendSafe."""
+    try:
+        bid = float(quote["bid"])
+        ask = float(quote["ask"])
+        old_entry = float(trade_params.entry_price)
+        old_sl = float(trade_params.stop_loss)
+        old_tp = float(trade_params.take_profit)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) and value > 0 for value in (bid, ask)):
+        return None
+
+    normalized_direction = direction.upper().strip()
+    if normalized_direction not in {"BUY", "SELL"}:
+        return None
+    old_sl_distance = abs(old_entry - old_sl)
+    old_tp_distance = abs(old_tp - old_entry)
+    point = float(constraints["point"])
+    digits = int(constraints["digits"])
+    if (
+        not math.isfinite(old_sl_distance)
+        or not math.isfinite(old_tp_distance)
+        or old_sl_distance <= 0
+        or old_tp_distance <= 0
+        or point <= 0
+    ):
+        return None
+
+    execution_price = ask if normalized_direction == "BUY" else bid
+    sl_reference = bid if normalized_direction == "BUY" else ask
+    tp_reference = ask if normalized_direction == "BUY" else bid
+    # Add one broker point beyond the reported boundary.  This is derived
+    # from the symbol metadata and avoids equality/rounding rejection.
+    sl_distance = max(
+        old_sl_distance,
+        float(constraints["sl_required_price"]) + point,
+    )
+    tp_distance = max(
+        old_tp_distance,
+        float(constraints["tp_required_price"]) + point,
+    )
+    if normalized_direction == "BUY":
+        stop_loss = round(sl_reference - sl_distance, digits)
+        take_profit = round(tp_reference + tp_distance, digits)
+    else:
+        stop_loss = round(sl_reference + sl_distance, digits)
+        take_profit = round(tp_reference - tp_distance, digits)
+
+    actual_sl_distance = (
+        sl_reference - stop_loss
+        if normalized_direction == "BUY"
+        else stop_loss - sl_reference
+    )
+    actual_tp_distance = (
+        take_profit - tp_reference
+        if normalized_direction == "BUY"
+        else tp_reference - take_profit
+    )
+    if actual_sl_distance <= 0 or actual_tp_distance <= 0:
+        return None
+    pip_size = float(constraints["pip_size"])
+    return {
+        "entry_price": round(execution_price, digits),
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "sl_distance": actual_sl_distance,
+        "tp_distance": actual_tp_distance,
+        "sl_distance_pips": actual_sl_distance / pip_size,
+        "tp_distance_pips": actual_tp_distance / pip_size,
+    }
 
 
 def _history_value(record: dict, *keys: str):
@@ -2580,6 +2855,112 @@ class GoldScalperLive:
                 ["All live entry gates passed"],
             )
             tp_params = decision.trade_params
+            if tp_params is None:
+                return (
+                    None,
+                    confirm_dicts,
+                    "MISSING_TRADE_PARAMETERS",
+                    "Allowed decision did not include SL/TP parameters",
+                )
+            original_entry_price = tp_params.entry_price
+
+            # The decision engine's entry price can be several network calls
+            # old by the time the final position check completes.  Fetch
+            # broker symbol constraints first, then fetch the quote last so
+            # the SL/TP re-anchor is based on the freshest executable price.
+            symbol_params = await get_symbol_params(SYMBOL)
+            stop_constraints = _broker_stop_constraints(symbol_params)
+            if stop_constraints is None:
+                return (
+                    None,
+                    confirm_dicts,
+                    "SYMBOL_CONSTRAINTS_UNAVAILABLE",
+                    f"Could not read broker SL/TP constraints for {SYMBOL}",
+                )
+            quote = await get_current_quote(SYMBOL)
+            if not quote:
+                return (
+                    None,
+                    confirm_dicts,
+                    "QUOTE_UNAVAILABLE",
+                    f"Could not refresh {SYMBOL} quote before order",
+                )
+            rebased = _rebase_order_prices(
+                tp_params,
+                decision.direction,
+                quote,
+                stop_constraints,
+            )
+            if rebased is None:
+                return (
+                    None,
+                    confirm_dicts,
+                    "INVALID_REBASED_STOPS",
+                    f"Could not produce valid broker-side SL/TP for {SYMBOL}",
+                )
+
+            # Keep all post-order telemetry/trailing state aligned with the
+            # exact prices sent to MTAPI, not the stale decision snapshot.
+            tp_params.entry_price = rebased["entry_price"]
+            tp_params.stop_loss = rebased["stop_loss"]
+            tp_params.take_profit = rebased["take_profit"]
+            tp_params.sl_distance_usd = round(rebased["sl_distance"], 2)
+            tp_params.sl_distance_pips = round(rebased["sl_distance_pips"], 2)
+            tp_params.risk_reward_ratio = round(
+                rebased["tp_distance"] / rebased["sl_distance"], 2
+            )
+            tp_params.risk_amount = round(
+                tp_params.lot_size
+                * rebased["sl_distance"]
+                * LOT_DOLLAR_PER_UNIT,
+                2,
+            )
+            tp_params.min_lot_risk_exceeded = (
+                tp_params.risk_amount > MAX_FIXED_LOT_RISK_USD + 0.01
+            )
+            if tp_params.min_lot_risk_exceeded:
+                return (
+                    None,
+                    confirm_dicts,
+                    "BROKER_STOP_DISTANCE_RISK",
+                    f"Broker minimum stop distance would risk "
+                    f"${tp_params.risk_amount:.2f}, above the "
+                    f"${MAX_FIXED_LOT_RISK_USD:.2f} cap",
+                )
+            direction_sign = 1 if decision.direction == "BUY" else -1
+            tp_params.break_even_at = round(
+                tp_params.entry_price
+                + direction_sign * rebased["sl_distance"],
+                stop_constraints["digits"],
+            )
+            tp_params.trailing_activation_at = tp_params.break_even_at
+            tp_params.trailing_stop_distance = round(
+                rebased["sl_distance"] * 0.5,
+                stop_constraints["digits"],
+            )
+            tp_params.break_even_sl = tp_params.entry_price
+
+            broker_stops = stop_constraints["stops_level_points"]
+            broker_freeze = stop_constraints["freeze_level_points"]
+            broker_sl = stop_constraints["sl_level_points"]
+            broker_tp = stop_constraints["tp_level_points"]
+            log.info(
+                f"ORDER_STOPS_CHECK [{timeframe}] {decision.direction} {SYMBOL}  "
+                f"bid={float(quote['bid']):.{stop_constraints['digits']}f}  "
+                f"ask={float(quote['ask']):.{stop_constraints['digits']}f}  "
+                f"entry={tp_params.entry_price:.{stop_constraints['digits']}f}  "
+                f"SL={tp_params.stop_loss:.{stop_constraints['digits']}f}  "
+                f"TP={tp_params.take_profit:.{stop_constraints['digits']}f}  "
+                f"sl_distance={rebased['sl_distance_pips']:.2f}pip  "
+                f"tp_distance={rebased['tp_distance_pips']:.2f}pip  "
+                f"stopsLevel={broker_stops if broker_stops is not None else 'unknown'}pt  "
+                f"freezeLevel={broker_freeze if broker_freeze is not None else 'unknown'}pt  "
+                f"symbolGroup.sl={broker_sl if broker_sl is not None else 'unknown'}pt  "
+                f"symbolGroup.tp={broker_tp if broker_tp is not None else 'unknown'}pt  "
+                f"point={stop_constraints['point']}  "
+                f"digits={stop_constraints['digits']}  "
+                f"reanchored_from={original_entry_price}"
+            )
             order_comment = strategy_order_comment(
                 COMMENT,
                 candidate_strategy_slots,
