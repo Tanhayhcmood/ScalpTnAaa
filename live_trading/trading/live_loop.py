@@ -1734,17 +1734,8 @@ class GoldScalperLive:
 
         # Final defense-in-depth check for RANGE.  The structural RANGE
         # filters may be disabled for telemetry-only operation.  An explicit
-        # standalone Price Action policy may lower only the confirmation floor
-        # to one aligned PA vote; all other entry gates remain mandatory.
-        _range_confirmation_floor = (
-            1
-            if (
-                PRICE_ACTION_STANDALONE
-                and decision.entry_filter is not None
-                and decision.entry_filter.price_action
-            )
-            else RANGE_MIN_CONFIRMATIONS
-        )
+        # Final defense-in-depth check: RANGE also requires both live engines.
+        _range_confirmation_floor = max(2, RANGE_MIN_CONFIRMATIONS)
         if (
             decision.regime == "RANGE"
             and decision.entry_filter is not None
@@ -2965,13 +2956,12 @@ class GoldScalperLive:
                         v = int(float(payload["min_confirmations"]))
                         _live_cfg.MIN_CONFIRMATIONS = v; _g["MIN_CONFIRMATIONS"] = v
                     if "price_action_standalone" in payload:
-                        raw = payload["price_action_standalone"]
-                        if isinstance(raw, str):
-                            v = raw.strip().lower() in {"1", "true", "yes", "on"}
-                        else:
-                            v = bool(raw)
-                        _live_cfg.PRICE_ACTION_STANDALONE = v
-                        _g["PRICE_ACTION_STANDALONE"] = v
+                        log.warning(
+                            "Ignoring price_action_standalone update: "
+                            "live entry policy requires Trend + Price Action."
+                        )
+                        _live_cfg.PRICE_ACTION_STANDALONE = False
+                        _g["PRICE_ACTION_STANDALONE"] = False
                     log.info(f"🔧 Strategy config updated via Telegram: {payload}")
                 except Exception as _upd_err:
                     log.warning(f"update_strategy payload error: {_upd_err}")

@@ -115,3 +115,23 @@ def test_nested_inside_bar_breakout_uses_outer_mother_boundary():
     assert result.bullish_inside_breakout
     assert result.inside_bar_depth == 2
     assert result.inside_bar_breakout_level == 2500.50
+
+
+def test_extended_inside_bar_breakout_is_marked_for_retest_instead_of_chasing():
+    candles = _base_candles()
+    candles[-3] = OHLCV(
+        candles[-3].time, 2499.70, 2500.40, 2499.40, 2499.85, 100.0
+    )
+    candles[-2] = OHLCV(
+        candles[-2].time, 2499.82, 2500.10, 2499.65, 2499.90, 100.0
+    )
+    candles[-1] = OHLCV(
+        candles[-1].time, 2499.90, 2501.40, 2499.85, 2501.25, 160.0
+    )
+
+    result = analyze_price_action(candles)
+
+    assert result.bullish_inside_breakout
+    assert result.breakout_level == 2500.40
+    assert result.breakout_extension_atr > 0.75
+    assert result.breakout_overextended is True

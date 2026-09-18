@@ -267,17 +267,22 @@ RANGE_ENTRY_FILTERS_ENABLED = os.getenv(
 ).strip().lower() in {"1", "true", "yes", "on"}
 MAX_RANGE_TRADES_PER_SESSION = _int("MAX_RANGE_TRADES_PER_SESSION", 2, lo=1, hi=20)
 # When enabled, a directional Price Action signal may authorize the strategy
-# vote by itself. This is intentionally independent of the other strategy
-# votes; confidence, quality, regime, R:R, position, and risk gates still
-# decide whether that PA setup can become a live order.
+# vote by itself. Kept as a compatibility setting for older panel payloads;
+# live entry policy below is now strict Trend + Price Action consensus.
 PRICE_ACTION_STANDALONE = os.getenv(
-    "PRICE_ACTION_STANDALONE", "true"
+    "PRICE_ACTION_STANDALONE", "false"
 ).strip().lower() in {"1", "true", "yes", "on"}
 # Minimum diagnostic PA score for the independent entry path.  The regular
 # PA detector can expose early/weak setups for telemetry; standalone trading
 # requires a stronger local setup before it can bypass other strategy votes.
 PA_STANDALONE_MIN_SCORE = _float(
     "PA_STANDALONE_MIN_SCORE", 0.24, lo=0.15, hi=1.0
+)
+# A closed-candle breakout that has already travelled this far beyond its
+# trigger level is not chased at market. The strategy waits for a retest on a
+# later bar instead of paying the worst part of the impulse.
+PA_MAX_BREAKOUT_EXTENSION_ATR = _float(
+    "PA_MAX_BREAKOUT_EXTENSION_ATR", 0.75, lo=0.25, hi=1.5
 )
 # When enabled, every new trade must also have a same-direction Price Action signal.
 # Default false preserves existing behavior until explicitly enabled on Render.

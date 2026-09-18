@@ -29,6 +29,7 @@ from live_trading.config import (
     MIN_CONFIRMATIONS,
     PRICE_ACTION_STANDALONE,
     PA_STANDALONE_MIN_SCORE,
+    PA_MAX_BREAKOUT_EXTENSION_ATR,
     RANGE_MIN_CONFIRMATIONS,
     RANGE_WEAK_MIN_CONFIRMATIONS,
     REQUIRE_SMC_PRICE_ACTION_WYCKOFF,
@@ -74,12 +75,19 @@ def _effective_min_confirmations(
     range_weak_min_confirmations = min(
         max(1, int(range_weak_min_confirmations)), max_confirmations
     )
+    # The live policy requires both authorized engines. The legacy env floors
+    # remain parsed for compatibility/telemetry, but can never downgrade a
+    # Trend + Price Action entry to a one-vote entry.
     if regime == "RANGE":
         # RANGE owns its floor; never inherit the ordinary/TREND floor.
         if str(strength).upper() == "WEAK":
-            return max(range_min_confirmations, range_weak_min_confirmations)
-        return range_min_confirmations
-    return base_min_confirmations
+            return max(
+                max_confirmations,
+                range_min_confirmations,
+                range_weak_min_confirmations,
+            )
+        return max(max_confirmations, range_min_confirmations)
+    return max(max_confirmations, base_min_confirmations)
 
 
 def _allow_without_smc_for_quality(
@@ -119,11 +127,10 @@ def _range_confirmation_gate(
     may reduce this floor to one aligned PA vote; all other RANGE safeguards
     remain mandatory.
     """
-    effective_min_confirmations = (
-        1
-        if price_action_standalone and entry_filter.price_action
-        else min_confirmations
-    )
+    # Strict live policy: exactly two authorized engines are required. Clamp
+    # both legacy one-vote and stale three/four-vote callers to the same
+    # Trend + Price Action contract.
+    effective_min_confirmations = 2
     if entry_filter.confirmation_count < effective_min_confirmations:
         return (
             False,
@@ -271,6 +278,9 @@ def run_decision_engine(
     sl_atr_multiplier: float = SL_ATR_BASE_MULTIPLIER,
     low_volatility_sl_atr_add: float = LOW_VOLATILITY_SL_ATR_ADD,
 ) -> DecisionResult:
+    # Strict live policy: PA standalone is retained only as a compatibility
+    # argument for old callers. It must never authorize a production order.
+    price_action_standalone = False
 
     smc     = analyze_smc_structure(candles, timeframe=timeframe)
     wyckoff = analyze_wyckoff(candles)
@@ -330,21 +340,20 @@ def run_decision_engine(
     # the direction on its own.  The later confidence, quality, regime, R:R,
     # position, and risk gates remain unchanged.
     if (
-        price_action_standalone
-        and pa.pa_signal in {"BUY", "SELL"}
-        and pa.pa_score < pa_standalone_min_score
+        pa.breakout_overextended
     ):
-        standalone_reason = (
-            f"Standalone Price Action score {pa.pa_score:.2f} < "
-            f"{pa_standalone_min_score:.2f} minimum"
+        extension_reason = (
+            f"Price Action breakout extended "
+            f"{pa.breakout_extension_atr:.2f} ATR beyond "
+            f"{pa.breakout_level:.2f}; wait for retest"
         )
         return _make_neutral(
             smc,
             wyckoff,
             pa,
             trend,
-            [standalone_reason],
-            [standalone_reason],
+            [extension_reason],
+            [extension_reason],
             regime_result=regime,
             direction=pa.pa_signal,
             candles=candles,
@@ -361,9 +370,7 @@ def run_decision_engine(
     )
     # The explicit PA standalone override remains available for ordinary
     # RANGE conditions, but weak RANGE must honor its stricter 3-vote floor.
-    range_price_action_standalone = (
-        price_action_standalone and not is_weak_range
-    )
+    range_price_action_standalone = False
     # A Trend-aligned entry is more exposed to a single transient EMA signal
     # than a structure/price-action setup. Keep the ordinary operator floor,
     # but require a second independent confirmation whenever Trend votes for
@@ -455,11 +462,7 @@ def run_decision_engine(
             smc=smc,
             pa=pa,
             confirmation_count=ef.confirmation_count,
-            min_confirmations=(
-                1
-                if range_price_action_standalone and ef.price_action
-                else effective_min_confirmations
-            ),
+            min_confirmations=effective_min_confirmations,
             edge_atr_distance=range_edge_atr_distance,
             strict_filters=range_entry_filters_enabled,
             require_edge_position=range_require_edge_position,
@@ -858,6 +861,16 @@ def describe_strategy(decision: "DecisionResult") -> dict:
                 "breakout_level": pa.inside_bar_breakout_level,
                 "strength_atr": round(pa.inside_bar_breakout_strength, 3),
             },
+                "entry_quality": {
+                    "breakout_level": getattr(pa, "breakout_level", None),
+                    "extension_atr": round(
+                        getattr(pa, "breakout_extension_atr", 0.0), 3
+                    ),
+                    "overextended": bool(
+                        getattr(pa, "breakout_overextended", False)
+                    ),
+                    "max_extension_atr": PA_MAX_BREAKOUT_EXTENSION_ATR,
+                },
         },
         "smc_zones": {
             "current_price": round(current_price, 3),

@@ -41,20 +41,24 @@ def test_range_does_not_add_a_counter_trend_vote_requirement():
     ) == 2
 
 
-def test_range_accepts_one_smc_confirmation():
+def test_range_rejects_one_smc_confirmation():
     result = EntryFilterResult(
         allowed=True, direction="BUY", confirmation_count=1,
         smc=True, trend=False, price_action=False, wyckoff=False,
     )
-    assert _range_confirmation_gate(result, 1) == (True, "")
+    allowed, reason = _range_confirmation_gate(result, 1)
+    assert allowed is False
+    assert "1/2 confirmations" in reason
 
 
-def test_range_accepts_one_price_action_confirmation():
+def test_range_rejects_one_price_action_confirmation():
     result = EntryFilterResult(
         allowed=True, direction="BUY", confirmation_count=1,
         smc=False, trend=False, price_action=True, wyckoff=False,
     )
-    assert _range_confirmation_gate(result, 1) == (True, "")
+    allowed, reason = _range_confirmation_gate(result, 1)
+    assert allowed is False
+    assert "1/2 confirmations" in reason
 
 
 def test_range_rejects_zero_confirmations():
@@ -64,7 +68,7 @@ def test_range_rejects_zero_confirmations():
     )
     allowed, reason = _range_confirmation_gate(result, 1)
     assert not allowed
-    assert "0/1 confirmations" in reason
+    assert "0/2 confirmations" in reason
 
 
 def test_range_rejects_one_confirmation_when_two_are_required():
@@ -77,7 +81,7 @@ def test_range_rejects_one_confirmation_when_two_are_required():
     assert "1/2 confirmations" in reason
 
 
-def test_standalone_price_action_can_satisfy_two_vote_range_floor():
+def test_standalone_price_action_cannot_satisfy_two_vote_range_floor():
     result = EntryFilterResult(
         allowed=True, direction="BUY", confirmation_count=1,
         smc=False, trend=False, price_action=True, wyckoff=False,
@@ -87,8 +91,8 @@ def test_standalone_price_action_can_satisfy_two_vote_range_floor():
         2,
         price_action_standalone=True,
     )
-    assert allowed is True
-    assert reason == ""
+    assert allowed is False
+    assert "1/2 confirmations" in reason
 
 
 def test_weak_range_does_not_allow_single_vote_standalone_override():
@@ -98,7 +102,7 @@ def test_weak_range_does_not_allow_single_vote_standalone_override():
     )
     allowed, reason = _range_confirmation_gate(result, 3)
     assert allowed is False
-    assert "1/3 confirmations" in reason
+    assert "1/2 confirmations" in reason
 
 
 def test_non_range_regime_keeps_global_confirmation_setting():

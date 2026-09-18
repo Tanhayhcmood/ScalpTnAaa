@@ -5,6 +5,7 @@ Ported from priceActionEngine.ts — confirmation only.
 from dataclasses import dataclass, replace
 from typing import List, Literal
 from live_trading.signals.gold_engine import OHLCV
+from live_trading.config import PA_MAX_BREAKOUT_EXTENSION_ATR
 
 
 @dataclass
@@ -62,6 +63,10 @@ class PriceActionResult:
     inside_bar_depth: int = 0
     inside_bar_breakout_level: float | None = None
     inside_bar_breakout_strength: float = 0.0
+    # Entry-quality telemetry for breakout chasing protection.
+    breakout_level: float | None = None
+    breakout_extension_atr: float = 0.0
+    breakout_overextended: bool = False
 
 
 def _calc_atr(candles: List[OHLCV], period: int) -> float:
@@ -279,18 +284,62 @@ def _detect_breakout_pullback(
     trend_up   = cp > prior * 1.002
     trend_down = cp < prior * 0.998
     pull_zone  = cp * cfg.pullback_zone_pct
+    previous = candles[n - 2]
+
+    def touched_support(candle):
+        return (
+            any(
+                candle.low <= level + pull_zone
+                and candle.high >= level - pull_zone
+                for level in support_lvls
+            )
+            or any(
+                candle.low <= zone["top"] + pull_zone
+                and candle.high >= zone["bottom"] - pull_zone
+                for zone in demand_zones
+            )
+        )
+
+    def touched_resistance(candle):
+        return (
+            any(
+                candle.low <= level + pull_zone
+                and candle.high >= level - pull_zone
+                for level in resistance_lvls
+            )
+            or any(
+                candle.low <= zone["top"] + pull_zone
+                and candle.high >= zone["bottom"] - pull_zone
+                for zone in supply_zones
+            )
+        )
+
+    # A pullback is a retest followed by a closed-candle reclaim, not merely a
+    # trend candle whose close happens to be near a stale level.
+    bullish_reclaim = (
+        _is_bull(curr)
+        and (
+            curr.close > previous.high
+            or _body_ratio(curr) >= 0.45
+        )
+    )
+    bearish_reclaim = (
+        _is_bear(curr)
+        and (
+            curr.close < previous.low
+            or _body_ratio(curr) >= 0.45
+        )
+    )
 
     if trend_up:
-        near_sup = any(abs(cp - l) <= pull_zone for l in support_lvls)
-        near_dem = any(z["bottom"] - pull_zone <= cp <= z["top"] + pull_zone
-                       for z in demand_zones)
-        if near_sup or near_dem: bull_pb = True
+        retest = touched_support(previous) or touched_support(curr)
+        if retest and bullish_reclaim:
+            bull_pb = True
 
     if trend_down:
-        near_res = any(abs(cp - l) <= pull_zone for l in resistance_lvls)
-        near_sup_z = any(z["bottom"] - pull_zone <= cp <= z["top"] + pull_zone
-                         for z in supply_zones)
-        if near_res or near_sup_z: bear_pb = True
+        retest = touched_resistance(previous) or touched_resistance(curr)
+        if retest and bearish_reclaim:
+            bear_pb = True
 
     (
         inside_detected,
@@ -447,6 +496,25 @@ def analyze_price_action(candles: List[OHLCV], timeframe: str = "M5") -> PriceAc
         near_dem, near_supl, near_sup, near_res,
     )
 
+    # A breakout signal is only actionable while price is still reasonably
+    # close to the broken level.  This does not reject the PA signal itself;
+    # the decision engine uses the metadata to avoid chasing an exhausted
+    # impulse at market and can wait for a retest instead.
+    breakout_level = None
+    if bull_inside or bear_inside:
+        breakout_level = inside_level
+    elif vbull:
+        below = [level for level in resistance_lvls if level < cp]
+        breakout_level = max(below) if below else None
+    elif vbear:
+        above = [level for level in support_lvls if level > cp]
+        breakout_level = min(above) if above else None
+    breakout_extension_atr = 0.0
+    if breakout_level is not None and atr > 0:
+        breakout_extension_atr = round(
+            max(0.0, abs(cp - breakout_level) / atr), 3
+        )
+
     return PriceActionResult(
         bullish_engulf=be, bearish_engulf=bae,
         bullish_pin_bar=bp, bearish_pin_bar=bap,
@@ -464,4 +532,10 @@ def analyze_price_action(candles: List[OHLCV], timeframe: str = "M5") -> PriceAc
         inside_bar_depth=inside_depth,
         inside_bar_breakout_level=inside_level,
         inside_bar_breakout_strength=inside_strength,
+        breakout_level=breakout_level,
+        breakout_extension_atr=breakout_extension_atr,
+        breakout_overextended=(
+            breakout_extension_atr
+            > PA_MAX_BREAKOUT_EXTENSION_ATR
+        ),
     )
