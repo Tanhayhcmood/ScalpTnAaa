@@ -62,6 +62,13 @@ class TestConfigDefaults:
         assert cfg.TREND_MIN_CONFIRMATIONS == 2
         assert isinstance(cfg.TREND_MIN_CONFIRMATIONS, int)
 
+    def test_protective_sl_atr_defaults(self):
+        cfg = _reload_config({})
+        assert cfg.SL_ATR_TIMEFRAME == "M5"
+        assert cfg.SL_ATR_PERIOD == 14
+        assert cfg.SL_ATR_BASE_MULTIPLIER == 3.0
+        assert cfg.LOW_VOLATILITY_SL_ATR_ADD == 0.5
+
     def test_confidence_threshold_defaults_are_forty_percent(self):
         cfg = _reload_config({})
         assert cfg.NORMAL_MIN_CONFIDENCE == 40.0

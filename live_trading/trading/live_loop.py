@@ -32,6 +32,8 @@ from typing import List, Optional
 
 from live_trading.config import (
     SYMBOL, TIMEFRAME, CANDLE_WINDOW, RISK_PERCENT,
+    SL_ATR_TIMEFRAME, SL_ATR_PERIOD, SL_ATR_BASE_MULTIPLIER,
+    LOW_VOLATILITY_SL_ATR_ADD,
     MAX_OPEN_TRADES, COMMENT,
     BAR_CHECK_INTERVAL, RECONNECT_DELAY, SYNC_TIMEOUT, RPC_CALL_TIMEOUT,
     MIN_CONFIRMATIONS, TREND_MIN_CONFIRMATIONS,
@@ -67,6 +69,7 @@ from live_trading.risk.capital_manager import (
     LOT_DOLLAR_PER_UNIT, MAX_FIXED_LOT_RISK_USD, CapitalOutput,
 )
 from live_trading.signals.decision_engine import run_decision_engine, DecisionResult, describe_strategy
+from live_trading.signals.gold_engine import calc_atr
 from live_trading.signals.mtf_filter import (
     compute_mtf_bias,
     evaluate_mtf_opposition,
@@ -500,6 +503,10 @@ class GoldScalperLive:
         # (currently H1).  It lets the MTF analysis cache refresh exactly once
         # per new HTF bar instead of once per M5/M10/M15/M20 entry event.
         self._latest_completed_bar_times: dict[str, Optional[datetime]] = {}
+        self._sl_atr_cache_bar_time: Optional[datetime] = None
+        self._sl_atr_cache_value: float = 0.0
+        self._sl_atr_cache_reason: str = "initial"
+        self._sl_atr_cache_failure_at: float = 0.0
         self._mtf_cache_bar_time: Optional[datetime] = None
         self._mtf_cache_bias: Optional[MtfBias] = None
         self._mtf_cache_reason: str = ""
@@ -615,6 +622,11 @@ class GoldScalperLive:
         log.info(f"  Hedged positions: {'enabled' if ALLOW_HEDGED_POSITIONS else 'disabled'}")
         log.info(f"  Min confirmations: {MIN_CONFIRMATIONS}")
         log.info(f"  Trend min confirmations: {TREND_MIN_CONFIRMATIONS}")
+        log.info(
+            f"  Protective SL ATR: {SL_ATR_TIMEFRAME}/{SL_ATR_PERIOD} "
+            f"base={SL_ATR_BASE_MULTIPLIER:.2f}x "
+            f"low-vol-add={LOW_VOLATILITY_SL_ATR_ADD:.2f}x"
+        )
         log.info(
             f"  MTF: {'ON' if MTF_ENABLED else 'OFF'} "
             f"(opposition threshold={MTF_OPPOSITION_THRESHOLD:.1f}, "
@@ -1016,6 +1028,10 @@ class GoldScalperLive:
             # knows when a new H1 context is available, without fetching the
             # full H1 candle window on every lower-timeframe bar.
             poll_timeframes.append(MTF_TIMEFRAME)
+        if SL_ATR_TIMEFRAME not in poll_timeframes:
+            # Keep the higher-timeframe ATR cache aligned with the completed
+            # bar that produced it; do not fetch M5 ATR on every M1 signal.
+            poll_timeframes.append(SL_ATR_TIMEFRAME)
 
         async def _poll(tf: str):
             try:
@@ -1065,7 +1081,7 @@ class GoldScalperLive:
                         f"— waiting for MT5 historical data sync"
                     )
                     continue
-                if tf == MTF_TIMEFRAME:
+                if tf in {MTF_TIMEFRAME, SL_ATR_TIMEFRAME}:
                     self._latest_completed_bar_times[tf] = _bt_naive
                 if tf not in trade_timeframes:
                     self._latest_completed_bar_times[tf] = _bt_naive
@@ -1155,6 +1171,60 @@ class GoldScalperLive:
             self._mtf_cache_failure_at = asyncio.get_event_loop().time()
             return None, reason
 
+    def _sl_atr_cache_needs_refresh(self) -> bool:
+        current_bar = self._latest_completed_bar_times.get(SL_ATR_TIMEFRAME)
+        if (
+            self._sl_atr_cache_value > 0.0
+            and current_bar == self._sl_atr_cache_bar_time
+        ):
+            return False
+        if (
+            self._sl_atr_cache_value <= 0.0
+            and current_bar == self._sl_atr_cache_bar_time
+            and asyncio.get_event_loop().time() - self._sl_atr_cache_failure_at < 30.0
+        ):
+            return False
+        return True
+
+    async def _refresh_sl_atr_cache(self) -> tuple[float, str]:
+        """Fetch ATR from the configured higher timeframe for protective SLs."""
+        cache_bar = self._latest_completed_bar_times.get(SL_ATR_TIMEFRAME)
+        try:
+            sl_candles = await fetch_candles(
+                SYMBOL,
+                SL_ATR_TIMEFRAME,
+                max(100, SL_ATR_PERIOD + 1),
+            )
+            if len(sl_candles) < SL_ATR_PERIOD + 1:
+                reason = (
+                    f"SL ATR candles insufficient ({len(sl_candles)}; "
+                    f"need {SL_ATR_PERIOD + 1})"
+                )
+                self._sl_atr_cache_value = 0.0
+                self._sl_atr_cache_reason = reason
+                self._sl_atr_cache_bar_time = cache_bar
+                self._sl_atr_cache_failure_at = asyncio.get_event_loop().time()
+                return 0.0, reason
+            value = calc_atr(sl_candles, SL_ATR_PERIOD)
+            if value <= 0.0:
+                reason = "SL ATR calculation returned zero"
+                self._sl_atr_cache_value = 0.0
+                self._sl_atr_cache_reason = reason
+                self._sl_atr_cache_bar_time = cache_bar
+                self._sl_atr_cache_failure_at = asyncio.get_event_loop().time()
+                return 0.0, reason
+            self._sl_atr_cache_value = value
+            self._sl_atr_cache_reason = ""
+            self._sl_atr_cache_bar_time = cache_bar
+            return value, ""
+        except Exception as exc:
+            reason = f"SL ATR fetch/calculation error: {exc}"
+            self._sl_atr_cache_value = 0.0
+            self._sl_atr_cache_reason = reason
+            self._sl_atr_cache_bar_time = cache_bar
+            self._sl_atr_cache_failure_at = asyncio.get_event_loop().time()
+            return 0.0, reason
+
     async def _on_new_bar(self, bar_time: datetime, tf: str = TIMEFRAME) -> None:
         self._set_trade_permission(
             False,
@@ -1173,19 +1243,48 @@ class GoldScalperLive:
             if self._mtf_cache_needs_refresh()
             else None
         )
+        sl_atr_task = (
+            asyncio.create_task(self._refresh_sl_atr_cache())
+            if self._sl_atr_cache_needs_refresh()
+            else None
+        )
+        tasks = [candles_task, account_task]
         if mtf_task is not None:
-            candles, acc_info, mtf_result = await asyncio.gather(
-                candles_task, account_task, mtf_task
-            )
-            htf_bias, htf_data_reason = mtf_result
+            tasks.append(mtf_task)
+        if sl_atr_task is not None:
+            tasks.append(sl_atr_task)
+        results = await asyncio.gather(*tasks)
+        candles, acc_info = results[0], results[1]
+        result_index = 2
+        if mtf_task is not None:
+            htf_bias, htf_data_reason = results[result_index]
+            result_index += 1
         else:
-            candles, acc_info = await asyncio.gather(candles_task, account_task)
             htf_bias = self._mtf_cache_bias if MTF_ENABLED else None
             htf_data_reason = self._mtf_cache_reason if MTF_ENABLED else ""
+        if sl_atr_task is not None:
+            sl_atr, sl_atr_reason = results[result_index]
+        else:
+            sl_atr, sl_atr_reason = (
+                self._sl_atr_cache_value,
+                self._sl_atr_cache_reason,
+            )
 
         # 1. Fetch candles for this timeframe (M5 / M10 / M15 / M20)
         if len(candles) < 50:
             log.warning(f"Only {len(candles)} candles returned — skipping bar")
+            return
+        if sl_atr <= 0.0:
+            self._set_trade_permission(
+                False,
+                "SL_ATR_DATA_UNAVAILABLE",
+                [sl_atr_reason or "Higher-timeframe SL ATR is unavailable"],
+            )
+            log.warning(
+                f"[{tf}] Skipping entry — higher-timeframe "
+                f"SL ATR ({SL_ATR_TIMEFRAME}) unavailable: "
+                f"{sl_atr_reason or 'unknown reason'}"
+            )
             return
         # Keep the latest closed window for adaptive trailing on this exact
         # trade timeframe. A single global ATR is incorrect when M1/M5/M15
@@ -1427,6 +1526,9 @@ class GoldScalperLive:
             range_weak_min_confirmations=RANGE_WEAK_MIN_CONFIRMATIONS,
             regime_strength=htf_bias.strength if htf_bias is not None else None,
             regime_context=htf_bias.regime if htf_bias is not None else None,
+            sl_atr=sl_atr,
+            sl_atr_multiplier=SL_ATR_BASE_MULTIPLIER,
+            low_volatility_sl_atr_add=LOW_VOLATILITY_SL_ATR_ADD,
         )
         self.last_decision = decision
 
@@ -1468,6 +1570,23 @@ class GoldScalperLive:
                 "require_price_action": bool(REQUIRE_PRICE_ACTION),
                 "confidence_hard_min": CONF_HARD_MIN,
                 "risk_percent": RISK_PERCENT,
+            },
+            "protective_sl": {
+                "atr_timeframe": SL_ATR_TIMEFRAME,
+                "atr_period": SL_ATR_PERIOD,
+                "atr": sl_atr,
+                "base_multiplier": SL_ATR_BASE_MULTIPLIER,
+                "low_volatility_add": LOW_VOLATILITY_SL_ATR_ADD,
+                "effective_multiplier": min(
+                    3.5,
+                    SL_ATR_BASE_MULTIPLIER
+                    + (
+                        LOW_VOLATILITY_SL_ATR_ADD
+                        if decision.regime == "LOW_VOLATILITY"
+                        else 0.0
+                    ),
+                ),
+                "cache_reason": sl_atr_reason or "fresh",
             },
             "mtf": {
                 "enabled": bool(MTF_ENABLED),

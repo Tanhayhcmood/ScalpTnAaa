@@ -170,6 +170,10 @@ METAAPI_ACCOUNT_ID = ""
 SYMBOL        = os.getenv("SYMBOL", "XAUUSD")
 TIMEFRAME     = _timeframe("TIMEFRAME", "5m")
 CANDLE_WINDOW = _int("CANDLE_WINDOW", 300, lo=50, hi=5000)
+# Stop-loss volatility is intentionally independent from the signal timeframe.
+# The live default uses M5 ATR while the robot scans M1 entries.
+SL_ATR_TIMEFRAME = _timeframe("SL_ATR_TIMEFRAME", "M5")
+SL_ATR_PERIOD = _int("SL_ATR_PERIOD", 14, lo=2, hi=100)
 
 # ── Risk & Trade Rules ───────────────────────────────────────────────────────
 # Production defaults — override via Render env vars if needed.
@@ -181,6 +185,16 @@ ENABLED_STRATEGIES = _strategy_list(
 # MIN_CONFIRMATIONS: minimum enabled engines that must agree for ordinary
 # entries.
 # CONF_HARD_MIN: trades below this confidence % are always rejected.
+# Base protective stop distance in higher-timeframe ATR units. The floor of
+# 3x prevents a compressed M1 signal candle from producing a tight stop.
+SL_ATR_BASE_MULTIPLIER = _float(
+    "SL_ATR_BASE_MULTIPLIER", 3.0, lo=3.0, hi=3.5
+)
+# LOW_VOLATILITY often precedes expansion, so widen the protective stop while
+# retaining the global 3.5x cap in the capital manager.
+LOW_VOLATILITY_SL_ATR_ADD = _float(
+    "LOW_VOLATILITY_SL_ATR_ADD", 0.5, lo=0.0, hi=1.0
+)
 RISK_PERCENT      = _float("RISK_PERCENT",      1.0,  lo=0.01, hi=10.0)
 #
 # Confidence policy:

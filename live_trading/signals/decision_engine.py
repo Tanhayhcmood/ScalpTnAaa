@@ -36,6 +36,8 @@ from live_trading.config import (
     RANGE_REQUIRE_EDGE_POSITION,
     TREND_MIN_CONFIRMATIONS,
     ENABLED_STRATEGIES,
+    SL_ATR_BASE_MULTIPLIER,
+    LOW_VOLATILITY_SL_ATR_ADD,
 )
 
 # Marginal confidence R:R floor: trades with confidence between CONF_HARD_MIN
@@ -256,6 +258,9 @@ def run_decision_engine(
     range_weak_min_confirmations: int = RANGE_WEAK_MIN_CONFIRMATIONS,
     regime_strength: Optional[str] = None,
     regime_context: Optional[str] = None,
+    sl_atr: Optional[float] = None,
+    sl_atr_multiplier: float = SL_ATR_BASE_MULTIPLIER,
+    low_volatility_sl_atr_add: float = LOW_VOLATILITY_SL_ATR_ADD,
 ) -> DecisionResult:
 
     smc     = analyze_smc_structure(candles, timeframe=timeframe)
@@ -476,6 +481,16 @@ def run_decision_engine(
                              direction=candidate,
                              candles=candles)
 
+    # Protective-stop volatility is intentionally independent from the signal
+    # timeframe. The live loop supplies ATR from SL_ATR_TIMEFRAME (normally
+    # M5), so a compressed M1 candle cannot create an unrealistically tight
+    # stop. LOW_VOLATILITY gets an additional configurable buffer because it
+    # can precede a volatility expansion.
+    protective_atr = float(sl_atr or regime.atr)
+    protective_multiplier = float(sl_atr_multiplier)
+    if regime.regime == "LOW_VOLATILITY":
+        protective_multiplier += float(low_volatility_sl_atr_add)
+
     last_candle  = candles[-1]
     session      = get_session_quality(last_candle.time)
     divergence   = analyze_divergence(candles)
@@ -590,7 +605,7 @@ def run_decision_engine(
     cap_input = CapitalInput(
         direction=candidate,
         entry_price=entry,
-        atr=regime.atr,
+        atr=protective_atr,
         account_balance=account_balance,
         risk_percent=(
             range_risk_percent
@@ -607,6 +622,7 @@ def run_decision_engine(
         take_profit_level=(
             range_resistance if candidate == "BUY" else range_support
         ),
+        sl_atr_multiplier=protective_multiplier,
     )
     trade_params = calc_trade_parameters(cap_input)
 

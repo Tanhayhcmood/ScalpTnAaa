@@ -109,6 +109,10 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `TIMEFRAME` | No | `5m` | Primary M5 detection/context timeframe |
 | `TRADE_TIMEFRAMES` | No | `1m` | M1 entry scan timeframe |
 | `CANDLE_WINDOW` | No | `300` | Bars fetched per candle request |
+| `SL_ATR_TIMEFRAME` | No | `M5` | Higher timeframe used for protective-stop ATR, independent of the signal timeframe |
+| `SL_ATR_PERIOD` | No | `14` | Wilder ATR period for protective stops |
+| `SL_ATR_BASE_MULTIPLIER` | No | `3.0` | Minimum protective-stop distance in higher-timeframe ATR units; capped at `3.5` |
+| `LOW_VOLATILITY_SL_ATR_ADD` | No | `0.5` | Additional ATR multiplier for LOW_VOLATILITY stops; total remains capped at `3.5` |
 | `RISK_PERCENT` | No | `1.0` | Risk per trade (% of balance) |
 | `MIN_CONFIRMATIONS` | No | `2` | Every ordinary entry requires two aligned engine confirmations |
 | `TREND_MIN_CONFIRMATIONS` | No | `2` | Minimum confirmations when Trend votes for the entry direction |

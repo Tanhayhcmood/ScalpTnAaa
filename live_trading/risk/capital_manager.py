@@ -7,8 +7,9 @@ from typing import Optional
 
 DEFAULT_RISK_PCT    = 1.0
 ATR_BUFFER_MULT     = 0.25
-MIN_SL_ATR_MULT     = 0.50
-MAX_SL_ATR_MULT     = 3.00
+DEFAULT_SL_ATR_MULT = 3.00
+MIN_SL_ATR_MULT     = 3.00
+MAX_SL_ATR_MULT     = 3.50
 FIXED_TP_RR         = 2.00
 LOT_DOLLAR_PER_UNIT = 100
 MIN_LOT             = 0.01
@@ -34,6 +35,9 @@ class CapitalInput:
     swing_low:           Optional[float] = None
     resistance_level:    Optional[float] = None
     support_level:       Optional[float] = None
+    # Protective stop distance is based on a higher-timeframe ATR supplied by
+    # the decision engine, not the signal candle's ATR.
+    sl_atr_multiplier:   float = DEFAULT_SL_ATR_MULT
 
 
 @dataclass
@@ -64,7 +68,12 @@ def _r4(n: float) -> float: return round(n, 4)
 
 def _calc_smart_sl(direction: str, entry: float, atr: float, inp: CapitalInput) -> float:
     buffer = atr * ATR_BUFFER_MULT
-    min_sl = atr * MIN_SL_ATR_MULT
+    requested_mult = _clamp(
+        float(inp.sl_atr_multiplier),
+        MIN_SL_ATR_MULT,
+        MAX_SL_ATR_MULT,
+    )
+    min_sl = atr * requested_mult
     max_sl = atr * MAX_SL_ATR_MULT
     raw_sl = None
 
@@ -99,7 +108,7 @@ def _calc_smart_sl(direction: str, entry: float, atr: float, inp: CapitalInput) 
             level  = max(cands)
             raw_sl = entry + (level - entry + buffer)
 
-    fallback  = atr * 1.5
+    fallback  = atr * requested_mult
     sl_dist   = abs(entry - raw_sl) if raw_sl is not None else fallback
     clamped   = _clamp(sl_dist, min_sl, max_sl)
     return _r2(entry - clamped if direction == "BUY" else entry + clamped)

@@ -45,6 +45,11 @@ services:
         value: "5m"
       - key: CANDLE_WINDOW
         value: "300"
+      # Protective SL uses independent M5 ATR, not the M1 signal ATR.
+      - key: SL_ATR_TIMEFRAME
+        value: "M5"
+      - key: SL_ATR_PERIOD
+        value: "14"
       # Option 2: keep the balanced 35% HTF confidence floor reproducible from the live Render environment.
       - key: OPTION_TWO_MIN_CONFIDENCE
         value: "25"
@@ -59,6 +64,12 @@ services:
         value: "2"
       - key: TREND_MIN_CONFIRMATIONS
         value: "2"
+      # Keep stops at least 3x higher-timeframe ATR and widen LOW_VOLATILITY
+      # setups by another 0.5x, with the capital manager capped at 3.5x.
+      - key: SL_ATR_BASE_MULTIPLIER
+        value: "3.0"
+      - key: LOW_VOLATILITY_SL_ATR_ADD
+        value: "0.5"
       # Only Trend and Price Action can authorize live entries. SMC and
       # Wyckoff remain available for diagnostics but cannot open trades.
       - key: ENABLED_STRATEGIES

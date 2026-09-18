@@ -17,7 +17,7 @@ def test_trend_only_entry_is_blocked_by_the_trend_confirmation_floor():
     assert result.confirmation_count == 1
 
 
-def test_sell_stop_uses_outer_structural_level_not_nearest_resistance():
+def test_sell_stop_does_not_use_a_tight_structural_level_below_atr_floor():
     result = calc_trade_parameters(
         CapitalInput(
             direction="SELL",
@@ -30,12 +30,12 @@ def test_sell_stop_uses_outer_structural_level_not_nearest_resistance():
         )
     )
 
-    # Outer high 103.0 + 0.25 ATR buffer 0.5.
-    assert result.stop_loss == 103.5
-    assert result.sl_distance_usd == 3.5
+    # The structural distance is 3.5, but the protective floor is 3x ATR.
+    assert result.stop_loss == 106.0
+    assert result.sl_distance_usd == 6.0
 
 
-def test_buy_stop_uses_outer_structural_level_not_nearest_support():
+def test_buy_stop_does_not_use_a_tight_structural_level_below_atr_floor():
     result = calc_trade_parameters(
         CapitalInput(
             direction="BUY",
@@ -48,6 +48,6 @@ def test_buy_stop_uses_outer_structural_level_not_nearest_support():
         )
     )
 
-    # The BUY side already uses the outer low (min of the candidates).
-    assert result.stop_loss == 96.5
-    assert result.sl_distance_usd == 3.5
+    # The structural distance is 3.5, but the protective floor is 3x ATR.
+    assert result.stop_loss == 94.0
+    assert result.sl_distance_usd == 6.0
