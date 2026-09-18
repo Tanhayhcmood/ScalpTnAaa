@@ -33,6 +33,7 @@ from typing import List, Optional
 from live_trading.config import (
     SYMBOL, TIMEFRAME, CANDLE_WINDOW, RISK_PERCENT,
     SL_ATR_TIMEFRAME, SL_ATR_PERIOD, SL_ATR_BASE_MULTIPLIER,
+    ENTRY_SIGNAL_ATR_PERIOD, MAX_ENTRY_SIGNAL_ATR_DISTANCE,
     LOW_VOLATILITY_SL_ATR_ADD,
     MAX_OPEN_TRADES, COMMENT,
     BAR_CHECK_INTERVAL, RECONNECT_DELAY, SYNC_TIMEOUT, RPC_CALL_TIMEOUT,
@@ -96,6 +97,7 @@ from live_trading.trading.strategy_slots import (
     available_for_strategy_slots,
     one_way_entry_allowed,
 )
+from live_trading.trading.entry_guard import validate_entry_price_distance
 from live_trading.utils.state_writer import (
     write_robot_state, write_mt5_snapshot,
     read_commands, clear_command, log_trade,
@@ -1291,6 +1293,7 @@ class GoldScalperLive:
         # positions are open together.
         self._last_candles_by_timeframe[tf] = list(candles)
         self._last_atr_by_timeframe[tf] = atr(candles, TRAIL_ATR_PERIOD)
+        signal_atr = calc_atr(candles, ENTRY_SIGNAL_ATR_PERIOD)
 
         # The bar detector and the signal fetch are separate broker requests.
         # A reconnect can make the detector see a fresh timestamp while the
@@ -1943,6 +1946,7 @@ class GoldScalperLive:
                 candidate_strategy_slots,
                 tf,
                 bar_time,
+                signal_atr,
             )
         )
         if result is None:
@@ -3037,6 +3041,7 @@ class GoldScalperLive:
         candidate_strategy_slots: tuple[str, ...],
         timeframe: str,
         bar_time: datetime,
+        signal_atr: float,
     ) -> tuple[Optional[TradeResult], list[dict], str, str]:
         """Re-check capacity and submit one entry atomically.
 
@@ -3135,6 +3140,47 @@ class GoldScalperLive:
                     confirm_dicts,
                     "QUOTE_UNAVAILABLE",
                     f"Could not refresh {SYMBOL} quote before order",
+                )
+            try:
+                execution_price = float(
+                    quote["ask"] if decision.direction == "BUY" else quote["bid"]
+                )
+            except (KeyError, TypeError, ValueError):
+                return (
+                    None,
+                    confirm_dicts,
+                    "QUOTE_UNAVAILABLE",
+                    f"Could not read executable {SYMBOL} price before order",
+                )
+            entry_guard = validate_entry_price_distance(
+                decision.direction,
+                original_entry_price,
+                execution_price,
+                signal_atr,
+                MAX_ENTRY_SIGNAL_ATR_DISTANCE,
+            )
+            self._last_candle_telemetry.setdefault("entry_price_guard", {}).update({
+                "direction": decision.direction,
+                "signal_price": original_entry_price,
+                "execution_price": execution_price,
+                "atr": signal_atr,
+                "max_atr_distance": MAX_ENTRY_SIGNAL_ATR_DISTANCE,
+                "distance": entry_guard.distance,
+                "distance_atr": entry_guard.distance_atr,
+                "max_distance": entry_guard.max_distance,
+                "status": "ALLOWED" if entry_guard.allowed else "BLOCKED",
+                "reason": entry_guard.reason,
+            })
+            if not entry_guard.allowed:
+                log.warning(
+                    f"⛔ Entry blocked by signal-price guard [{timeframe}] "
+                    f"{decision.direction} {SYMBOL}: {entry_guard.reason}"
+                )
+                return (
+                    None,
+                    confirm_dicts,
+                    "SIGNAL_PRICE_DRIFT_BLOCKED",
+                    entry_guard.reason,
                 )
             rebased = _rebase_order_prices(
                 tp_params,

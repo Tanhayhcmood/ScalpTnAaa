@@ -73,6 +73,8 @@ class TestConfigDefaults:
         assert cfg.SL_ATR_PERIOD == 14
         assert cfg.SL_ATR_BASE_MULTIPLIER == 3.0
         assert cfg.LOW_VOLATILITY_SL_ATR_ADD == 0.5
+        assert cfg.ENTRY_SIGNAL_ATR_PERIOD == 14
+        assert cfg.MAX_ENTRY_SIGNAL_ATR_DISTANCE == 0.75
 
     def test_confidence_threshold_defaults_are_forty_percent(self):
         cfg = _reload_config({})

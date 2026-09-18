@@ -50,6 +50,12 @@ services:
         value: "M5"
       - key: SL_ATR_PERIOD
         value: "14"
+      # Do not chase a closed-candle signal after a fast move. The live
+      # executable price must remain within 0.75 signal-timeframe ATR.
+      - key: ENTRY_SIGNAL_ATR_PERIOD
+        value: "14"
+      - key: MAX_ENTRY_SIGNAL_ATR_DISTANCE
+        value: "0.75"
       # Option 2: keep the balanced 35% HTF confidence floor reproducible from the live Render environment.
       - key: OPTION_TWO_MIN_CONFIDENCE
         value: "25"

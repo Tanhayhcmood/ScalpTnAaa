@@ -196,6 +196,13 @@ CANDLE_WINDOW = _int("CANDLE_WINDOW", 300, lo=50, hi=5000)
 # The live default uses M5 ATR while the robot scans M1 entries.
 SL_ATR_TIMEFRAME = _timeframe("SL_ATR_TIMEFRAME", "M5")
 SL_ATR_PERIOD = _int("SL_ATR_PERIOD", 14, lo=2, hi=100)
+# A signal is only actionable while the executable broker price remains close
+# to the price that produced it. This is deliberately based on the signal
+# timeframe ATR, not the wider protective-stop ATR.
+ENTRY_SIGNAL_ATR_PERIOD = _int("ENTRY_SIGNAL_ATR_PERIOD", 14, lo=2, hi=100)
+MAX_ENTRY_SIGNAL_ATR_DISTANCE = _float(
+    "MAX_ENTRY_SIGNAL_ATR_DISTANCE", 0.75, lo=0.10, hi=3.0
+)
 
 # ── Risk & Trade Rules ───────────────────────────────────────────────────────
 # Production defaults — override via Render env vars if needed.
