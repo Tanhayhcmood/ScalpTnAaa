@@ -71,6 +71,26 @@ def _float(name: str, default: float, lo: float | None = None, hi: float | None 
     return val
 
 
+def _strategy_list(name: str, default: str) -> tuple[str, ...]:
+    """Parse the signal engines that are allowed to authorize live entries."""
+    valid = ("smc", "trend", "price_action", "wyckoff")
+    raw = os.getenv(name, default)
+    strategies = tuple(dict.fromkeys(
+        item.strip().lower() for item in raw.split(",") if item.strip()
+    ))
+    invalid = tuple(item for item in strategies if item not in valid)
+    if invalid or not strategies:
+        print(
+            f"ERROR: {name} contains invalid or empty strategy names: "
+            f"{', '.join(invalid or ('<empty>',))}. "
+            f"Valid values: {', '.join(valid)}. "
+            "Fix it in the Render dashboard and redeploy.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return strategies
+
+
 # ── Valid timeframe labels ────────────────────────────────────────────────────
 _VALID_TIMEFRAMES = {
     "1m", "5m", "10m", "15m", "20m", "30m", "1h", "4h", "1d",
@@ -153,8 +173,13 @@ CANDLE_WINDOW = _int("CANDLE_WINDOW", 300, lo=50, hi=5000)
 
 # ── Risk & Trade Rules ───────────────────────────────────────────────────────
 # Production defaults — override via Render env vars if needed.
-# MIN_CONFIRMATIONS: minimum engines that must agree for ordinary entries
-# (out of 4: SMC, Trend, PA, Wyckoff).
+# ENABLED_STRATEGIES: only these engines can authorize a live entry. The
+# default intentionally keeps SMC and Wyckoff in observation/telemetry only.
+ENABLED_STRATEGIES = _strategy_list(
+    "ENABLED_STRATEGIES", "trend,price_action"
+)
+# MIN_CONFIRMATIONS: minimum enabled engines that must agree for ordinary
+# entries.
 # CONF_HARD_MIN: trades below this confidence % are always rejected.
 RISK_PERCENT      = _float("RISK_PERCENT",      1.0,  lo=0.01, hi=10.0)
 #
@@ -176,8 +201,8 @@ RANGE_MIN_CONFIDENCE  = _float("RANGE_MIN_CONFIDENCE",  40.0, lo=0.0, hi=100.0)
 # TREND_MIN_CONFIRMATIONS and the ordinary entry policy.
 MIN_CONFIRMATIONS = _int("MIN_CONFIRMATIONS",   2,    lo=1,    hi=10)
 # A Trend-aligned ordinary entry must have at least two independent votes by
-# default. This is deliberately separate from MIN_CONFIRMATIONS so SMC/PA/
-# Wyckoff-only entries can retain the operator-selected ordinary policy.
+# default. This is deliberately separate from MIN_CONFIRMATIONS so the
+# operator can keep Trend entries stricter than Price Action entries.
 TREND_MIN_CONFIRMATIONS = _int("TREND_MIN_CONFIRMATIONS", 2, lo=1, hi=4)
 # Dedicated RANGE playbook. Its confirmation floor is intentionally separate
 # from both MIN_CONFIRMATIONS and TREND_MIN_CONFIRMATIONS so RANGE can use a
@@ -242,8 +267,9 @@ QUALITY_ADX_MIN   = _float("QUALITY_ADX_MIN",    12.0, lo=5.0,  hi=40.0)
 # 300 bars on M5 is roughly 25 hours and is too permissive for scalping;
 # the default 24 closed bars keeps BOS/CHoCH actionable for about two hours.
 STRUCTURE_MAX_AGE_BARS = _int("STRUCTURE_MAX_AGE_BARS", 24, lo=3, hi=100)
-# One concurrent position is allowed per strategy slot (SMC, Trend, Price
-# Action, and Wyckoff), so the safe aggregate ceiling is four positions.
+# One concurrent position is allowed per strategy slot. The default active
+# strategy set is Trend + Price Action, but legacy SMC/Wyckoff slots remain
+# understood so existing positions fail closed during the transition.
 MAX_OPEN_TRADES   = _int("MAX_OPEN_TRADES", 4, lo=1, hi=10)
 # The account is directional by default. Strategy slots may still be used for
 # scale-in decisions, but an opposite-side position is never opened while a

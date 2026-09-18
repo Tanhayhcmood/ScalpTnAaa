@@ -25,6 +25,23 @@ def test_any_two_non_smc_strategies_can_open_an_entry():
     assert result.price_action is True
 
 
+def test_disabled_smc_and_wyckoff_do_not_authorize_entries():
+    result = apply_entry_filter(
+        smc_signal="BUY",
+        ema_trend="NEUTRAL",
+        pa_signal="NEUTRAL",
+        wyckoff_signal="BUY",
+        min_confirmations=1,
+        enabled_strategies=("trend", "price_action"),
+    )
+
+    assert result.allowed is False
+    assert result.direction == "NEUTRAL"
+    assert result.confirmation_count == 0
+    assert result.smc is False
+    assert result.wyckoff is False
+
+
 def test_opposing_two_to_two_vote_is_blocked():
     result = apply_entry_filter(
         smc_signal="BUY",

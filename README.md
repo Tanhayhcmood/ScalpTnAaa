@@ -112,6 +112,7 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `RISK_PERCENT` | No | `1.0` | Risk per trade (% of balance) |
 | `MIN_CONFIRMATIONS` | No | `2` | Every ordinary entry requires two aligned engine confirmations |
 | `TREND_MIN_CONFIRMATIONS` | No | `2` | Minimum confirmations when Trend votes for the entry direction |
+| `ENABLED_STRATEGIES` | No | `trend,price_action` | Signal engines allowed to authorize live entries; SMC and Wyckoff remain diagnostic-only by default |
 | `PRICE_ACTION_STANDALONE` | No | `true` | Allow a directional Price Action signal to authorize an entry alone; other quality/risk gates remain active |
 | `RANGE_TRADING_ENABLED` | No | `true` | Enable the dedicated edge/sweep/reversal RANGE playbook |
 | `RANGE_MIN_CONFIRMATIONS` | No | `2` | Normal RANGE confirmation floor |

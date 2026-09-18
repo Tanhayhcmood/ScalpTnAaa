@@ -59,6 +59,10 @@ services:
         value: "2"
       - key: TREND_MIN_CONFIRMATIONS
         value: "2"
+      # Only Trend and Price Action can authorize live entries. SMC and
+      # Wyckoff remain available for diagnostics but cannot open trades.
+      - key: ENABLED_STRATEGIES
+        value: "trend,price_action"
       # Dedicated RANGE playbook. The standalone PA path may authorize
       # one PA vote, but all RANGE structural, confidence, R:R, and risk gates
       # remain active.
@@ -90,8 +94,8 @@ services:
       # blocked even when they would occupy different strategy slots.
       - key: ALLOW_HEDGED_POSITIONS
         value: "false"
-      # One concurrent position per strategy slot: SMC, Trend, Price Action,
-      # and Wyckoff. Legacy untagged positions fail closed and occupy all slots.
+      # One concurrent position per enabled strategy slot. Legacy untagged
+      # positions fail closed and occupy all known slots.
       # Price Action may authorize the strategy vote alone. All independent
       # confidence, quality, regime, MTF, and risk gates stay active.
       - key: REQUIRE_PRICE_ACTION

@@ -35,6 +35,7 @@ from live_trading.config import (
     RANGE_ENTRY_FILTERS_ENABLED,
     RANGE_REQUIRE_EDGE_POSITION,
     TREND_MIN_CONFIRMATIONS,
+    ENABLED_STRATEGIES,
 )
 
 # Marginal confidence R:R floor: trades with confidence between CONF_HARD_MIN
@@ -159,16 +160,28 @@ def _candidate_direction(
     pa: PriceActionResult,
     trend: TrendResult,
     price_action_standalone: bool = False,
+    enabled_strategies = None,
 ) -> str:
-    """Return the unique direction with the most strategy votes."""
-    if price_action_standalone and pa.pa_signal in {"BUY", "SELL"}:
+    """Return the unique direction with the most enabled strategy votes."""
+    enabled = set(enabled_strategies or ("smc", "trend", "price_action", "wyckoff"))
+    if (
+        price_action_standalone
+        and "price_action" in enabled
+        and pa.pa_signal in {"BUY", "SELL"}
+    ):
         return pa.pa_signal
-    votes = (
-        smc.smc_signal,
-        "BUY" if trend.trend == "BULLISH" else
-        "SELL" if trend.trend == "BEARISH" else "NEUTRAL",
-        pa.pa_signal,
-        wyckoff.wyckoff_signal,
+    votes = {
+        "smc": smc.smc_signal,
+        "trend": (
+            "BUY" if trend.trend == "BULLISH" else
+            "SELL" if trend.trend == "BEARISH" else "NEUTRAL"
+        ),
+        "price_action": pa.pa_signal,
+        "wyckoff": wyckoff.wyckoff_signal,
+    }
+    votes = tuple(
+        vote for name, vote in votes.items()
+        if name in enabled
     )
     buy_count = sum(vote == "BUY" for vote in votes)
     sell_count = sum(vote == "SELL" for vote in votes)
@@ -256,6 +269,7 @@ def run_decision_engine(
         pa,
         trend,
         price_action_standalone=price_action_standalone,
+        enabled_strategies=ENABLED_STRATEGIES,
     )
     if candidate == "NEUTRAL":
         return _make_neutral(
@@ -357,6 +371,7 @@ def run_decision_engine(
             require_smc_price_action_wyckoff and not is_range_regime
         ),
         price_action_standalone=price_action_standalone,
+        enabled_strategies=ENABLED_STRATEGIES,
     )
     # The RANGE confirmation floor is mandatory even when the optional
     # structural filters (edge, sweep, reversal) are disabled.  Those filters

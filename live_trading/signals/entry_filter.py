@@ -1,13 +1,14 @@
 """Entry Filter — four-engine confirmation policy.
 
-Ordinary entries require the configured number of aligned engines. The
-production policy uses two aligned confirmations and does not allow a single
-Price Action vote to bypass that floor.
+Ordinary entries require the configured number of aligned engines. The live
+configuration can restrict which engines are allowed to authorize entries;
+disabled engines remain available for diagnostics but do not vote.
 """
 from dataclasses import dataclass
-from typing import Literal
+from typing import Iterable, Literal
 
 MIN_CONFIRMATIONS = 2
+ALL_STRATEGIES = ("smc", "trend", "price_action", "wyckoff")
 
 
 @dataclass
@@ -36,6 +37,7 @@ def apply_entry_filter(
     require_price_action: bool = False,
     require_smc_price_action_wyckoff: bool = False,
     price_action_standalone: bool = False,
+    enabled_strategies: Iterable[str] | None = None,
 ) -> EntryFilterResult:
     """Allow an entry when the configured strategy policy is satisfied.
 
@@ -43,7 +45,8 @@ def apply_entry_filter(
     selects the candidate and may pass without SMC, Trend, or Wyckoff. The
     production configuration keeps that override disabled.
     """
-    votes = {
+    enabled = set(enabled_strategies or ALL_STRATEGIES)
+    raw_votes = {
         "smc": _vote(smc_signal),
         "trend": _vote(
             "BUY" if ema_trend == "BULLISH" else
@@ -51,6 +54,12 @@ def apply_entry_filter(
         ),
         "price_action": _vote(pa_signal),
         "wyckoff": _vote(wyckoff_signal),
+    }
+    # Keep disabled engines visible to the caller as telemetry inputs, but
+    # remove their votes from direction selection and confirmation counting.
+    votes = {
+        name: value if name in enabled else "NEUTRAL"
+        for name, value in raw_votes.items()
     }
     buy_count = sum(value == "BUY" for value in votes.values())
     sell_count = sum(value == "SELL" for value in votes.values())
