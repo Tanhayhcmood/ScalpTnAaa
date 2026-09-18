@@ -1,4 +1,4 @@
-"""RANGE regression tests: the default policy requires one confirmation."""
+"""RANGE confirmation policy regression tests."""
 
 from live_trading.signals.decision_engine import (
     _effective_min_confirmations,
@@ -7,16 +7,38 @@ from live_trading.signals.decision_engine import (
 from live_trading.signals.entry_filter import EntryFilterResult
 
 
-def test_range_uses_one_confirmation_floor_by_default():
-    assert _effective_min_confirmations(2, "RANGE", False) == 1
+def test_range_uses_two_confirmation_floor_when_strength_is_not_weak():
+    assert _effective_min_confirmations(
+        2, "RANGE", False, range_min_confirmations=2, strength="MODERATE"
+    ) == 2
 
 
-def test_range_can_use_a_stricter_explicit_range_setting():
-    assert _effective_min_confirmations(2, "RANGE", False, range_min_confirmations=2) == 2
+def test_weak_range_uses_the_stricter_confirmation_floor():
+    assert _effective_min_confirmations(
+        2,
+        "RANGE",
+        False,
+        range_min_confirmations=2,
+        range_weak_min_confirmations=3,
+        strength="WEAK",
+    ) == 3
+
+
+def test_weak_range_floor_is_tunable():
+    assert _effective_min_confirmations(
+        2,
+        "RANGE",
+        False,
+        range_min_confirmations=2,
+        range_weak_min_confirmations=4,
+        strength="WEAK",
+    ) == 4
 
 
 def test_range_does_not_add_a_counter_trend_vote_requirement():
-    assert _effective_min_confirmations(1, "RANGE", True) == 1
+    assert _effective_min_confirmations(
+        2, "RANGE", True, range_min_confirmations=2, strength="MODERATE"
+    ) == 2
 
 
 def test_range_accepts_one_smc_confirmation():
@@ -69,5 +91,17 @@ def test_standalone_price_action_can_satisfy_two_vote_range_floor():
     assert reason == ""
 
 
+def test_weak_range_does_not_allow_single_vote_standalone_override():
+    result = EntryFilterResult(
+        allowed=True, direction="BUY", confirmation_count=1,
+        smc=False, trend=False, price_action=True, wyckoff=False,
+    )
+    allowed, reason = _range_confirmation_gate(result, 3)
+    assert allowed is False
+    assert "1/3 confirmations" in reason
+
+
 def test_non_range_regime_keeps_global_confirmation_setting():
-    assert _effective_min_confirmations(2, "WEAK_TREND_BULL", False) == 2
+    assert _effective_min_confirmations(
+        2, "WEAK_TREND_BULL", False, strength="WEAK"
+    ) == 2

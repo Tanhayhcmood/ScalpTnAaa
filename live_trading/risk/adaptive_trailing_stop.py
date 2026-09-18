@@ -24,6 +24,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 class AdaptiveTrailingConfig:
     enabled: bool = True
     atr_period: int = 14
+    chandelier_atr_multiplier: float = 2.5
     normal_multiplier: float = 2.0
     tight_multiplier: float = 0.9
     exhaustion_confirm_count: int = 2
@@ -53,6 +54,7 @@ class ExhaustionSignals:
 @dataclass(frozen=True)
 class AdaptiveTrailDecision:
     mode: str
+    stage: str
     multiplier: float
     atr: float
     distance: float
@@ -60,6 +62,11 @@ class AdaptiveTrailDecision:
     exhaustion: ExhaustionSignals
     floating_profit_price: float
     floating_profit_atr_multiple: float
+    floating_profit_r_multiple: float
+    risk_distance: float
+    highest_price_since_entry: Optional[float]
+    lowest_price_since_entry: Optional[float]
+    breakeven_armed: bool
     tightening_eligible: bool
 
 
@@ -224,48 +231,131 @@ def compute_adaptive_trail(
     candles: Sequence[Any],
     cfg: AdaptiveTrailingConfig,
     entry_price: Optional[float] = None,
+    initial_sl: Optional[float] = None,
+    risk_distance: Optional[float] = None,
+    current_sl: Optional[float] = None,
+    highest_price_since_entry: Optional[float] = None,
+    lowest_price_since_entry: Optional[float] = None,
+    breakeven_armed: bool = False,
 ) -> AdaptiveTrailDecision:
-    """Compute a ratchetable stop candidate from the latest closed candles."""
+    """Compute the three-stage trailing decision for one open position.
+
+    Stage 1 deliberately returns no candidate until favourable price movement
+    reaches one initial risk unit (1R).  Stage 2 returns the entry price as
+    the exact breakeven candidate.  Once the live SL is already at/beyond
+    breakeven, stage 3 uses a Chandelier stop anchored to the best price seen
+    since entry rather than to the current quote.
+
+    ``highest_price_since_entry`` and ``lowest_price_since_entry`` are supplied
+    by the live loop so the extreme survives between ticks and restarts.
+    """
     current_atr = atr(candles, cfg.atr_period)
     exhaustion = detect_exhaustion(candles, direction, cfg)
     is_buy = str(direction).upper() == "BUY"
     floating_profit_price = 0.0
+    normalized_entry: Optional[float] = None
     if entry_price is not None:
+        try:
+            normalized_entry = float(entry_price)
+        except (TypeError, ValueError):
+            normalized_entry = None
+    if normalized_entry is not None:
         favorable_move = (
-            float(current_price) - float(entry_price)
+            float(current_price) - normalized_entry
             if is_buy
-            else float(entry_price) - float(current_price)
+            else normalized_entry - float(current_price)
         )
         floating_profit_price = round(max(0.0, favorable_move), 8)
+    else:
+        favorable_move = 0.0
+
+    normalized_risk = 0.0
+    if normalized_entry is not None and initial_sl is not None:
+        try:
+            candidate_risk = abs(normalized_entry - float(initial_sl))
+            # Older persisted baselines did not store initial_sl and were
+            # restored with 0.0.  That sentinel must fall back to the saved
+            # risk_distance instead of becoming a fake multi-hundred-dollar R.
+            if float(initial_sl) > 0.0 and candidate_risk > 0.0:
+                normalized_risk = candidate_risk
+        except (TypeError, ValueError):
+            normalized_risk = 0.0
+    if normalized_risk <= 0.0 and risk_distance is not None:
+        try:
+            normalized_risk = abs(float(risk_distance))
+        except (TypeError, ValueError):
+            normalized_risk = 0.0
+
     floating_profit_atr_multiple = (
         floating_profit_price / current_atr if current_atr > 0.0 else 0.0
     )
+    floating_profit_r_multiple = (
+        floating_profit_price / normalized_risk if normalized_risk > 0.0 else 0.0
+    )
 
-    # Tightening is intentionally never configurable below 2-of-3.  A single
-    # weakening momentum signal is not enough to pull the stop closer.
-    required_confirmations = max(2, min(3, int(cfg.exhaustion_confirm_count)))
-    enough_confirmation = exhaustion.active_count >= required_confirmations
-    enough_profit = (
-        current_atr > 0.0
-        and floating_profit_atr_multiple
-        >= max(0.0, float(cfg.min_profit_atr_multiple))
+    high_since_entry = None
+    low_since_entry = None
+    if normalized_entry is not None:
+        try:
+            high_since_entry = (
+                max(normalized_entry, float(highest_price_since_entry), float(current_price))
+                if highest_price_since_entry is not None
+                else max(normalized_entry, float(current_price))
+            )
+            low_since_entry = (
+                min(normalized_entry, float(lowest_price_since_entry), float(current_price))
+                if lowest_price_since_entry is not None
+                else min(normalized_entry, float(current_price))
+            )
+        except (TypeError, ValueError):
+            high_since_entry = normalized_entry
+            low_since_entry = normalized_entry
+
+    # Once the threshold has been observed, retain that fact even if price
+    # retraces before the next poll.  The live loop persists this flag.
+    breakeven_armed = bool(
+        breakeven_armed
+        or (normalized_risk > 0.0 and floating_profit_price >= normalized_risk)
     )
-    tightening_eligible = enough_confirmation and enough_profit
-    mode = "TIGHTENING" if tightening_eligible else "NORMAL"
-    raw_multiplier = cfg.tight_multiplier if tightening_eligible else cfg.normal_multiplier
-    # Keep an absolute ATR floor in tightening mode, even if a smaller
-    # tight_multiplier is configured.
-    multiplier = (
-        max(raw_multiplier, float(cfg.min_tight_distance_atr))
-        if tightening_eligible
-        else raw_multiplier
-    )
-    distance = current_atr * multiplier
+
+    stage = "WAITING_FOR_1R"
     candidate = None
-    if current_atr > 0.0 and distance > 0.0:
-        candidate = round(current_price - distance if is_buy else current_price + distance, 8)
+    multiplier = 0.0
+    distance = 0.0
+    if breakeven_armed and normalized_entry is not None:
+        sl_at_or_beyond_breakeven = False
+        if current_sl is not None:
+            try:
+                live_sl = float(current_sl)
+                sl_at_or_beyond_breakeven = (
+                    live_sl >= normalized_entry if is_buy
+                    else live_sl <= normalized_entry
+                )
+            except (TypeError, ValueError):
+                sl_at_or_beyond_breakeven = False
+
+        if not sl_at_or_beyond_breakeven:
+            stage = "BREAKEVEN"
+            candidate = round(normalized_entry, 8)
+            distance = round(abs(float(current_price) - normalized_entry), 8)
+        elif current_atr > 0.0:
+            stage = "CHANDELIER"
+            multiplier = float(cfg.chandelier_atr_multiplier)
+            if is_buy and high_since_entry is not None:
+                candidate = round(high_since_entry - (multiplier * current_atr), 8)
+                distance = round(high_since_entry - candidate, 8)
+            elif not is_buy and low_since_entry is not None:
+                candidate = round(low_since_entry + (multiplier * current_atr), 8)
+                distance = round(candidate - low_since_entry, 8)
+
+    # ``mode`` remains in the decision contract for panel compatibility.
+    # Exhaustion indicators are retained as telemetry but no longer authorize
+    # an SL move; the R-based state machine is the sole activation gate.
+    mode = stage
+    tightening_eligible = stage == "CHANDELIER"
     return AdaptiveTrailDecision(
         mode=mode,
+        stage=stage,
         multiplier=multiplier,
         atr=current_atr,
         distance=round(distance, 8),
@@ -273,6 +363,15 @@ def compute_adaptive_trail(
         exhaustion=exhaustion,
         floating_profit_price=floating_profit_price,
         floating_profit_atr_multiple=round(floating_profit_atr_multiple, 8),
+        floating_profit_r_multiple=round(floating_profit_r_multiple, 8),
+        risk_distance=round(normalized_risk, 8),
+        highest_price_since_entry=(
+            round(high_since_entry, 8) if high_since_entry is not None else None
+        ),
+        lowest_price_since_entry=(
+            round(low_since_entry, 8) if low_since_entry is not None else None
+        ),
+        breakeven_armed=breakeven_armed,
         tightening_eligible=tightening_eligible,
     )
 

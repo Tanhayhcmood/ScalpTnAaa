@@ -51,6 +51,8 @@ from live_trading.config import (
     TRAIL_MOMENTUM_LOOKBACK, TRAIL_BODY_SHRINK_RATIO,
     TRAIL_VOLUME_SHRINK_RATIO, TRAIL_MIN_PROFIT_ATR,
     TRAIL_MIN_DISTANCE_ATR, TRAIL_MIN_STEP_PRICE,
+    TRAIL_CHANDELIER_ATR_MULTIPLIER,
+    RANGE_WEAK_MIN_CONFIRMATIONS,
     MTF_ENABLED, MTF_TIMEFRAME, MTF_CANDLE_WINDOW,
     MTF_OPPOSITION_THRESHOLD, MTF_DRY_RUN,
     TRADE_TIMEFRAMES,
@@ -570,6 +572,7 @@ class GoldScalperLive:
         self._trailing_cfg = AdaptiveTrailingConfig(
             enabled=TRAIL_ENABLED,
             atr_period=TRAIL_ATR_PERIOD,
+            chandelier_atr_multiplier=TRAIL_CHANDELIER_ATR_MULTIPLIER,
             normal_multiplier=TRAIL_NORMAL_MULTIPLIER,
             tight_multiplier=TRAIL_TIGHT_MULTIPLIER,
             exhaustion_confirm_count=TRAIL_EXHAUSTION_CONFIRM_COUNT,
@@ -1421,17 +1424,44 @@ class GoldScalperLive:
             range_entry_filters_enabled=RANGE_ENTRY_FILTERS_ENABLED,
             timeframe=tf,
             price_action_standalone=PRICE_ACTION_STANDALONE,
+            range_weak_min_confirmations=RANGE_WEAK_MIN_CONFIRMATIONS,
+            regime_strength=htf_bias.strength if htf_bias is not None else None,
+            regime_context=htf_bias.regime if htf_bias is not None else None,
         )
         self.last_decision = decision
 
         # 6. Write MT5 snapshot for Telegram panel
         last_c = candles[-1]
         _strategy_telemetry = describe_strategy(decision)
+        _policy_strength = str(
+            decision.regime_strength
+            or (htf_bias.strength if htf_bias is not None else "")
+        ).upper()
+        _policy_regime = str(
+            decision.policy_regime
+            or decision.regime
+            or (htf_bias.regime if htf_bias is not None else "")
+        ).upper()
+        _policy_min_confirmations = decision.effective_min_confirmations
+        if _policy_min_confirmations is None:
+            if _policy_regime == "RANGE":
+                _policy_min_confirmations = (
+                    max(RANGE_MIN_CONFIRMATIONS, RANGE_WEAK_MIN_CONFIRMATIONS)
+                    if _policy_strength == "WEAK"
+                    else RANGE_MIN_CONFIRMATIONS
+                )
+            else:
+                _policy_min_confirmations = MIN_CONFIRMATIONS
         _strategy_telemetry.update({
             "candle_time": last_c.time,
             "timeframe": tf,
             "entry_policy": {
-                "min_confirmations": MIN_CONFIRMATIONS,
+                "min_confirmations": _policy_min_confirmations,
+                "base_min_confirmations": MIN_CONFIRMATIONS,
+                "range_min_confirmations": RANGE_MIN_CONFIRMATIONS,
+                "range_weak_min_confirmations": RANGE_WEAK_MIN_CONFIRMATIONS,
+                "regime": _policy_regime,
+                "strength": _policy_strength or "UNKNOWN",
                 "trend_min_confirmations": TREND_MIN_CONFIRMATIONS,
                 "price_action_standalone": bool(PRICE_ACTION_STANDALONE),
                 "pa_standalone_min_score": PA_STANDALONE_MIN_SCORE,
@@ -1856,6 +1886,7 @@ class GoldScalperLive:
                 "confidence":  decision.confidence,
                 "grade":       decision.grade,
                 "regime":      decision.regime,
+                 "timeframe":   tf,
                 "bar_time":    bar_time.isoformat(),
                 "strategy":    strategy,
                 "strategy_slots": list(candidate_strategy_slots),
@@ -1880,7 +1911,11 @@ class GoldScalperLive:
                 "direction":     decision.direction,
                 "entry":         tp_params.entry_price,
                 "risk_distance": abs(tp_params.entry_price - tp_params.stop_loss),
+                "initial_sl":    tp_params.stop_loss,
                 "timeframe":     tf,
+                "highest_price_since_entry": tp_params.entry_price,
+                "lowest_price_since_entry": tp_params.entry_price,
+                "breakeven_armed": False,
             }
             # Build a synthetic position so the Telegram panel reflects the
             # newly opened trade immediately rather than waiting up to 5 min
@@ -1965,6 +2000,10 @@ class GoldScalperLive:
                         "entry":         float(entry["entry"]),
                         "risk_distance": risk,
                         "initial_sl":    float(entry["sl"]),
+                    "timeframe":     entry.get("timeframe") or TIMEFRAME,
+                    "highest_price_since_entry": float(entry["entry"]),
+                    "lowest_price_since_entry": float(entry["entry"]),
+                    "breakeven_armed": False,
                     }
                 break
         # Fallback: derive from the position's live snapshot.
@@ -1980,6 +2019,10 @@ class GoldScalperLive:
                 "entry":         float(pos.get("open_price", 0.0)),
                 "risk_distance": risk,
                 "initial_sl":    float(pos.get("sl", 0.0)),
+                "timeframe":     pos.get("timeframe") or TIMEFRAME,
+                "highest_price_since_entry": float(pos.get("open_price", 0.0)),
+                "lowest_price_since_entry": float(pos.get("open_price", 0.0)),
+                "breakeven_armed": False,
             }
         return None
 
@@ -2052,42 +2095,98 @@ class GoldScalperLive:
             current_price = quote["bid"] if direction == "BUY" else quote["ask"]
             timeframe = str(baseline.get("timeframe") or TIMEFRAME)
             candles = self._last_candles_by_timeframe.get(timeframe, [])
+
+            # Keep the best favourable quote observed for this ticket.  These
+            # extremes, unlike the current quote, are the anchor for the
+            # Chandelier calculation and are persisted with the baseline.
+            try:
+                current_price = float(current_price)
+                entry_price = float(baseline["entry"])
+                if direction == "BUY":
+                    baseline["highest_price_since_entry"] = max(
+                        float(baseline.get("highest_price_since_entry", entry_price)),
+                        entry_price,
+                        current_price,
+                    )
+                else:
+                    baseline["lowest_price_since_entry"] = min(
+                        float(baseline.get("lowest_price_since_entry", entry_price)),
+                        entry_price,
+                        current_price,
+                    )
+            except (TypeError, ValueError):
+                self._last_trailing_statuses[pos_id] = {
+                    "active": False,
+                    "action": "SKIP",
+                    "reason": "invalid quote or entry price",
+                }
+                return
+
             decision = compute_adaptive_trail(
                 direction=direction,
                 current_price=current_price,
                 candles=candles,
                 cfg=self._trailing_cfg,
                 entry_price=baseline["entry"],
+                initial_sl=baseline.get("initial_sl"),
+                risk_distance=baseline.get("risk_distance"),
+                current_sl=pos.get("sl"),
+                highest_price_since_entry=baseline.get(
+                    "highest_price_since_entry"
+                ),
+                lowest_price_since_entry=baseline.get(
+                    "lowest_price_since_entry"
+                ),
+                breakeven_armed=baseline.get("breakeven_armed", False),
+            )
+            baseline.update(
+                {
+                    "highest_price_since_entry": (
+                        decision.highest_price_since_entry
+                    ),
+                    "lowest_price_since_entry": (
+                        decision.lowest_price_since_entry
+                    ),
+                    "breakeven_armed": decision.breakeven_armed,
+                }
             )
             candidate_sl = decision.candidate_sl
             previous_status = self._last_trailing_statuses.get(pos_id, {})
+            apply_step = (
+                0.0
+                if decision.stage == "BREAKEVEN"
+                else self._trailing_cfg.min_step_price
+            )
             applicable = should_apply(
                 direction,
                 pos["sl"],
                 candidate_sl,
-                self._trailing_cfg.min_step_price,
+                apply_step,
             )
             action = "MODIFY" if applicable else "HOLD"
             if candidate_sl is None:
-                reason_text = "insufficient ATR/candle data"
-            elif (
-                decision.mode == "NORMAL"
-                and decision.exhaustion.active_count
-                >= max(2, min(3, self._trailing_cfg.exhaustion_confirm_count))
-                and not decision.tightening_eligible
-            ):
                 reason_text = (
-                    "tightening waiting for profit %.2f ATR (current %.2f ATR)"
+                    "waiting for 1R (current %.3fR, risk_distance=%.5f)"
                     % (
-                        self._trailing_cfg.min_profit_atr_multiple,
-                        decision.floating_profit_atr_multiple,
+                        decision.floating_profit_r_multiple,
+                        decision.risk_distance,
                     )
                 )
+                if decision.stage == "CHANDELIER":
+                    reason_text = "insufficient ATR/candle data for chandelier"
             else:
-                reason_text = "adaptive distance ready"
+                reason_text = (
+                    "move SL to exact breakeven at 1R"
+                    if decision.stage == "BREAKEVEN"
+                    else (
+                        "chandelier from favourable extreme "
+                        f"(multiplier={self._trailing_cfg.chandelier_atr_multiplier:.2f})"
+                    )
+                )
             self._last_trailing_statuses[pos_id] = {
                 "active": candidate_sl is not None,
                 "mode": decision.mode,
+                "stage": decision.stage,
                 "timeframe": timeframe,
                 "atr": decision.atr,
                 "multiplier": decision.multiplier,
@@ -2096,6 +2195,11 @@ class GoldScalperLive:
                 "floating_profit": pos.get("profit", 0.0),
                 "floating_profit_price": decision.floating_profit_price,
                 "floating_profit_atr": decision.floating_profit_atr_multiple,
+                "floating_profit_r": decision.floating_profit_r_multiple,
+                "risk_distance": decision.risk_distance,
+                "highest_price_since_entry": decision.highest_price_since_entry,
+                "lowest_price_since_entry": decision.lowest_price_since_entry,
+                "breakeven_armed": decision.breakeven_armed,
                 "current_sl": pos["sl"],
                 "candidate_sl": candidate_sl,
                 "action": action,
@@ -2103,52 +2207,56 @@ class GoldScalperLive:
                 "sync_reason": self._trailing_sync_reason,
             }
             if (
-                previous_status.get("mode") == "NORMAL"
-                and decision.mode == "TIGHTENING"
+                previous_status.get("stage") != decision.stage
+                and decision.stage == "BREAKEVEN"
             ):
                 log.info(
-                    "Adaptive trailing switch: ticket=%s mode=NORMAL->TIGHTENING "
-                    "timeframe=%s indicators=%s new_distance=%.5f "
+                    "Adaptive trailing stage: ticket=%s stage=BREAKEVEN "
+                    "timeframe=%s risk_distance=%.5f "
                     "floating_profit=%.2f floating_profit_price=%.5f "
-                    "profit_atr=%.3f atr=%.5f multiplier=%.3f",
+                    "profit_r=%.3f",
                     pos_id,
                     timeframe,
-                    ",".join(decision.exhaustion.active),
-                    decision.distance,
+                    decision.risk_distance,
                     pos.get("profit", 0.0),
                     decision.floating_profit_price,
-                    decision.floating_profit_atr_multiple,
-                    decision.atr,
-                    decision.multiplier,
+                    decision.floating_profit_r_multiple,
                 )
             elif (
-                previous_status.get("mode") == "TIGHTENING"
-                and decision.mode == "NORMAL"
+                previous_status.get("stage") != decision.stage
+                and decision.stage == "CHANDELIER"
             ):
                 log.info(
-                    "Adaptive trailing switch: ticket=%s mode=TIGHTENING->NORMAL "
-                    "timeframe=%s indicators=%s new_distance=%.5f "
+                    "Adaptive trailing stage: ticket=%s stage=CHANDELIER "
+                    "timeframe=%s highest=%.5f lowest=%.5f "
                     "atr=%.5f multiplier=%.3f",
                     pos_id,
                     timeframe,
-                    ",".join(decision.exhaustion.active) or "none",
-                    decision.distance,
+                    decision.highest_price_since_entry or 0.0,
+                    decision.lowest_price_since_entry or 0.0,
                     decision.atr,
                     decision.multiplier,
                 )
             log.info(
-                "Adaptive trailing update: ticket=%s mode=%s timeframe=%s "
+                "Adaptive trailing update: ticket=%s stage=%s mode=%s timeframe=%s "
                 "floating_profit=%.2f floating_profit_price=%.5f "
-                "profit_atr=%.3f atr=%.5f distance=%.5f indicators=%s "
+                "profit_r=%.3f profit_atr=%.3f risk_distance=%.5f "
+                "atr=%.5f distance=%.5f "
+                "extreme_high=%.5f extreme_low=%.5f indicators=%s "
                 "reason=%s action=%s",
                 pos_id,
+                decision.stage,
                 decision.mode,
                 timeframe,
                 pos.get("profit", 0.0),
                 decision.floating_profit_price,
+                decision.floating_profit_r_multiple,
                 decision.floating_profit_atr_multiple,
+                decision.risk_distance,
                 decision.atr,
                 decision.distance,
+                decision.highest_price_since_entry or 0.0,
+                decision.lowest_price_since_entry or 0.0,
                 ",".join(decision.exhaustion.active) or "none",
                 reason_text,
                 action,
@@ -2172,11 +2280,17 @@ class GoldScalperLive:
                     "position_id": pos["id"],
                     "action": "TRAIL_SL",
                     "direction": direction,
+                    "stage": decision.stage,
                     "mode": decision.mode,
                     "timeframe": timeframe,
                     "atr": decision.atr,
                     "multiplier": decision.multiplier,
                     "trail_distance": decision.distance,
+                    "floating_profit_price": decision.floating_profit_price,
+                    "floating_profit_r": decision.floating_profit_r_multiple,
+                    "risk_distance": decision.risk_distance,
+                    "highest_price_since_entry": decision.highest_price_since_entry,
+                    "lowest_price_since_entry": decision.lowest_price_since_entry,
                     "exhaustion_confirmations": list(decision.exhaustion.active),
                     "old_sl": pos["sl"],
                     "new_sl": candidate_sl,
@@ -3047,6 +3161,16 @@ class GoldScalperLive:
                     "entry": entry,
                     "risk_distance": risk_distance,
                     "initial_sl": float(baseline.get("initial_sl", 0.0)),
+                    "timeframe": baseline.get("timeframe") or TIMEFRAME,
+                    "highest_price_since_entry": float(
+                        baseline.get("highest_price_since_entry", entry)
+                    ),
+                    "lowest_price_since_entry": float(
+                        baseline.get("lowest_price_since_entry", entry)
+                    ),
+                    "breakeven_armed": bool(
+                        baseline.get("breakeven_armed", False)
+                    ),
                 }
             except (KeyError, TypeError, ValueError):
                 continue

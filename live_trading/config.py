@@ -186,6 +186,11 @@ RANGE_TRADING_ENABLED = os.getenv("RANGE_TRADING_ENABLED", "true").strip().lower
     "1", "true", "yes", "on",
 }
 RANGE_MIN_CONFIRMATIONS = _int("RANGE_MIN_CONFIRMATIONS", 2, lo=1, hi=4)
+# Weak RANGE conditions are noisier, so the entry policy can require a
+# stronger consensus without changing the normal RANGE floor.
+RANGE_WEAK_MIN_CONFIRMATIONS = _int(
+    "RANGE_WEAK_MIN_CONFIRMATIONS", 3, lo=2, hi=4
+)
 RANGE_MIN_RR = _float("RANGE_MIN_RR", 1.5, lo=1.0, hi=10.0)
 RANGE_EDGE_ATR_DISTANCE = _float("RANGE_EDGE_ATR_DISTANCE", 0.25, lo=0.05, hi=2.0)
 RANGE_RISK_PERCENT = _float("RANGE_RISK_PERCENT", 0.5, lo=0.01, hi=10.0)
@@ -340,11 +345,14 @@ MAX_DRAWDOWN_PCT     = _float("MAX_DRAWDOWN_PCT",      8.0,  lo=0.1, hi=50.0)
 SLIPPAGE_POINTS      = _int("SLIPPAGE_POINTS",         30,   lo=1,   hi=500)
 
 # ── Adaptive ATR Trailing Stop ─────────────────────────────────────────────────
-# Distance is ATR(period) * multiplier on the trade's timeframe. Once enough
-# independent exhaustion signals agree, the multiplier changes from normal to
-# tight mode. All values are environment-configurable on Render.
+# The live stop waits for 1R, moves to breakeven, then uses a Chandelier stop
+# anchored to the best price seen since entry. Legacy normal/tight settings are
+# retained for config compatibility and telemetry.
 TRAIL_ENABLED        = os.getenv("TRAIL_ENABLED", "true").lower() == "true"
 TRAIL_ATR_PERIOD = _int("TRAIL_ATR_PERIOD", 14, lo=1, hi=100)
+TRAIL_CHANDELIER_ATR_MULTIPLIER = _float(
+    "TRAIL_CHANDELIER_ATR_MULTIPLIER", 2.5, lo=2.0, hi=3.0
+)
 TRAIL_NORMAL_MULTIPLIER = _float("TRAIL_NORMAL_MULTIPLIER", 2.0, lo=0.1, hi=5.0)
 TRAIL_TIGHT_MULTIPLIER = _float("TRAIL_TIGHT_MULTIPLIER", 0.9, lo=0.1, hi=3.0)
 TRAIL_EXHAUSTION_CONFIRM_COUNT = _int(

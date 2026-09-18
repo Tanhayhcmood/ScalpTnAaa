@@ -30,6 +30,7 @@ from live_trading.config import (
     PRICE_ACTION_STANDALONE,
     PA_STANDALONE_MIN_SCORE,
     RANGE_MIN_CONFIRMATIONS,
+    RANGE_WEAK_MIN_CONFIRMATIONS,
     REQUIRE_SMC_PRICE_ACTION_WYCKOFF,
     RANGE_ENTRY_FILTERS_ENABLED,
     RANGE_REQUIRE_EDGE_POSITION,
@@ -52,6 +53,8 @@ def _effective_min_confirmations(
     regime: str,
     counter_trend: bool,
     range_min_confirmations: int = RANGE_MIN_CONFIRMATIONS,
+    range_weak_min_confirmations: int = RANGE_WEAK_MIN_CONFIRMATIONS,
+    strength: str = "",
 ) -> int:
     """Return the operator-selected N-of-4 floor.
 
@@ -61,6 +64,8 @@ def _effective_min_confirmations(
     """
     if regime == "RANGE":
         # RANGE owns its floor; never inherit the ordinary/TREND floor.
+        if str(strength).upper() == "WEAK":
+            return max(range_min_confirmations, range_weak_min_confirmations)
         return range_min_confirmations
     return base_min_confirmations
 
@@ -143,6 +148,9 @@ class DecisionResult:
     divergence:      Optional[DivergenceResult]  = None
     dxy_signal:      str                         = "NEUTRAL"
     range_context:   Optional[RangeContext]      = None
+    effective_min_confirmations: Optional[int]   = None
+    regime_strength: str                         = ""
+    policy_regime: str                           = ""
 
 
 def _candidate_direction(
@@ -232,6 +240,9 @@ def run_decision_engine(
     timeframe: str = "M5",
     price_action_standalone: bool = PRICE_ACTION_STANDALONE,
     pa_standalone_min_score: float = PA_STANDALONE_MIN_SCORE,
+    range_weak_min_confirmations: int = RANGE_WEAK_MIN_CONFIRMATIONS,
+    regime_strength: Optional[str] = None,
+    regime_context: Optional[str] = None,
 ) -> DecisionResult:
 
     smc     = analyze_smc_structure(candles, timeframe=timeframe)
@@ -259,10 +270,30 @@ def run_decision_engine(
 
     # Detect regime early — needed to set the adaptive confirmation threshold.
     regime = detect_market_regime(candles, trend, wyckoff, use_atr_high_vol)
-    effective_min_confirmations = _effective_min_confirmations(
+    effective_regime_strength = str(regime_strength or trend.strength).upper()
+    policy_regime = str(regime_context or regime.regime).upper()
+    local_min_confirmations = _effective_min_confirmations(
         min_confirmations,
         regime.regime,
         _counter_trend,
+        range_min_confirmations=range_min_confirmations,
+        range_weak_min_confirmations=range_weak_min_confirmations,
+        strength=effective_regime_strength,
+    )
+    policy_min_confirmations = _effective_min_confirmations(
+        min_confirmations,
+        policy_regime,
+        _counter_trend,
+        range_min_confirmations=range_min_confirmations,
+        range_weak_min_confirmations=range_weak_min_confirmations,
+        strength=effective_regime_strength,
+    )
+    # Preserve the stricter local RANGE floor when the HTF context is a
+    # different regime, while also allowing a weak HTF RANGE to raise the
+    # ordinary local floor to the configured weak-range value.
+    effective_min_confirmations = max(
+        local_min_confirmations,
+        policy_min_confirmations,
     )
 
     # Standalone mode is intentionally independent of SMC/Trend/Wyckoff, but
@@ -296,6 +327,15 @@ def run_decision_engine(
     # Price Action or Wyckoff is sufficient; the global option-1 gate must
     # not turn that dedicated two-confirmation playbook into a three-vote gate.
     is_range_regime = regime.regime == "RANGE"
+    is_weak_range = (
+        effective_regime_strength == "WEAK"
+        and (is_range_regime or policy_regime == "RANGE")
+    )
+    # The explicit PA standalone override remains available for ordinary
+    # RANGE conditions, but weak RANGE must honor its stricter 3-vote floor.
+    range_price_action_standalone = (
+        price_action_standalone and not is_weak_range
+    )
     # A Trend-aligned entry is more exposed to a single transient EMA signal
     # than a structure/price-action setup. Keep the ordinary operator floor,
     # but require a second independent confirmation whenever Trend votes for
@@ -325,8 +365,8 @@ def run_decision_engine(
     if is_range_regime:
         range_votes_ok, range_votes_reason = _range_confirmation_gate(
             ef,
-            range_min_confirmations,
-            price_action_standalone=price_action_standalone,
+            effective_min_confirmations,
+            price_action_standalone=range_price_action_standalone,
         )
         if not range_votes_ok:
             return _make_neutral(
@@ -387,8 +427,8 @@ def run_decision_engine(
             confirmation_count=ef.confirmation_count,
             min_confirmations=(
                 1
-                if price_action_standalone and ef.price_action
-                else range_min_confirmations
+                if range_price_action_standalone and ef.price_action
+                else effective_min_confirmations
             ),
             edge_atr_distance=range_edge_atr_distance,
             strict_filters=range_entry_filters_enabled,
@@ -627,6 +667,9 @@ def run_decision_engine(
         divergence=divergence,
         dxy_signal=dxy_signal,
         range_context=range_context,
+        effective_min_confirmations=effective_min_confirmations,
+        regime_strength=effective_regime_strength,
+        policy_regime=policy_regime,
     )
 
 

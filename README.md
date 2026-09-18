@@ -114,7 +114,8 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `TREND_MIN_CONFIRMATIONS` | No | `2` | Minimum confirmations when Trend votes for the entry direction |
 | `PRICE_ACTION_STANDALONE` | No | `true` | Allow a directional Price Action signal to authorize an entry alone; other quality/risk gates remain active |
 | `RANGE_TRADING_ENABLED` | No | `true` | Enable the dedicated edge/sweep/reversal RANGE playbook |
-| `RANGE_MIN_CONFIRMATIONS` | No | `2` | RANGE requires two aligned strategy confirmations |
+| `RANGE_MIN_CONFIRMATIONS` | No | `2` | Normal RANGE confirmation floor |
+| `RANGE_WEAK_MIN_CONFIRMATIONS` | No | `3` | Weak RANGE confirmation floor; requires stronger consensus |
 | `RANGE_MIN_RR` | No | `1.5` | Minimum RANGE risk/reward |
 | `RANGE_EDGE_ATR_DISTANCE` | No | `0.25` | Maximum distance from a RANGE edge in ATR units |
 | `RANGE_RISK_PERCENT` | No | `0.25` | Risk per RANGE trade (% of balance) |
@@ -133,13 +134,12 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `MAX_DRAWDOWN_PCT` | No | `12.0` | Guardian: drawdown halt threshold |
 | `SLIPPAGE_POINTS` | No | `30` | Max fill slippage in broker points |
 | `TRAIL_ATR_PERIOD` | No | `14` | ATR period used by adaptive trailing on each trade timeframe |
-| `TRAIL_NORMAL_MULTIPLIER` | No | `2.0` | Normal trailing distance multiplier (`ATR × multiplier`) |
-| `TRAIL_TIGHT_MULTIPLIER` | No | `0.9` | Tightening multiplier after exhaustion confirmation |
-| `TRAIL_EXHAUSTION_CONFIRM_COUNT` | No | `2` | Number of exhaustion signal families required (2–3; tightening never uses fewer than 2) |
+| `TRAIL_CHANDELIER_ATR_MULTIPLIER` | No | `2.5` | Chandelier distance after breakeven (`highest/lowest since entry ± ATR × multiplier`, constrained to 2–3) |
+| `TRAIL_NORMAL_MULTIPLIER` / `TRAIL_TIGHT_MULTIPLIER` | No | `2.0` / `0.9` | Legacy compatibility settings; no longer authorize SL movement |
+| `TRAIL_EXHAUSTION_CONFIRM_COUNT` | No | `2` | Legacy exhaustion telemetry setting; no longer authorizes SL movement |
 | `TRAIL_MOMENTUM_LOOKBACK` | No | `3` | Bars used for MACD/RSI momentum slope |
 | `TRAIL_BODY_SHRINK_RATIO` / `TRAIL_VOLUME_SHRINK_RATIO` | No | `0.8` | Recent-to-baseline contraction threshold for candle bodies/volume |
-| `TRAIL_MIN_PROFIT_ATR` | No | `1.5` | Minimum favourable floating movement in ATR multiples before tightening |
-| `TRAIL_MIN_DISTANCE_ATR` | No | `1.0` | Absolute minimum stop distance in ATR multiples during tightening |
+| `TRAIL_MIN_PROFIT_ATR` / `TRAIL_MIN_DISTANCE_ATR` | No | `1.5` / `1.0` | Legacy compatibility settings; the live activation threshold is 1× initial R and the post-BE distance is Chandelier ATR |
 | `TRAIL_MIN_STEP_PRICE` | No | `0.05` | Minimum favourable stop improvement before a broker modification |
 | `STATE_FILE` / `MT5_SNAPSHOT` / `COMMANDS_FILE` / `GUARDIAN_STATE_FILE` / `LOG_FILE` | No | `/tmp/...` | Local file paths — ephemeral, real cross-restart durability comes from Redis (see Architecture above) |
 

@@ -1,5 +1,4 @@
 import unittest
-from unittest.mock import patch
 
 from live_trading.risk.adaptive_trailing_stop import (
     AdaptiveTrailingConfig,
@@ -28,91 +27,118 @@ class AdaptiveTrailingStopTests(unittest.TestCase):
             candles.append(candle(start, start + body, start - 0.5, start + body, 50))
         return candles
 
-    def test_normal_distance_uses_configured_atr_multiplier(self):
+    def test_stage_one_holds_until_one_r(self):
         candles = [
             candle(100, 102, 99, 101, 100)
             for _ in range(30)
         ]
         decision = compute_adaptive_trail(
             "BUY",
-            101,
+            100.5,
             candles,
-            AdaptiveTrailingConfig(
-                atr_period=14,
-                normal_multiplier=2.0,
-                exhaustion_confirm_count=3,
-            ),
+            AdaptiveTrailingConfig(),
+            entry_price=100.0,
+            initial_sl=98.0,
+            current_sl=98.0,
         )
-        self.assertEqual(decision.mode, "NORMAL")
+        self.assertEqual(decision.stage, "WAITING_FOR_1R")
+        self.assertIsNone(decision.candidate_sl)
+        self.assertLess(decision.floating_profit_r_multiple, 1.0)
         self.assertGreater(decision.atr, 0)
-        self.assertAlmostEqual(decision.distance, decision.atr * 2.0)
 
-    def test_two_confirmations_switch_to_tightening(self):
-        candles = self._exhaustion_candles()
-        # Momentum is directional and volume is lower; body contraction plus
-        # either signal must be enough for the default 2-of-3 policy.
-        signals = detect_exhaustion(
-            candles,
-            "BUY",
-            AdaptiveTrailingConfig(momentum_lookback=3),
-        )
-        self.assertGreaterEqual(signals.active_count, 2)
+    def test_negative_floating_profit_never_builds_a_stop_candidate(self):
+        candles = [candle(100, 101, 99, 99.5, 100) for _ in range(30)]
         decision = compute_adaptive_trail(
             "BUY",
-            candles[-1]["close"],
+            99.0,
             candles,
             AdaptiveTrailingConfig(),
-            entry_price=95.0,
+            entry_price=100.0,
+            initial_sl=98.0,
+            current_sl=98.0,
         )
-        self.assertEqual(decision.mode, "TIGHTENING")
-        self.assertLess(decision.multiplier, 2.0)
-        self.assertGreaterEqual(decision.floating_profit_atr_multiple, 1.5)
+        self.assertEqual(decision.stage, "WAITING_FOR_1R")
+        self.assertIsNone(decision.candidate_sl)
+        self.assertEqual(decision.floating_profit_price, 0.0)
 
-    def test_tightening_waits_for_minimum_profit(self):
-        candles = self._exhaustion_candles()
+    def test_one_r_moves_stop_exactly_to_breakeven(self):
+        candles = [candle(100, 101, 100, 100.5, 100) for _ in range(30)]
         decision = compute_adaptive_trail(
             "BUY",
-            candles[-1]["close"],
+            102.0,
             candles,
             AdaptiveTrailingConfig(),
-            entry_price=100.5,
+            entry_price=100.0,
+            initial_sl=98.0,
+            current_sl=98.0,
         )
-        self.assertGreaterEqual(decision.exhaustion.active_count, 2)
-        self.assertEqual(decision.mode, "NORMAL")
-        self.assertFalse(decision.tightening_eligible)
-        self.assertLess(decision.floating_profit_atr_multiple, 1.5)
+        self.assertEqual(decision.stage, "BREAKEVEN")
+        self.assertEqual(decision.candidate_sl, 100.0)
+        self.assertTrue(decision.breakeven_armed)
+        self.assertAlmostEqual(decision.floating_profit_r_multiple, 1.0)
 
-    def test_momentum_alone_never_enables_tightening(self):
-        candles = [candle(100, 102, 99, 101, 100) for _ in range(40)]
-        with patch(
-            "live_trading.risk.adaptive_trailing_stop._directional_momentum_weakening",
-            return_value=True,
-        ):
-            decision = compute_adaptive_trail(
-                "BUY",
-                candles[-1]["close"],
-                candles,
-                AdaptiveTrailingConfig(exhaustion_confirm_count=1),
-                entry_price=95.0,
-            )
-        self.assertEqual(decision.exhaustion.active, ("momentum_weakening",))
-        self.assertEqual(decision.mode, "NORMAL")
+    def test_chandelier_uses_highest_price_since_entry(self):
+        candles = [candle(100, 101, 100, 100.5, 100) for _ in range(30)]
+        decision = compute_adaptive_trail(
+            "BUY",
+            105.0,
+            candles,
+            AdaptiveTrailingConfig(chandelier_atr_multiplier=2.5),
+            entry_price=100.0,
+            initial_sl=98.0,
+            current_sl=100.0,
+            highest_price_since_entry=106.0,
+            breakeven_armed=True,
+        )
+        self.assertEqual(decision.stage, "CHANDELIER")
+        self.assertEqual(decision.highest_price_since_entry, 106.0)
+        self.assertAlmostEqual(decision.candidate_sl, 103.5)
 
-    def test_tightening_respects_absolute_atr_distance_floor(self):
+    def test_chandelier_uses_lowest_price_for_sell(self):
+        candles = [candle(100, 101, 100, 100.5, 100) for _ in range(30)]
+        decision = compute_adaptive_trail(
+            "SELL",
+            95.0,
+            candles,
+            AdaptiveTrailingConfig(chandelier_atr_multiplier=2.5),
+            entry_price=100.0,
+            initial_sl=102.0,
+            current_sl=100.0,
+            lowest_price_since_entry=94.0,
+            breakeven_armed=True,
+        )
+        self.assertEqual(decision.stage, "CHANDELIER")
+        self.assertEqual(decision.lowest_price_since_entry, 94.0)
+        self.assertAlmostEqual(decision.candidate_sl, 96.5)
+
+    def test_risk_distance_is_derived_from_initial_sl(self):
         candles = self._exhaustion_candles()
         decision = compute_adaptive_trail(
             "BUY",
-            candles[-1]["close"],
+            102.0,
             candles,
-            AdaptiveTrailingConfig(
-                tight_multiplier=0.25,
-                min_tight_distance_atr=1.0,
-            ),
-            entry_price=95.0,
+            AdaptiveTrailingConfig(),
+            entry_price=100.0,
+            initial_sl=98.0,
+            current_sl=98.0,
         )
-        self.assertEqual(decision.mode, "TIGHTENING")
-        self.assertEqual(decision.multiplier, 1.0)
-        self.assertAlmostEqual(decision.distance, decision.atr)
+        self.assertEqual(decision.risk_distance, 2.0)
+        self.assertEqual(decision.stage, "BREAKEVEN")
+
+    def test_legacy_zero_initial_sl_falls_back_to_saved_risk(self):
+        candles = [candle(100, 101, 100, 100.5, 100) for _ in range(30)]
+        decision = compute_adaptive_trail(
+            "BUY",
+            102.0,
+            candles,
+            AdaptiveTrailingConfig(),
+            entry_price=100.0,
+            initial_sl=0.0,
+            risk_distance=2.0,
+            current_sl=98.0,
+        )
+        self.assertEqual(decision.risk_distance, 2.0)
+        self.assertEqual(decision.stage, "BREAKEVEN")
 
     def test_missing_volume_does_not_count_as_declining(self):
         candles = [candle(100, 102, 99, 101, 0) for _ in range(30)]

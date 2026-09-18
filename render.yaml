@@ -112,6 +112,13 @@ services:
         value: "8.0"
       - key: SLIPPAGE_POINTS
         value: "30"
+      # Trailing waits for 1R, moves to breakeven, then uses
+      # highest/lowest-price-since-entry minus 2.5 ATR.
+      - key: TRAIL_CHANDELIER_ATR_MULTIPLIER
+        value: "2.5"
+      # Weak RANGE entries require a stronger strategy consensus.
+      - key: RANGE_WEAK_MIN_CONFIRMATIONS
+        value: "3"
       # TRADE_TIMEFRAMES / QUALITY_ADX_MIN are read by the live engine and
       # were set on the live service but missing from this manifest.
       - key: TRADE_TIMEFRAMES
