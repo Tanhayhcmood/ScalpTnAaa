@@ -162,7 +162,8 @@ def apply_quality_filter(
     if len(candles) < 30:
         blocked.blocked_reasons = ["Insufficient candle data (< 30)"]
         return blocked
-    # The ordinary entry filter is N-of-4, but a legacy hard gate used to
+    # The ordinary entry filter is a two-engine Trend + Price Action policy,
+    # but a legacy hard gate used to
     # discard PA+Trend/Wyckoff setups whenever SMC was neutral.  Only the
     # decision engine can explicitly open this path, and only when PA itself
     # is one of the aligned confirmations.

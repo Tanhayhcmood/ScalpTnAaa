@@ -42,7 +42,7 @@ export METAAPI_ACCOUNT_ID="your-account-id-here"
 # Optional overrides
 export SYMBOL=XAUUSD
 export RISK_PERCENT=1.0
-export MIN_CONFIRMATIONS=3
+export MIN_CONFIRMATIONS=2
 
 # Risk Guardian — circuit breakers (strongly recommended for live accounts)
 export DAILY_LOSS_LIMIT_PCT=3.0   # halt if day PnL drops below -3% of balance
@@ -86,7 +86,7 @@ live_trading/
 │   ├── market_regime.py          ← 11 regimes + ADX
 │   ├── confidence_engine.py      ← 0–100 weighted score
 │   ├── quality_filter.py         ← Session quality / ADX / late-entry gate
-│   ├── entry_filter.py           ← min 3-of-4 vote gate
+│   ├── entry_filter.py           ← Trend + Price Action two-engine gate
 │   └── decision_engine.py        ← master orchestrator
 ├── risk/
 │   ├── capital_manager.py        ← SL (structural), TP=2R, lot=1%
@@ -112,7 +112,7 @@ candles (300 M5 bars)
    ├─► Price Action      → Engulf, Pin Bar, Breakout
    ├─► Wyckoff Engine    → Phase, Spring, Upthrust
    │
-   ├─► Entry Filter      → min 1-of-4 vote (SMC required)
+   ├─► Entry Filter      → Trend + Price Action only
    ├─► Market Regime     → 11 regimes + ADX + rules per regime
    ├─► Confidence Engine → 0–100 score (6 weighted bands)
    ├─► Quality Filter    → Session quality / ADX / late-entry / volume gate
@@ -130,7 +130,7 @@ candles (300 M5 bars)
 | Confidence hard minimum | 70% | decisionEngine.ts |
 | Risk per trade | 1% of balance | capitalManager.ts |
 | Take profit | 2R | capitalManager.ts |
-| Min confirmations | 1-of-4 | entryFilter.ts |
+| Min confirmations | 2-of-2 | entry_filter.py |
 | SMC swing lookback | 5 bars | smcEngine.ts |
 | ATR period | 14 (Wilder) | goldEngine.ts |
 

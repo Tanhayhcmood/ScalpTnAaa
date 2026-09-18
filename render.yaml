@@ -133,7 +133,7 @@ services:
         value: "2.5"
       # Weak RANGE entries require a stronger strategy consensus.
       - key: RANGE_WEAK_MIN_CONFIRMATIONS
-        value: "3"
+        value: "2"
       # TRADE_TIMEFRAMES / QUALITY_ADX_MIN are read by the live engine and
       # were set on the live service but missing from this manifest.
       - key: TRADE_TIMEFRAMES

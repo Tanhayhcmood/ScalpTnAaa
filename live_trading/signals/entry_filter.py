@@ -1,14 +1,15 @@
-"""Entry Filter — four-engine confirmation policy.
+"""Entry Filter — two-engine live entry confirmation policy.
 
-Ordinary entries require the configured number of aligned engines. The live
-configuration can restrict which engines are allowed to authorize entries;
-disabled engines remain available for diagnostics but do not vote.
+Trend and Price Action are the only engines that can authorize a live entry.
+SMC and Wyckoff remain available to callers for diagnostics, but are excluded
+from direction selection and confirmation counting.
 """
 from dataclasses import dataclass
 from typing import Iterable, Literal
 
 MIN_CONFIRMATIONS = 2
-ALL_STRATEGIES = ("smc", "trend", "price_action", "wyckoff")
+ENTRY_STRATEGIES = ("trend", "price_action")
+ALL_STRATEGIES = ENTRY_STRATEGIES
 
 
 @dataclass
@@ -45,7 +46,11 @@ def apply_entry_filter(
     selects the candidate and may pass without SMC, Trend, or Wyckoff. The
     production configuration keeps that override disabled.
     """
-    enabled = set(enabled_strategies or ALL_STRATEGIES)
+    enabled = set(enabled_strategies or ENTRY_STRATEGIES)
+    required_confirmations = min(
+        max(1, int(min_confirmations)),
+        len(ENTRY_STRATEGIES),
+    )
     raw_votes = {
         "smc": _vote(smc_signal),
         "trend": _vote(
@@ -99,7 +104,7 @@ def apply_entry_filter(
     elif standalone_pa:
         allowed = pa_ok
     else:
-        allowed = count >= min_confirmations and (
+        allowed = count >= required_confirmations and (
             not require_price_action or pa_ok
         )
 

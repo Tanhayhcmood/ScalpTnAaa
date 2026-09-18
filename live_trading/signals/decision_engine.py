@@ -45,9 +45,10 @@ from live_trading.config import (
 # 1.3 = profitable in expectancy even at 45% win rate (1.3 × 0.45 > 0.55).
 CONF_MARGINAL_RR = 1.3
 
-# All four engines have equal weight. The production entry floor is the
-# operator-selected N-of-4 consensus; no regime silently raises it to make
-# one strategy mandatory. RANGE keeps its separate structural safeguards.
+# Trend and Price Action are the only engines with live-entry authority.
+# SMC and Wyckoff still run for diagnostics/telemetry, but never participate
+# in direction selection, confirmation counting, or mandatory entry gates.
+# RANGE keeps its separate structural safeguards.
 _CHOPPY_REGIMES = {"ACCUMULATION", "DISTRIBUTION", "HIGH_VOLATILITY"}
 
 
@@ -59,12 +60,20 @@ def _effective_min_confirmations(
     range_weak_min_confirmations: int = RANGE_WEAK_MIN_CONFIRMATIONS,
     strength: str = "",
 ) -> int:
-    """Return the operator-selected N-of-4 floor.
+    """Return the operator-selected two-engine floor.
 
     Counter-trend and choppy-market handling remain covered by the existing
     confidence, quality, regime, MTF, and risk gates; they do not silently
     turn the configured one-strategy floor into a stricter vote requirement.
     """
+    max_confirmations = 2
+    base_min_confirmations = min(max(1, int(base_min_confirmations)), max_confirmations)
+    range_min_confirmations = min(
+        max(1, int(range_min_confirmations)), max_confirmations
+    )
+    range_weak_min_confirmations = min(
+        max(1, int(range_weak_min_confirmations)), max_confirmations
+    )
     if regime == "RANGE":
         # RANGE owns its floor; never inherit the ordinary/TREND floor.
         if str(strength).upper() == "WEAK":
@@ -105,7 +114,7 @@ def _range_confirmation_gate(
     """Apply the RANGE confirmation floor without changing vote semantics.
 
     RANGE keeps its separate edge, fresh sweep, reversal, R:R, and session
-    limits. Its signal vote still follows the same equal-weight N-of-4
+    limits. Its signal vote still follows the same equal-weight two-engine
     consensus as ordinary entries. An explicit standalone Price Action policy
     may reduce this floor to one aligned PA vote; all other RANGE safeguards
     remain mandatory.
@@ -165,7 +174,7 @@ def _candidate_direction(
     enabled_strategies = None,
 ) -> str:
     """Return the unique direction with the most enabled strategy votes."""
-    enabled = set(enabled_strategies or ("smc", "trend", "price_action", "wyckoff"))
+    enabled = set(enabled_strategies or ("trend", "price_action"))
     if (
         price_action_standalone
         and "price_action" in enabled
@@ -341,7 +350,7 @@ def run_decision_engine(
             candles=candles,
         )
 
-    # Entry filter — equal-weight N-of-4 consensus; no engine is mandatory.
+    # Entry filter — equal-weight Trend + Price Action consensus.
     # RANGE has a narrower rule than ordinary regimes: SMC plus either
     # Price Action or Wyckoff is sufficient; the global option-1 gate must
     # not turn that dedicated two-confirmation playbook into a three-vote gate.
@@ -372,9 +381,10 @@ def run_decision_engine(
         wyckoff_signal  = wyckoff.wyckoff_signal,
         min_confirmations = effective_min_confirmations,
         require_price_action = require_price_action and not is_range_regime,
-        require_smc_price_action_wyckoff = (
-            require_smc_price_action_wyckoff and not is_range_regime
-        ),
+        # The old three-engine option is intentionally ignored for live
+        # entries. SMC and Wyckoff are diagnostic-only under the current
+        # two-engine policy.
+        require_smc_price_action_wyckoff = False,
         price_action_standalone=price_action_standalone,
         enabled_strategies=ENABLED_STRATEGIES,
     )
@@ -722,7 +732,9 @@ def describe_strategy(decision: "DecisionResult") -> dict:
     }
     if ef is not None:
         confirmations = [
-            label for key, label in _ENGINE_NAMES.items() if getattr(ef, key)
+            _ENGINE_NAMES[key]
+            for key in ("trend", "price_action")
+            if getattr(ef, key)
         ]
         confirmation_count = ef.confirmation_count
     else:
@@ -783,11 +795,11 @@ def describe_strategy(decision: "DecisionResult") -> dict:
         "regime_label":        decision.regime_label,
         "confirmations":       confirmations,
         "confirmation_count":  confirmation_count,
-        "confirmation_total":  4,
+        "confirmation_total":  2,
         # Top signal-level reasons behind the confidence score (e.g. "BOS
         # confirmed", "Strong EMA alignment (50/100/200)", "Spring confirmed").
         "signals":             list(decision.reasoning[:6]),
-        # Structured per-candle telemetry.  Keep the four decision stages
+        # Structured per-candle telemetry. Keep all four signal stages
         # separate so the panel/log consumer can identify where a setup was
         # weakened or blocked without re-running strategy code.
         "consensus": {
@@ -799,7 +811,7 @@ def describe_strategy(decision: "DecisionResult") -> dict:
                 "wyckoff": decision.wyckoff.wyckoff_signal,
             },
             "confirmed": confirmation_count,
-            "total": 4,
+            "total": 2,
             "allowed": bool(ef.allowed) if ef is not None else False,
         },
         "confidence_stage": {

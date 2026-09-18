@@ -49,9 +49,9 @@ def test_regime_block_preserves_direction_regime_and_votes():
         allowed=True,
         direction="SELL",
         confirmation_count=2,
-        smc=True,
+        smc=False,
         trend=True,
-        price_action=False,
+        price_action=True,
         wyckoff=False,
     )
     accumulation = RegimeResult(
@@ -89,9 +89,9 @@ def test_blocked_decision_telemetry_reports_aligned_confirmations():
         allowed=True,
         direction="SELL",
         confirmation_count=2,
-        smc=True,
+        smc=False,
         trend=True,
-        price_action=False,
+        price_action=True,
         wyckoff=False,
     )
 
@@ -112,6 +112,8 @@ def test_blocked_decision_telemetry_reports_aligned_confirmations():
     assert telemetry["direction"] == "SELL"
     assert telemetry["confirmation_count"] == 2
     assert telemetry["confirmations"] == [
-        "Smart Money Concepts (structure)",
         "Trend (EMA alignment)",
+        "Price Action",
     ]
+    assert telemetry["confirmation_total"] == 2
+    assert telemetry["consensus"]["total"] == 2

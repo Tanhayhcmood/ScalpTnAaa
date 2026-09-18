@@ -52,10 +52,15 @@ class TestConfigDefaults:
         assert isinstance(cfg.RISK_PERCENT, float)
 
     def test_min_confirmations_default(self):
-        """Ordinary entries require two engines; Price Action is separate."""
+        """Ordinary entries require the two live entry engines."""
         cfg = _reload_config({})
         assert cfg.MIN_CONFIRMATIONS == 2
         assert isinstance(cfg.MIN_CONFIRMATIONS, int)
+
+    def test_live_entry_strategies_are_fixed_to_trend_and_price_action(self):
+        cfg = _reload_config({"ENABLED_STRATEGIES": "smc,trend,price_action,wyckoff"})
+        assert cfg.LIVE_ENTRY_STRATEGIES == ("trend", "price_action")
+        assert cfg.ENABLED_STRATEGIES == ("trend", "price_action")
 
     def test_trend_min_confirmations_default(self):
         cfg = _reload_config({})
@@ -80,6 +85,18 @@ class TestConfigDefaults:
         cfg = _reload_config({})
         assert cfg.RANGE_MIN_CONFIRMATIONS == 2
         assert isinstance(cfg.RANGE_MIN_CONFIRMATIONS, int)
+
+    def test_confirmation_floors_are_capped_at_two_engines(self):
+        cfg = _reload_config({
+            "MIN_CONFIRMATIONS": "4",
+            "TREND_MIN_CONFIRMATIONS": "3",
+            "RANGE_MIN_CONFIRMATIONS": "4",
+            "RANGE_WEAK_MIN_CONFIRMATIONS": "3",
+        })
+        assert cfg.MIN_CONFIRMATIONS == 2
+        assert cfg.TREND_MIN_CONFIRMATIONS == 2
+        assert cfg.RANGE_MIN_CONFIRMATIONS == 2
+        assert cfg.RANGE_WEAK_MIN_CONFIRMATIONS == 2
 
     def test_quality_adx_min_default_is_balanced(self):
         cfg = _reload_config({})

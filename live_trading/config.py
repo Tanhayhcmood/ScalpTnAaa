@@ -91,6 +91,28 @@ def _strategy_list(name: str, default: str) -> tuple[str, ...]:
     return strategies
 
 
+# Live entries are intentionally authorized by exactly these two engines.
+# SMC and Wyckoff continue to run for diagnostics and telemetry, but their
+# signals must never expand the entry consensus or become a required gate.
+LIVE_ENTRY_STRATEGIES = ("trend", "price_action")
+
+
+def _entry_confirmation_floor(name: str, default: int = 2) -> int:
+    """Read a legacy confirmation setting without allowing a 3-of-4 floor.
+
+    Render may retain an older environment value after a deployment. Capping
+    here keeps the two-engine policy authoritative even when that happens.
+    """
+    value = _int(name, default, lo=1, hi=4)
+    if value > len(LIVE_ENTRY_STRATEGIES):
+        print(
+            f"WARNING: {name}={value} exceeds the two-engine live-entry "
+            f"policy; using {len(LIVE_ENTRY_STRATEGIES)} instead.",
+            file=sys.stderr,
+        )
+    return min(value, len(LIVE_ENTRY_STRATEGIES))
+
+
 # ── Valid timeframe labels ────────────────────────────────────────────────────
 _VALID_TIMEFRAMES = {
     "1m", "5m", "10m", "15m", "20m", "30m", "1h", "4h", "1d",
@@ -177,11 +199,10 @@ SL_ATR_PERIOD = _int("SL_ATR_PERIOD", 14, lo=2, hi=100)
 
 # ── Risk & Trade Rules ───────────────────────────────────────────────────────
 # Production defaults — override via Render env vars if needed.
-# ENABLED_STRATEGIES: only these engines can authorize a live entry. The
-# default intentionally keeps SMC and Wyckoff in observation/telemetry only.
-ENABLED_STRATEGIES = _strategy_list(
-    "ENABLED_STRATEGIES", "trend,price_action"
-)
+# ENABLED_STRATEGIES remains as a compatibility name for callers and old
+# Render variables. Its value is deliberately fixed so an old environment
+# setting cannot re-enable SMC or Wyckoff for live entries.
+ENABLED_STRATEGIES = LIVE_ENTRY_STRATEGIES
 # MIN_CONFIRMATIONS: minimum enabled engines that must agree for ordinary
 # entries.
 # CONF_HARD_MIN: trades below this confidence % are always rejected.
@@ -213,22 +234,22 @@ RANGE_MIN_CONFIDENCE  = _float("RANGE_MIN_CONFIDENCE",  40.0, lo=0.0, hi=100.0)
 # cannot open a trade by itself after a transient candle signal.
 # RANGE has its own confirmation floor below, independent of
 # TREND_MIN_CONFIRMATIONS and the ordinary entry policy.
-MIN_CONFIRMATIONS = _int("MIN_CONFIRMATIONS",   2,    lo=1,    hi=10)
+MIN_CONFIRMATIONS = _entry_confirmation_floor("MIN_CONFIRMATIONS")
 # A Trend-aligned ordinary entry must have at least two independent votes by
 # default. This is deliberately separate from MIN_CONFIRMATIONS so the
 # operator can keep Trend entries stricter than Price Action entries.
-TREND_MIN_CONFIRMATIONS = _int("TREND_MIN_CONFIRMATIONS", 2, lo=1, hi=4)
+TREND_MIN_CONFIRMATIONS = _entry_confirmation_floor("TREND_MIN_CONFIRMATIONS")
 # Dedicated RANGE playbook. Its confirmation floor is intentionally separate
 # from both MIN_CONFIRMATIONS and TREND_MIN_CONFIRMATIONS so RANGE can use a
 # lighter vote requirement without changing ordinary or TREND entries.
 RANGE_TRADING_ENABLED = os.getenv("RANGE_TRADING_ENABLED", "true").strip().lower() in {
     "1", "true", "yes", "on",
 }
-RANGE_MIN_CONFIRMATIONS = _int("RANGE_MIN_CONFIRMATIONS", 2, lo=1, hi=4)
+RANGE_MIN_CONFIRMATIONS = _entry_confirmation_floor("RANGE_MIN_CONFIRMATIONS")
 # Weak RANGE conditions are noisier, so the entry policy can require a
 # stronger consensus without changing the normal RANGE floor.
-RANGE_WEAK_MIN_CONFIRMATIONS = _int(
-    "RANGE_WEAK_MIN_CONFIRMATIONS", 3, lo=2, hi=4
+RANGE_WEAK_MIN_CONFIRMATIONS = _entry_confirmation_floor(
+    "RANGE_WEAK_MIN_CONFIRMATIONS"
 )
 RANGE_MIN_RR = _float("RANGE_MIN_RR", 1.5, lo=1.0, hi=10.0)
 RANGE_EDGE_ATR_DISTANCE = _float("RANGE_EDGE_ATR_DISTANCE", 0.25, lo=0.05, hi=2.0)

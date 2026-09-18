@@ -120,7 +120,7 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `PRICE_ACTION_STANDALONE` | No | `true` | Allow a directional Price Action signal to authorize an entry alone; other quality/risk gates remain active |
 | `RANGE_TRADING_ENABLED` | No | `true` | Enable the dedicated edge/sweep/reversal RANGE playbook |
 | `RANGE_MIN_CONFIRMATIONS` | No | `2` | Normal RANGE confirmation floor |
-| `RANGE_WEAK_MIN_CONFIRMATIONS` | No | `3` | Weak RANGE confirmation floor; requires stronger consensus |
+| `RANGE_WEAK_MIN_CONFIRMATIONS` | No | `2` | Weak RANGE confirmation floor; capped at the two live entry engines |
 | `RANGE_MIN_RR` | No | `1.5` | Minimum RANGE risk/reward |
 | `RANGE_EDGE_ATR_DISTANCE` | No | `0.25` | Maximum distance from a RANGE edge in ATR units |
 | `RANGE_RISK_PERCENT` | No | `0.25` | Risk per RANGE trade (% of balance) |

@@ -13,7 +13,7 @@ def test_range_uses_two_confirmation_floor_when_strength_is_not_weak():
     ) == 2
 
 
-def test_weak_range_uses_the_stricter_confirmation_floor():
+def test_weak_range_uses_the_two_engine_confirmation_floor():
     assert _effective_min_confirmations(
         2,
         "RANGE",
@@ -21,10 +21,10 @@ def test_weak_range_uses_the_stricter_confirmation_floor():
         range_min_confirmations=2,
         range_weak_min_confirmations=3,
         strength="WEAK",
-    ) == 3
+    ) == 2
 
 
-def test_weak_range_floor_is_tunable():
+def test_weak_range_floor_is_capped_at_two_engines():
     assert _effective_min_confirmations(
         2,
         "RANGE",
@@ -32,7 +32,7 @@ def test_weak_range_floor_is_tunable():
         range_min_confirmations=2,
         range_weak_min_confirmations=4,
         strength="WEAK",
-    ) == 4
+    ) == 2
 
 
 def test_range_does_not_add_a_counter_trend_vote_requirement():
