@@ -42,11 +42,11 @@ services:
         value: XAUUSD
       # FIX: TIMEFRAME and CANDLE_WINDOW are now env-configurable (fix #4).
       - key: TIMEFRAME
-        value: "15m"
+        value: "5m"
       - key: CANDLE_WINDOW
         value: "300"
-      # Protective SL uses the same stable M15 context as the live signal,
-      # rather than a noisy one-minute/tick-scale ATR.
+      # Keep the protective SL on stable M15 volatility while entries run on
+      # M5, avoiding a stop that is too tight for normal gold noise.
       - key: SL_ATR_TIMEFRAME
         value: "M15"
       - key: SL_ATR_PERIOD
@@ -147,11 +147,10 @@ services:
       # Weak RANGE entries require a stronger strategy consensus.
       - key: RANGE_WEAK_MIN_CONFIRMATIONS
         value: "2"
-      # Use M15 as the sole live entry timeframe. The previous 1m setting
-      # could trigger a lower-timeframe BUY while the operator was watching
-      # the M15 chart, creating apparently late or contradictory entries.
+      # Use M5 as the sole live entry timeframe for scalping. The protective
+      # SL remains based on M15 volatility above.
       - key: TRADE_TIMEFRAMES
-        value: "M15"
+        value: "5m"
       - key: QUALITY_ADX_MIN
         value: "12"
       - key: BAR_CHECK_INTERVAL
