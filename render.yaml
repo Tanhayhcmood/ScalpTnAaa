@@ -42,12 +42,13 @@ services:
         value: XAUUSD
       # FIX: TIMEFRAME and CANDLE_WINDOW are now env-configurable (fix #4).
       - key: TIMEFRAME
-        value: "5m"
+        value: "15m"
       - key: CANDLE_WINDOW
         value: "300"
-      # Protective SL uses independent M5 ATR, not the M1 signal ATR.
+      # Protective SL uses the same stable M15 context as the live signal,
+      # rather than a noisy one-minute/tick-scale ATR.
       - key: SL_ATR_TIMEFRAME
-        value: "M5"
+        value: "M15"
       - key: SL_ATR_PERIOD
         value: "14"
       # Do not chase a closed-candle signal after a fast move. The live
@@ -56,6 +57,10 @@ services:
         value: "14"
       - key: MAX_ENTRY_SIGNAL_ATR_DISTANCE
         value: "0.75"
+      # Extra room required beyond the next equal high/low before a fixed-R
+      # target is considered reachable.
+      - key: TARGET_ROOM_BUFFER_ATR
+        value: "0.15"
       # Option 2: keep the balanced 35% HTF confidence floor reproducible from the live Render environment.
       - key: OPTION_TWO_MIN_CONFIDENCE
         value: "25"
@@ -142,10 +147,11 @@ services:
       # Weak RANGE entries require a stronger strategy consensus.
       - key: RANGE_WEAK_MIN_CONFIRMATIONS
         value: "2"
-      # TRADE_TIMEFRAMES / QUALITY_ADX_MIN are read by the live engine and
-      # were set on the live service but missing from this manifest.
+      # Use M15 as the sole live entry timeframe. The previous 1m setting
+      # could trigger a lower-timeframe BUY while the operator was watching
+      # the M15 chart, creating apparently late or contradictory entries.
       - key: TRADE_TIMEFRAMES
-        value: "1m"
+        value: "M15"
       - key: QUALITY_ADX_MIN
         value: "12"
       - key: BAR_CHECK_INTERVAL
@@ -159,14 +165,16 @@ services:
         value: "2"
       - key: HISTORICAL_RETRY_BACKOFF
         value: "1.0"
-      # HTF opposition is a negative-only safety filter. It does not require
-      # another strategy to agree, but blocks clearly opposed H1 conditions.
+      # HTF is a hard directional safety gate: lower-timeframe entries must
+      # agree with a confirmed H1 bias, not merely avoid strong opposition.
       - key: MTF_ENABLED
         value: "true"
       - key: MTF_TIMEFRAME
         value: "H1"
       - key: MTF_CANDLE_WINDOW
         value: "300"
+      - key: MTF_REQUIRE_ALIGNMENT
+        value: "true"
       - key: MTF_DRY_RUN
         value: "false"
       - key: OPTION_TWO_MIN_TIMEFRAMES

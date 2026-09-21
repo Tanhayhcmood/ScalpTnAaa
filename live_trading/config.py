@@ -223,6 +223,11 @@ SL_ATR_BASE_MULTIPLIER = _float(
 LOW_VOLATILITY_SL_ATR_ADD = _float(
     "LOW_VOLATILITY_SL_ATR_ADD", 0.5, lo=0.0, hi=1.0
 )
+# Minimum room beyond the next equal high/low before a target can be trusted.
+# This is deliberately small; the dominant requirement remains the regime R:R.
+TARGET_ROOM_BUFFER_ATR = _float(
+    "TARGET_ROOM_BUFFER_ATR", 0.15, lo=0.0, hi=1.0
+)
 RISK_PERCENT      = _float("RISK_PERCENT",      1.0,  lo=0.01, hi=10.0)
 #
 # Confidence policy:
@@ -345,6 +350,14 @@ MTF_CANDLE_WINDOW = _int("MTF_CANDLE_WINDOW", 300, lo=50, hi=1000)
 MTF_OPPOSITION_THRESHOLD = _float(
     "MTF_OPPOSITION_THRESHOLD", 55.0, lo=0.0, hi=100.0
 )
+# Require the executable timeframe to agree with a confirmed HTF bias.  This
+# is stricter than the legacy opposition-only filter and prevents a lower-TF
+# bullish candle from buying directly into a bearish H1 structure.
+MTF_REQUIRE_ALIGNMENT = os.getenv(
+    "MTF_REQUIRE_ALIGNMENT", "true"
+).strip().lower() in {
+    "1", "true", "yes", "on",
+}
 # Start in observation mode. The filter computes and logs would_block but does
 # not reject orders until the operator explicitly sets this to false on Render.
 MTF_DRY_RUN = os.getenv("MTF_DRY_RUN", "true").strip().lower() in {

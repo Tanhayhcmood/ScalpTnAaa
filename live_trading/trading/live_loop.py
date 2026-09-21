@@ -57,7 +57,7 @@ from live_trading.config import (
     TRAIL_CHANDELIER_ATR_MULTIPLIER,
     RANGE_WEAK_MIN_CONFIRMATIONS,
     MTF_ENABLED, MTF_TIMEFRAME, MTF_CANDLE_WINDOW,
-    MTF_OPPOSITION_THRESHOLD, MTF_DRY_RUN,
+    MTF_OPPOSITION_THRESHOLD, MTF_REQUIRE_ALIGNMENT, MTF_DRY_RUN,
     TRADE_TIMEFRAMES,
     ALLOW_HEDGED_POSITIONS,
 )
@@ -1827,10 +1827,10 @@ class GoldScalperLive:
                 )
                 return
 
-        # 8b. Gate: negative-only HTF opposition check.
-        # MTF must not become a second positive-confirmation strategy.  The
-        # existing decision, confidence, quality, and risk gates remain the
-        # source of approval; MTF can only reject clear strong opposition.
+        # 8b. Gate: HTF alignment and opposition check.
+        # The existing decision, confidence, quality, and risk gates remain
+        # the source of approval.  HTF can reject a lower-timeframe setup
+        # when the confirmed H1 bias is absent or opposed.
         if MTF_ENABLED:
             _mtf_check = evaluate_mtf_opposition(
                 htf_bias,
@@ -1838,33 +1838,59 @@ class GoldScalperLive:
                 opposition_threshold=MTF_OPPOSITION_THRESHOLD,
             )
             _would_block = _mtf_check.would_block
-            _is_hard_block = _would_block and not MTF_DRY_RUN
+            _alignment_blocked = (
+                MTF_REQUIRE_ALIGNMENT
+                and (
+                    htf_bias is None
+                    or htf_bias.direction != decision.direction
+                )
+            )
+            _is_hard_block = (
+                (_would_block or _alignment_blocked) and not MTF_DRY_RUN
+            )
             self._last_candle_telemetry.setdefault("mtf", {}).update({
                 "htf_trend": _mtf_check.htf_trend,
                 "candidate": _mtf_check.candidate,
                 "opposition_strength": _mtf_check.opposition_strength,
                 "would_block": _would_block,
+                "alignment_required": MTF_REQUIRE_ALIGNMENT,
+                "alignment_blocked": _alignment_blocked,
                 "gate": (
                     "BLOCKED"
                     if _is_hard_block
                     else "DRY_RUN_WOULD_BLOCK"
-                    if _would_block
+                    if (_would_block or _alignment_blocked)
                     else "ALLOWED"
                 ),
-                "gate_reason": _mtf_check.reason,
+                "gate_reason": (
+                    "HTF alignment required: "
+                    f"candidate={decision.direction} "
+                    f"bias={htf_bias.direction if htf_bias else 'NEUTRAL'}"
+                    if _alignment_blocked
+                    else _mtf_check.reason
+                ),
             })
             log.info(
                 "MTF check: candidate=%s htf_trend=%s "
-                "opposition_strength=%.1f threshold=%.1f would_block=%s%s",
+                "bias=%s opposition_strength=%.1f threshold=%.1f "
+                "would_block=%s alignment_blocked=%s%s",
                 _mtf_check.candidate,
                 _mtf_check.htf_trend,
+                htf_bias.direction if htf_bias else "NEUTRAL",
                 _mtf_check.opposition_strength,
                 _mtf_check.threshold,
                 str(_would_block).lower(),
+                str(_alignment_blocked).lower(),
                 " (dry_run)" if MTF_DRY_RUN else "",
             )
             if _is_hard_block:
-                _mtf_reason = f"MTF BLOCK: {_mtf_check.reason}"
+                _mtf_reason = (
+                    "MTF BLOCK: HTF alignment required — "
+                    f"candidate={decision.direction}, "
+                    f"bias={htf_bias.direction if htf_bias else 'NEUTRAL'}"
+                    if _alignment_blocked
+                    else f"MTF BLOCK: {_mtf_check.reason}"
+                )
                 self._set_trade_permission(False, "MTF_HARD_BLOCKED", [_mtf_reason])
                 log.info(f"⛔  {_mtf_reason}")
                 _mtf_extra = {
@@ -1882,6 +1908,7 @@ class GoldScalperLive:
                         "blocked":   _mtf_reason,
                         "opposition_strength": _mtf_check.opposition_strength,
                         "threshold": _mtf_check.threshold,
+                        "alignment_required": MTF_REQUIRE_ALIGNMENT,
                     },
                 }
                 self._write_state("SCANNING", acc_info, decision, pos, extra=_mtf_extra)
@@ -3278,6 +3305,7 @@ class GoldScalperLive:
                 tp=tp_params.take_profit,
                 comment=order_comment,
                 deviation=SLIPPAGE_POINTS,
+                price_digits=stop_constraints["digits"],
             )
             return result, confirm_dicts, "", ""
 

@@ -39,6 +39,7 @@ from live_trading.config import (
     ENABLED_STRATEGIES,
     SL_ATR_BASE_MULTIPLIER,
     LOW_VOLATILITY_SL_ATR_ADD,
+    TARGET_ROOM_BUFFER_ATR,
 )
 
 # Marginal confidence R:R floor: trades with confidence between CONF_HARD_MIN
@@ -51,6 +52,75 @@ CONF_MARGINAL_RR = 1.3
 # in direction selection, confirmation counting, or mandatory entry gates.
 # RANGE keeps its separate structural safeguards.
 _CHOPPY_REGIMES = {"ACCUMULATION", "DISTRIBUTION", "HIGH_VOLATILITY"}
+
+
+def _entry_location_block_reason(candidate: str, pa) -> Optional[str]:
+    """Reject entries that arrive at the wrong side of a nearby level.
+
+    A bullish candle at resistance (or a bearish candle at support) is not
+    enough evidence for a market entry. Confirmed breakouts and pullback
+    reclaims remain eligible, subject to the existing extension and quality
+    gates.
+    """
+    candidate = str(candidate).upper()
+    if (
+        candidate == "BUY"
+        and pa.near_resistance
+        and not (pa.valid_bull_breakout or pa.bullish_pullback)
+    ):
+        return (
+            "BUY blocked: price is near resistance without a confirmed "
+            "breakout/retest"
+        )
+    if (
+        candidate == "SELL"
+        and pa.near_support
+        and not (pa.valid_bear_breakout or pa.bearish_pullback)
+    ):
+        return (
+            "SELL blocked: price is near support without a confirmed "
+            "breakdown/retest"
+        )
+    return None
+
+
+def _target_room_block_reason(
+    candidate: str,
+    entry: float,
+    stop_loss: float,
+    structural_level: Optional[float],
+    minimum_rr: float,
+    atr: float,
+) -> Optional[str]:
+    """Require usable room beyond the next structural barrier.
+
+    The fixed target is only meaningful when price can reach it before the
+    nearest equal high/low. A small ATR buffer accounts for spread and wick
+    touches that would otherwise make the advertised R:R misleading.
+    """
+    if structural_level is None or entry <= 0 or stop_loss <= 0:
+        return None
+    risk_distance = abs(entry - stop_loss)
+    if risk_distance <= 0 or minimum_rr <= 0:
+        return None
+    candidate = str(candidate).upper()
+    room = (
+        structural_level - entry
+        if candidate == "BUY"
+        else entry - structural_level
+        if candidate == "SELL"
+        else 0.0
+    )
+    if room <= 0:
+        return None
+    buffer = max(0.0, float(atr)) * TARGET_ROOM_BUFFER_ATR
+    required_room = risk_distance * minimum_rr + buffer
+    if room + 1e-9 < required_room:
+        return (
+            f"{candidate} blocked: structural room {room:.2f} is below "
+            f"required {required_room:.2f} for R:R {minimum_rr:.2f}"
+        )
+    return None
 
 
 def _effective_min_confirmations(
@@ -584,6 +654,21 @@ def run_decision_engine(
             dxy_signal=dxy_signal,
         )
 
+    location_reason = _entry_location_block_reason(candidate, pa)
+    if location_reason is not None:
+        return _make_neutral(
+            smc,
+            wyckoff,
+            pa,
+            trend,
+            [location_reason],
+            [location_reason],
+            regime_result=regime,
+            entry_filter=ef,
+            direction=candidate,
+            candles=candles,
+        )
+
     # Capital manager inputs
     aligned_obs = [ob for ob in smc.order_blocks
                    if ob.type == ("BULLISH" if candidate == "BUY" else "BEARISH")]
@@ -638,6 +723,46 @@ def run_decision_engine(
         sl_atr_multiplier=protective_multiplier,
     )
     trade_params = calc_trade_parameters(cap_input)
+
+    # For ordinary trend entries the nearest equal high/low is a hard
+    # structural barrier even though the target remains the fixed 2R target.
+    # RANGE already supplies its own explicit target and R:R check, so it does
+    # not pass through this additional room gate.
+    structural_target = (
+        eq_resistance if candidate == "BUY" else eq_support
+    ) if regime.regime != "RANGE" else None
+    required_rr_for_room = regime.rules.min_rr
+    room_reason = _target_room_block_reason(
+        candidate,
+        trade_params.entry_price,
+        trade_params.stop_loss,
+        structural_target,
+        required_rr_for_room,
+        protective_atr,
+    )
+    if room_reason is not None:
+        return DecisionResult(
+            allowed=False,
+            direction=candidate,  # type: ignore
+            confidence=conf_result.confidence,
+            components=conf_result.components,
+            grade=conf_result.grade,
+            regime=regime.regime,
+            regime_label=regime.rules.label,
+            regime_rules=regime.rules,
+            quality_filter=quality,
+            blocked_reasons=[room_reason],
+            reasoning=conf_result.reasoning + [room_reason],
+            trade_params=None,
+            smc=smc,
+            wyckoff=wyckoff,
+            pa=pa,
+            trend=trend,
+            entry_filter=ef,
+            divergence=divergence,
+            dxy_signal=dxy_signal,
+            range_context=range_context,
+        )
 
     # Fixed 0.01-lot policy: allow the configured volume up to the
     # explicit dollar-risk ceiling, independent of the percentage budget.

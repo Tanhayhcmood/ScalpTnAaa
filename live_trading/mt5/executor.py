@@ -59,6 +59,7 @@ async def place_market_order(
     tp:        float,
     comment:   str = "GSPv4",
     deviation: int = 30,
+    price_digits: int = 2,
 ) -> TradeResult:
     base    = get_connection()
     conn_id = get_conn_id()
@@ -79,14 +80,19 @@ async def place_market_order(
 
     log.debug(f"Placing {normalized_direction} {lot} lots {symbol}  SL={sl}  TP={tp}")
 
+    try:
+        normalized_digits = max(0, min(8, int(price_digits)))
+    except (TypeError, ValueError):
+        normalized_digits = 2
+
     params = {
         "id":         conn_id,
         "symbol":     symbol,
         "operation":  operation,
         "volume":     lot,
         "slippage":   deviation,
-        "stoploss":   round(sl, 2),
-        "takeprofit": round(tp, 2),
+        "stoploss":   round(sl, normalized_digits),
+        "takeprofit": round(tp, normalized_digits),
         "comment":    comment[:32],
     }
 
