@@ -105,6 +105,27 @@ from live_trading.utils.state_writer import (
 
 log = get_logger()
 
+def _candle_time_text(candle) -> str:
+    if candle is None:
+        return "-"
+    value = getattr(candle, "time", None)
+    return value.isoformat() if isinstance(value, datetime) else str(value or "-")
+
+
+def _log_candle_window(timeframe: str, candles, source: str) -> None:
+    """Log one compact latest-closed-candle window per history fetch."""
+    first = candles[0] if candles else None
+    last = candles[-1] if candles else None
+    log.info(
+        "CANDLE_HISTORY source=%s timeframe=%s returned=%d first=%s last=%s",
+        source,
+        timeframe,
+        len(candles),
+        _candle_time_text(first),
+        _candle_time_text(last),
+    )
+
+
 def _checkpoint(msg: str) -> None:
     """Write a bounded-size progress marker to an always-writable path so we
     can pinpoint exactly where the engine hangs, even when no exception is
@@ -1195,8 +1216,9 @@ class GoldScalperLive:
             sl_candles = await fetch_candles(
                 SYMBOL,
                 SL_ATR_TIMEFRAME,
-                max(100, SL_ATR_PERIOD + 1),
+                max(200, SL_ATR_PERIOD + 1),
             )
+            _log_candle_window(SL_ATR_TIMEFRAME, sl_candles, "sl_atr")
             if len(sl_candles) < SL_ATR_PERIOD + 1:
                 reason = (
                     f"SL ATR candles insufficient ({len(sl_candles)}; "
@@ -1272,7 +1294,8 @@ class GoldScalperLive:
                 self._sl_atr_cache_reason,
             )
 
-        # 1. Fetch candles for this timeframe (M5 / M10 / M15 / M20)
+        _log_candle_window(tf, candles, "entry")
+        # 1. Fetch the latest completed candles for this timeframe.
         if len(candles) < 50:
             log.warning(f"Only {len(candles)} candles returned — skipping bar")
             return

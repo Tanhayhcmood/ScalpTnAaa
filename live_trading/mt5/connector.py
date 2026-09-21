@@ -108,6 +108,8 @@ _TF_MAP = {
     "H1": 60, "H4": 240, "D1": 1440,
 }
 
+_MIN_CANDLE_HISTORY = 200
+
 
 def _parse_candle_time(value: object) -> Optional[datetime]:
     """Parse an MTAPI candle timestamp into an aware UTC datetime."""
@@ -535,7 +537,13 @@ async def check_symbol_available(symbol: str) -> bool:
 async def fetch_candles(
     symbol: str, timeframe: str, count: int = 300
 ) -> List[OHLCV]:
-    """Fetch OHLCV candles via MTAPI GET /PriceHistoryV2."""
+    """Fetch the latest completed OHLCV candles via MTAPI.
+
+    The returned window is always the most recent completed history, never a
+    day-start slice. Keep a 200-bar floor so 1m entries and higher-timeframe
+    ATR/MTF calculations have enough warm-up data after a restart.
+    """
+    requested_count = max(_MIN_CANDLE_HISTORY, int(count))
     # Compatibility path for the historical RPC-shaped adapter contract.
     # This is only exercised when a caller supplies _account explicitly.
     legacy_account = globals().get("_account")
@@ -547,11 +555,16 @@ async def fetch_candles(
                 (label for label, minutes in _TF_MAP.items() if minutes == tf and label.islower()),
                 timeframe,
             )
+            now = datetime.now(timezone.utc)
+            request_minutes = (
+                _h1_request_minutes(requested_count)
+                if tf == 60 else tf * (requested_count + 5)
+            )
             raw_candles = await get_history(
                 symbol=symbol,
                 timeframe=tf_label,
-                start_time=None,
-                limit=max(1, int(count)) + 5,
+                start_time=now - timedelta(minutes=request_minutes),
+                limit=requested_count + 5,
             )
             parsed: list[tuple[datetime, OHLCV]] = []
             for row in raw_candles or []:
@@ -572,7 +585,7 @@ async def fetch_candles(
                     ),
                 ))
             parsed.sort(key=lambda item: item[0])
-            return [candle for _, candle in parsed[:-1]][-max(1, int(count)):]
+            return [candle for _, candle in parsed[:-1]][-requested_count:]
         except Exception:
             return []
     for attempt in range(2):
@@ -581,8 +594,8 @@ async def fetch_candles(
         tf_min = _TF_MAP.get(timeframe, 5)
         now = datetime.now(timezone.utc)
         request_minutes = (
-            _h1_request_minutes(count)
-            if tf_min == 60 else tf_min * (count + 5)
+            _h1_request_minutes(requested_count)
+            if tf_min == 60 else tf_min * (requested_count + 5)
         )
         from_str = (now - timedelta(minutes=request_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
         to_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -626,7 +639,11 @@ async def fetch_candles(
                     timeframe_minutes=tf_min,
                     now=now,
                 )
-                return candles[-count:] if len(candles) > count else candles
+                return (
+                    candles[-requested_count:]
+                    if len(candles) > requested_count
+                    else candles
+                )
         except Exception as exc:
             if attempt == 0:
                 log.warning(f"fetch_candles error (attempt 1) — reconnecting: {exc}")

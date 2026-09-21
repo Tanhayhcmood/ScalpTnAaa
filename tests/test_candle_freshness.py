@@ -1,7 +1,7 @@
 """Regression tests for live closed-candle synchronization."""
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 from live_trading.mt5 import connector
@@ -42,7 +42,7 @@ def test_last_completed_bar_is_latest_closed_candle():
 
 
 def test_fetch_candles_requests_latest_window_without_worker_clock_anchor():
-    """A broker clock offset must not make the history query return an old window."""
+    """History is requested relative to now, not from the start of the day."""
     latest_open = datetime(2026, 9, 14, 3, 10, tzinfo=timezone.utc)
     latest_closed = datetime(2026, 9, 14, 3, 5, tzinfo=timezone.utc)
     history = [
@@ -81,9 +81,11 @@ def test_fetch_candles_requests_latest_window_without_worker_clock_anchor():
 
     result = asyncio.run(run_fetch())
     assert [c.time for c in result] == [latest_closed]
-    fake_account.get_historical_candles.assert_awaited_once_with(
-        symbol="XAUUSD",
-        timeframe="5m",
-        start_time=None,
-        limit=6,
-    )
+    call = fake_account.get_historical_candles.await_args.kwargs
+    assert call["symbol"] == "XAUUSD"
+    assert call["timeframe"] == "5m"
+    assert call["limit"] == 205
+    assert isinstance(call["start_time"], datetime)
+    now = datetime.now(timezone.utc)
+    assert now - timedelta(minutes=1030) < call["start_time"]
+    assert call["start_time"] < now - timedelta(minutes=1020)

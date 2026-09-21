@@ -190,7 +190,7 @@ METAAPI_ACCOUNT_ID = ""
 
 # ── Symbol & Timeframe ───────────────────────────────────────────────────────
 SYMBOL        = os.getenv("SYMBOL", "XAUUSD")
-TIMEFRAME     = _timeframe("TIMEFRAME", "5m")
+TIMEFRAME     = _timeframe("TIMEFRAME", "1m")
 CANDLE_WINDOW = _int("CANDLE_WINDOW", 300, lo=50, hi=5000)
 # Stop-loss volatility is intentionally independent from the signal timeframe.
 # The live default uses M5 ATR while the robot scans M1 entries.
@@ -378,10 +378,8 @@ OPTION_TWO_MIN_TIMEFRAMES = _int("OPTION_TWO_MIN_TIMEFRAMES", 2, lo=2, hi=10)
 # computed on H1 regardless of which trade TFs are active, because H1
 # represents the directional context for the whole session.
 #
-# Recommended:  "M20,M15,M10,1m"  (4 TFs = ~2-4 entries/day per TF)
-# Conservative: "M15,1m"           (2 TFs = cleaner, fewer signals)
-# Aggressive:   "M20,M15,M10,1m"   (same as recommended)
-TRADE_TIMEFRAMES  = _trade_timeframes("TRADE_TIMEFRAMES", "5m")
+# The live entry service currently watches only the 1m bar stream.
+TRADE_TIMEFRAMES  = _trade_timeframes("TRADE_TIMEFRAMES", "1m")
 
 
 
@@ -389,7 +387,7 @@ TRADE_TIMEFRAMES  = _trade_timeframes("TRADE_TIMEFRAMES", "5m")
 COMMENT = "GSPv4"
 
 # ── Loop Timing ──────────────────────────────────────────────────────────────
-# Poll frequently enough to notice a newly closed M5 candle promptly.  This
+# Poll frequently enough to notice a newly closed 1m candle promptly.  This
 # only checks bar timestamps; signal evaluation still uses closed candles.
 BAR_CHECK_INTERVAL = _int("BAR_CHECK_INTERVAL", 5, lo=1, hi=60)
 RECONNECT_DELAY    = 30       # seconds before reconnect attempt
