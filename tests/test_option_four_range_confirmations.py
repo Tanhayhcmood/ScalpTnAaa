@@ -81,7 +81,7 @@ def test_range_rejects_one_confirmation_when_two_are_required():
     assert "1/2 confirmations" in reason
 
 
-def test_standalone_price_action_cannot_satisfy_two_vote_range_floor():
+def test_standalone_price_action_satisfies_range_confirmation_floor():
     result = EntryFilterResult(
         allowed=True, direction="BUY", confirmation_count=1,
         smc=False, trend=False, price_action=True, wyckoff=False,
@@ -91,8 +91,8 @@ def test_standalone_price_action_cannot_satisfy_two_vote_range_floor():
         2,
         price_action_standalone=True,
     )
-    assert allowed is False
-    assert "1/2 confirmations" in reason
+    assert allowed is True
+    assert reason == ""
 
 
 def test_weak_range_does_not_allow_single_vote_standalone_override():

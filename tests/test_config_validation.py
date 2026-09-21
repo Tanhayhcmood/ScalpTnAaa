@@ -105,9 +105,9 @@ class TestConfigDefaults:
         assert cfg.QUALITY_ADX_MIN == 12.0
         assert isinstance(cfg.QUALITY_ADX_MIN, float)
 
-    def test_price_action_standalone_is_disabled_by_default(self):
+    def test_price_action_standalone_is_enabled_by_default(self):
         cfg = _reload_config({})
-        assert cfg.PRICE_ACTION_STANDALONE is False
+        assert cfg.PRICE_ACTION_STANDALONE is True
 
     def test_max_open_trades_default_is_one_per_strategy_slot(self):
         cfg = _reload_config({})

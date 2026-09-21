@@ -103,9 +103,9 @@ services:
       # reversal, and at least two aligned strategy confirmations.
       - key: RANGE_ENTRY_FILTERS_ENABLED
         value: "true"
-      # Live orders require both Trend and Price Action.
+      # A directional Price Action signal may authorize an entry by itself.
       - key: PRICE_ACTION_STANDALONE
-        value: "false"
+        value: "true"
       - key: PA_STANDALONE_MIN_SCORE
         value: "0.24"
       - key: PA_MAX_BREAKOUT_EXTENSION_ATR

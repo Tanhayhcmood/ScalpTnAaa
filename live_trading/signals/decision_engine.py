@@ -197,9 +197,11 @@ def _range_confirmation_gate(
     may reduce this floor to one aligned PA vote; all other RANGE safeguards
     remain mandatory.
     """
-    # Strict live policy: exactly two authorized engines are required. Clamp
-    # both legacy one-vote and stale three/four-vote callers to the same
-    # Trend + Price Action contract.
+    # Standalone PA may reduce this floor to one aligned PA vote. Otherwise
+    # preserve the two-engine Trend + Price Action contract, even if a stale
+    # caller supplies a lower floor.
+    if price_action_standalone and entry_filter.price_action:
+        return True, ""
     effective_min_confirmations = 2
     if entry_filter.confirmation_count < effective_min_confirmations:
         return (
@@ -348,10 +350,6 @@ def run_decision_engine(
     sl_atr_multiplier: float = SL_ATR_BASE_MULTIPLIER,
     low_volatility_sl_atr_add: float = LOW_VOLATILITY_SL_ATR_ADD,
 ) -> DecisionResult:
-    # Strict live policy: PA standalone is retained only as a compatibility
-    # argument for old callers. It must never authorize a production order.
-    price_action_standalone = False
-
     smc     = analyze_smc_structure(candles, timeframe=timeframe)
     wyckoff = analyze_wyckoff(candles)
     pa      = analyze_price_action(candles, timeframe=timeframe)
@@ -410,8 +408,26 @@ def run_decision_engine(
     # the direction on its own.  The later confidence, quality, regime, R:R,
     # position, and risk gates remain unchanged.
     if (
-        pa.breakout_overextended
+        price_action_standalone
+        and pa.pa_signal in {"BUY", "SELL"}
+        and pa.pa_score < pa_standalone_min_score
     ):
+        standalone_reason = (
+            f"Standalone Price Action score {pa.pa_score:.2f} < "
+            f"{pa_standalone_min_score:.2f} minimum"
+        )
+        return _make_neutral(
+            smc,
+            wyckoff,
+            pa,
+            trend,
+            [standalone_reason],
+            [standalone_reason],
+            regime_result=regime,
+            direction=pa.pa_signal,
+            candles=candles,
+        )
+    if pa.breakout_overextended:
         extension_reason = (
             f"Price Action breakout extended "
             f"{pa.breakout_extension_atr:.2f} ATR beyond "
@@ -438,9 +454,9 @@ def run_decision_engine(
         effective_regime_strength == "WEAK"
         and (is_range_regime or policy_regime == "RANGE")
     )
-    # The explicit PA standalone override remains available for ordinary
-    # RANGE conditions, but weak RANGE must honor its stricter 3-vote floor.
-    range_price_action_standalone = False
+    # The explicit PA standalone override is available for ordinary RANGE
+    # conditions, but weak RANGE keeps its stricter configured floor.
+    range_price_action_standalone = price_action_standalone and not is_weak_range
     # A Trend-aligned entry is more exposed to a single transient EMA signal
     # than a structure/price-action setup. Keep the ordinary operator floor,
     # but require a second independent confirmation whenever Trend votes for
@@ -466,9 +482,9 @@ def run_decision_engine(
         enabled_strategies=ENABLED_STRATEGIES,
     )
     # The RANGE confirmation floor is mandatory even when the optional
-    # structural filters (edge, sweep, reversal) are disabled.  Those filters
-    # may be informational, but a single strategy vote must never authorize an
-    # entry.
+    # structural filters (edge, sweep, reversal) are disabled, except for the
+    # explicit standalone PA policy. Those filters may be informational, but
+    # standalone PA still has to pass every other RANGE safeguard.
     if is_range_regime:
         range_votes_ok, range_votes_reason = _range_confirmation_gate(
             ef,
@@ -532,7 +548,11 @@ def run_decision_engine(
             smc=smc,
             pa=pa,
             confirmation_count=ef.confirmation_count,
-            min_confirmations=effective_min_confirmations,
+            min_confirmations=(
+                1
+                if range_price_action_standalone and ef.price_action
+                else effective_min_confirmations
+            ),
             edge_atr_distance=range_edge_atr_distance,
             strict_filters=range_entry_filters_enabled,
             require_edge_position=range_require_edge_position,
