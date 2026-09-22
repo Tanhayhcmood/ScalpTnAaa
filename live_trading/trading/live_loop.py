@@ -98,6 +98,9 @@ from live_trading.trading.strategy_slots import (
     one_way_entry_allowed,
 )
 from live_trading.trading.entry_guard import validate_entry_price_distance
+from live_trading.trading.active_entry_policy import (
+    evaluate_active_entry,
+)
 from live_trading.utils.state_writer import (
     write_robot_state, write_mt5_snapshot,
     read_commands, clear_command, log_trade,
@@ -1572,6 +1575,7 @@ class GoldScalperLive:
             sl_atr=sl_atr,
             sl_atr_multiplier=SL_ATR_BASE_MULTIPLIER,
             low_volatility_sl_atr_add=LOW_VOLATILITY_SL_ATR_ADD,
+            symbol=SYMBOL,
         )
         self.last_decision = decision
 
@@ -1769,6 +1773,27 @@ class GoldScalperLive:
                 decision.blocked_reasons or ["No signal"],
             )
             log.info(f"No trade → {reasons}")
+            self._write_state(
+                "SCANNING", acc_info, decision, pos,
+                extra=self._guardian_extra(gs),
+            )
+            return
+
+        # Phase 1 is the sole runtime strategy authority. Keep this check in
+        # the live loop as well as the decision engine so a future caller or
+        # legacy signal path cannot submit an order independently.
+        active_entry = evaluate_active_entry(
+            decision,
+            symbol=SYMBOL,
+            timeframe=tf,
+        )
+        if not active_entry.allowed:
+            self._set_trade_permission(
+                False,
+                "ACTIVE_STRATEGY_BLOCKED",
+                [active_entry.reason],
+            )
+            log.info("%s", active_entry.reason)
             self._write_state(
                 "SCANNING", acc_info, decision, pos,
                 extra=self._guardian_extra(gs),
@@ -3127,6 +3152,18 @@ class GoldScalperLive:
         safety boundary immediately before the broker request.
         """
         async with self._entry_lock:
+            active_entry = evaluate_active_entry(
+                decision,
+                symbol=SYMBOL,
+                timeframe=timeframe,
+            )
+            if not active_entry.allowed:
+                return (
+                    None,
+                    [],
+                    "ACTIVE_STRATEGY_BLOCKED",
+                    active_entry.reason,
+                )
             try:
                 confirm_result = await get_open_positions(
                     SYMBOL,

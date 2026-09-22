@@ -24,6 +24,10 @@ from live_trading.risk.capital_manager import (
     FIXED_TP_RR, MAX_FIXED_LOT_RISK_USD, CapitalInput, CapitalOutput,
     calc_trade_parameters,
 )
+from live_trading.trading.active_entry_policy import (
+    ACTIVE_ENTRY_STRATEGY,
+    evaluate_active_entry,
+)
 from live_trading.config import (
     CONF_HARD_MIN,
     MIN_CONFIRMATIONS,
@@ -364,6 +368,7 @@ def run_decision_engine(
     sl_atr: Optional[float] = None,
     sl_atr_multiplier: float = SL_ATR_BASE_MULTIPLIER,
     low_volatility_sl_atr_add: float = LOW_VOLATILITY_SL_ATR_ADD,
+    symbol: str = "XAUUSD",
 ) -> DecisionResult:
     smc     = analyze_smc_structure(candles, timeframe=timeframe)
     wyckoff = analyze_wyckoff(candles)
@@ -868,8 +873,10 @@ def run_decision_engine(
             entry_filter=ef,
         )
 
-    # ── TRADE ALLOWED ─────────────────────────────────────────────────────────
-    return DecisionResult(
+    # ── PHASE 1 ACTIVE STRATEGY GATE ──────────────────────────────────────────
+    # Legacy engines may still contribute diagnostics above, but only the
+    # named XAUUSD 1m volatility/trend breakout can reach the order path.
+    permitted_decision = DecisionResult(
         allowed=True, direction=candidate,  # type: ignore
         confidence=conf_result.confidence, components=conf_result.components,
         grade=conf_result.grade, regime=regime.regime, regime_label=regime.rules.label,
@@ -885,6 +892,19 @@ def run_decision_engine(
         regime_strength=effective_regime_strength,
         policy_regime=policy_regime,
     )
+    active_entry = evaluate_active_entry(
+        permitted_decision,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
+    if not active_entry.allowed:
+        permitted_decision.allowed = False
+        permitted_decision.blocked_reasons = [active_entry.reason]
+        permitted_decision.reasoning = (
+            permitted_decision.reasoning + [active_entry.reason]
+        )
+        permitted_decision.trade_params = None
+    return permitted_decision
 
 
 def describe_strategy(decision: "DecisionResult") -> dict:
@@ -961,6 +981,7 @@ def describe_strategy(decision: "DecisionResult") -> dict:
         })
 
     return {
+        "active_strategy":    ACTIVE_ENTRY_STRATEGY,
         "direction":           decision.direction,
         "grade":               decision.grade,
         "confidence":          round(decision.confidence, 1),
