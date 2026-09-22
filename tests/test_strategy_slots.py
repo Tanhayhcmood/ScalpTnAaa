@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 from live_trading.trading.strategy_slots import (
+    ACTIVE_STRATEGY_SLOT,
     STRATEGY_SLOTS,
     available_for_strategy_slots,
     occupied_strategy_slots,
@@ -22,41 +23,53 @@ def _decision(**votes):
     return SimpleNamespace(entry_filter=entry_filter)
 
 
-def test_permitted_decision_claims_each_aligned_strategy_slot():
+def test_permitted_decision_claims_only_the_active_strategy_slot():
     assert strategy_slots_for_decision(_decision(
-        smc=True, price_action=True
-    )) == ("smc", "price_action")
+        smc=True, trend=True, price_action=True, wyckoff=True
+    )) == (ACTIVE_STRATEGY_SLOT,)
 
 
 def test_order_comment_round_trip_preserves_strategy_slots():
-    comment = strategy_order_comment("GSPv4", ("smc", "price_action"))
+    comment = strategy_order_comment("GSPv4", (ACTIVE_STRATEGY_SLOT,))
 
-    assert comment == "GSPv4|S=SMC,PA"
+    assert comment == "GSPv4|S=XVTB"
     assert strategy_slots_from_position({"comment": comment}) == {
-        "smc", "price_action"
+        ACTIVE_STRATEGY_SLOT
     }
 
 
-def test_same_strategy_cannot_open_a_second_position():
-    positions = [{"comment": "GSPv4|S=SMC"}]
-
+def test_non_active_strategy_votes_cannot_claim_a_live_slot():
+    assert strategy_slots_for_decision(_decision(smc=True)) == ()
     allowed, reason = available_for_strategy_slots(
-        positions, ("smc",), max_open_positions=4
+        [{"comment": "GSPv4"}],
+        ("smc",),
+        max_open_positions=4,
     )
 
     assert allowed is False
-    assert "SMC" in reason
+    assert "No active strategy slot" in reason
 
 
-def test_unused_strategy_slot_can_open_while_another_is_occupied():
+def test_same_strategy_cannot_open_a_second_position():
+    positions = [{"comment": "GSPv4|S=XVTB"}]
+
+    allowed, reason = available_for_strategy_slots(
+        positions, (ACTIVE_STRATEGY_SLOT,), max_open_positions=4
+    )
+
+    assert allowed is False
+    assert "XVTB" in reason
+
+
+def test_legacy_strategy_position_occupies_the_active_slot():
     positions = [{"comment": "GSPv4|S=SMC"}]
 
     allowed, reason = available_for_strategy_slots(
-        positions, ("price_action",), max_open_positions=4
+        positions, (ACTIVE_STRATEGY_SLOT,), max_open_positions=4
     )
 
-    assert allowed is True
-    assert reason == ""
+    assert allowed is False
+    assert "XVTB" in reason
 
 
 def test_legacy_untagged_position_occupies_all_slots_fail_closed():
@@ -64,8 +77,8 @@ def test_legacy_untagged_position_occupies_all_slots_fail_closed():
 
     assert occupied_strategy_slots(positions) == set(STRATEGY_SLOTS)
     allowed, reason = available_for_strategy_slots(
-        positions, ("wyckoff",), max_open_positions=4
+        positions, (ACTIVE_STRATEGY_SLOT,), max_open_positions=4
     )
 
     assert allowed is False
-    assert "WYC" in reason
+    assert "XVTB" in reason

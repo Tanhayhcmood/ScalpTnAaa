@@ -1,4 +1,4 @@
-"""One-open-position capacity per signal strategy.
+"""One-open-position capacity for the single live strategy.
 
 Positions opened before strategy-slot tagging was introduced are treated as
 occupying every slot.  That fail-closed behavior prevents a legacy position
@@ -11,8 +11,20 @@ import re
 from typing import Iterable, Mapping
 
 
-STRATEGY_SLOTS = ("smc", "trend", "price_action", "wyckoff")
+ACTIVE_STRATEGY_SLOT = "xauusd_volatility_trend_breakout"
+
+# The first slot is the only slot that can be claimed by a new live decision.
+# Legacy slots remain understood so positions opened in earlier phases still
+# fail closed instead of allowing the active strategy to duplicate them.
+STRATEGY_SLOTS = (
+    ACTIVE_STRATEGY_SLOT,
+    "smc",
+    "trend",
+    "price_action",
+    "wyckoff",
+)
 _SLOT_CODES = {
+    ACTIVE_STRATEGY_SLOT: "XVTB",
     "smc": "SMC",
     "trend": "TRD",
     "price_action": "PA",
@@ -83,22 +95,22 @@ def one_way_entry_allowed(
 
 
 def strategy_slots_for_decision(decision) -> tuple[str, ...]:
-    """Return the aligned strategy slots claimed by a permitted decision."""
+    """Return the single live strategy slot claimed by a permitted decision."""
     entry_filter = getattr(decision, "entry_filter", None)
-    if entry_filter is None:
+    if entry_filter is None or not (
+        bool(getattr(entry_filter, "trend", False))
+        and bool(getattr(entry_filter, "price_action", False))
+    ):
         return ()
-    return tuple(
-        slot for slot in STRATEGY_SLOTS
-        if bool(getattr(entry_filter, slot, False))
-    )
+    return (ACTIVE_STRATEGY_SLOT,)
 
 
 def strategy_order_comment(base_comment: str, slots: Iterable[str]) -> str:
-    """Encode strategy ownership in the broker-visible order comment."""
+    """Encode the active strategy ownership in the broker-visible comment."""
     codes = [
         _SLOT_CODES[slot]
         for slot in slots
-        if slot in _SLOT_CODES
+        if slot == ACTIVE_STRATEGY_SLOT
     ]
     if not codes:
         return base_comment[:32]
@@ -118,7 +130,13 @@ def strategy_slots_from_position(position: Mapping) -> frozenset[str]:
         for code in match.group(1).split(",")
         if code in _CODE_TO_SLOT
     )
-    return slots or frozenset(STRATEGY_SLOTS)
+    if not slots:
+        return frozenset(STRATEGY_SLOTS)
+    # Any position created by a previous multi-strategy phase occupies the
+    # single active slot during the transition.  This preserves fail-closed
+    # behavior without allowing an older SMC/Trend/PA/Wyckoff position to
+    # coexist with the Phase 3 strategy.
+    return frozenset({ACTIVE_STRATEGY_SLOT})
 
 
 def occupied_strategy_slots(positions: Iterable[Mapping]) -> frozenset[str]:
@@ -141,10 +159,10 @@ def available_for_strategy_slots(
         return False, f"Maximum open positions reached ({max_open_positions})"
 
     candidates = tuple(dict.fromkeys(
-        slot for slot in candidate_slots if slot in STRATEGY_SLOTS
+        slot for slot in candidate_slots if slot == ACTIVE_STRATEGY_SLOT
     ))
     if not candidates:
-        return False, "No strategy slot is attached to the permitted decision"
+        return False, "No active strategy slot is attached to the permitted decision"
 
     occupied = occupied_strategy_slots(position_list)
     duplicate_slots = tuple(slot for slot in candidates if slot in occupied)
