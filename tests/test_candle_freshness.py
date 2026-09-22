@@ -42,7 +42,7 @@ def test_last_completed_bar_is_latest_closed_candle():
 
 
 def test_fetch_candles_requests_latest_window_without_worker_clock_anchor():
-    """History is requested relative to now, not from the start of the day."""
+    """History uses a rolling warm-up request and returns the latest closed bar."""
     latest_open = datetime(2026, 9, 14, 3, 10, tzinfo=timezone.utc)
     latest_closed = datetime(2026, 9, 14, 3, 5, tzinfo=timezone.utc)
     history = [
@@ -84,8 +84,8 @@ def test_fetch_candles_requests_latest_window_without_worker_clock_anchor():
     call = fake_account.get_historical_candles.await_args.kwargs
     assert call["symbol"] == "XAUUSD"
     assert call["timeframe"] == "5m"
-    assert call["limit"] == 105
+    assert call["limit"] == 205
     assert isinstance(call["start_time"], datetime)
     now = datetime.now(timezone.utc)
-    assert now - timedelta(minutes=530) < call["start_time"]
-    assert call["start_time"] < now - timedelta(minutes=520)
+    assert now - timedelta(minutes=1030) < call["start_time"]
+    assert call["start_time"] < now - timedelta(minutes=1020)

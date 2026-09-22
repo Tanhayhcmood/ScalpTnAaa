@@ -135,6 +135,7 @@ def _checkpoint(msg: str) -> None:
             _f.write(f"{datetime.utcnow().isoformat()}  {msg}\n")
     except Exception:
         pass
+    log.info("LOOP_CHECKPOINT %s", msg)
 
 
 # ── Exponential backoff constants ─────────────────────────────────────────────
@@ -892,7 +893,10 @@ class GoldScalperLive:
                     "NOT_EVALUATED",
                     ["No active entry evaluation"],
                 )
-                await self._process_commands()
+                await self._run_stage(
+                    "command processing",
+                    self._process_commands(),
+                )
                 _checkpoint(f"loop#{self.loop_count} commands processed")
 
                 if self.paused:
@@ -904,7 +908,10 @@ class GoldScalperLive:
                     continue
 
                 # ── Reconnect with exponential backoff ────────────────────────
-                ok = await ensure_connected(attempt=self._reconnect_attempts + 1)
+                ok = await self._run_stage(
+                    "connection check",
+                    ensure_connected(attempt=self._reconnect_attempts + 1),
+                )
                 _checkpoint(f"loop#{self.loop_count} ensure_connected -> {ok}")
                 if not ok:
                     self._reconnect_attempts += 1
@@ -1022,9 +1029,11 @@ class GoldScalperLive:
         try:
             return await asyncio.wait_for(operation, timeout=timeout)
         except asyncio.TimeoutError as exc:
-            log.error(
-                f"Trading stage '{name}' exceeded {timeout}s; "
-                "forcing a clean MetaAPI reconnect."
+            log.exception(
+                "Trading stage '%s' exceeded %ss; forcing a clean "
+                "MetaAPI reconnect.",
+                name,
+                timeout,
             )
             self._write_state(
                 "DISCONNECTED",
@@ -1032,6 +1041,11 @@ class GoldScalperLive:
                 extra={"error": f"{name} timeout"},
             )
             raise RuntimeError(f"Trading stage timed out: {name}") from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Trading stage '%s' failed", name)
+            raise
 
     # ── Bar detection ─────────────────────────────────────────────────────────
 
@@ -1189,6 +1203,7 @@ class GoldScalperLive:
             return htf_bias, ""
         except Exception as exc:
             reason = f"MTF fetch/analysis error (fail-safe): {exc}"
+            log.exception("MTF candle refresh failed")
             self._mtf_cache_bias = None
             self._mtf_cache_reason = reason
             self._mtf_cache_bar_time = cache_bar
@@ -1244,6 +1259,7 @@ class GoldScalperLive:
             return value, ""
         except Exception as exc:
             reason = f"SL ATR fetch/calculation error: {exc}"
+            log.exception("SL ATR candle refresh failed")
             self._sl_atr_cache_value = 0.0
             self._sl_atr_cache_reason = reason
             self._sl_atr_cache_bar_time = cache_bar

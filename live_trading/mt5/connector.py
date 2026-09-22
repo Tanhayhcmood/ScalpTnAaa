@@ -68,6 +68,9 @@ _watchdog_task: asyncio.Task | None = None
 _MT5_KEEPALIVE_TASK: asyncio.Task | None = None
 _MT5_KEEPALIVE_INTERVAL_S: float = 180.0
 _MT5_SESSION_REFRESH_AGE_S: float = 14400.0
+_CANDLE_FETCH_CONNECT_TIMEOUT_S: float = 30.0
+_CANDLE_FETCH_HTTP_TIMEOUT_S: float = 60.0
+_MIN_CANDLE_REQUEST = 200
 
 
 def _connect_params(
@@ -541,6 +544,10 @@ async def fetch_candles(
     indicator warm-up requirements.
     """
     requested_count = max(1, int(count))
+    # Keep the broker request warm enough for MTAPI/MT5 to return a reliable
+    # closed-bar window after startup. The caller still receives exactly the
+    # requested latest closed candles below; this is not a fixed-day anchor.
+    request_count = max(_MIN_CANDLE_REQUEST, requested_count)
     # Compatibility path for the historical RPC-shaped adapter contract.
     # This is only exercised when a caller supplies _account explicitly.
     legacy_account = globals().get("_account")
@@ -554,14 +561,17 @@ async def fetch_candles(
             )
             now = datetime.now(timezone.utc)
             request_minutes = (
-                _h1_request_minutes(requested_count)
-                if tf == 60 else tf * (requested_count + 5)
+                _h1_request_minutes(request_count)
+                if tf == 60 else tf * (request_count + 5)
             )
-            raw_candles = await get_history(
-                symbol=symbol,
-                timeframe=tf_label,
-                start_time=now - timedelta(minutes=request_minutes),
-                limit=requested_count + 5,
+            raw_candles = await asyncio.wait_for(
+                get_history(
+                    symbol=symbol,
+                    timeframe=tf_label,
+                    start_time=now - timedelta(minutes=request_minutes),
+                    limit=request_count + 5,
+                ),
+                timeout=_CANDLE_FETCH_HTTP_TIMEOUT_S,
             )
             parsed: list[tuple[datetime, OHLCV]] = []
             for row in raw_candles or []:
@@ -584,15 +594,44 @@ async def fetch_candles(
             parsed.sort(key=lambda item: item[0])
             return [candle for _, candle in parsed[:-1]][-requested_count:]
         except Exception:
+            log.exception(
+                "fetch_candles legacy adapter failed "
+                "(symbol=%s timeframe=%s count=%d)",
+                symbol,
+                timeframe,
+                requested_count,
+            )
             return []
     for attempt in range(2):
-        if not _conn_id and not await ensure_connected():
-            return []
+        if not _conn_id:
+            try:
+                connected = await asyncio.wait_for(
+                    ensure_connected(),
+                    timeout=_CANDLE_FETCH_CONNECT_TIMEOUT_S,
+                )
+            except Exception:
+                log.exception(
+                    "fetch_candles connection check failed "
+                    "(symbol=%s timeframe=%s attempt=%d)",
+                    symbol,
+                    timeframe,
+                    attempt + 1,
+                )
+                return []
+            if not connected:
+                log.error(
+                    "fetch_candles connection unavailable "
+                    "(symbol=%s timeframe=%s attempt=%d)",
+                    symbol,
+                    timeframe,
+                    attempt + 1,
+                )
+                return []
         tf_min = _TF_MAP.get(timeframe, 5)
         now = datetime.now(timezone.utc)
         request_minutes = (
-            _h1_request_minutes(requested_count)
-            if tf_min == 60 else tf_min * (requested_count + 5)
+            _h1_request_minutes(request_count)
+            if tf_min == 60 else tf_min * (request_count + 5)
         )
         from_str = (now - timedelta(minutes=request_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
         to_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -606,16 +645,36 @@ async def fetch_candles(
                     "to": to_str,
                     "timeFrame": tf_min,
                 },
-                timeout=aiohttp.ClientTimeout(total=60),
+                timeout=aiohttp.ClientTimeout(total=_CANDLE_FETCH_HTTP_TIMEOUT_S),
             ) as resp:
                 data = await resp.json(content_type=None)
                 if not isinstance(data, list):
-                    if attempt == 0:
-                        _invalidate_connection()
-                        continue
+                    log.error(
+                        "fetch_candles returned non-list payload "
+                        "(symbol=%s timeframe=%s attempt=%d status=%d type=%s payload=%s)",
+                        symbol,
+                        timeframe,
+                        attempt + 1,
+                        resp.status,
+                        type(data).__name__,
+                        repr(data)[:240],
+                    )
+                    # A valid HTTP response containing an MTAPI error object
+                    # is a data failure, not proof that the session is stale.
+                    # Reconnecting here can block the main loop for the full
+                    # broker handshake while the original problem persists.
                     return []
                 candles_with_times: List[Tuple[datetime, OHLCV]] = []
                 for bar in data:
+                    if not isinstance(bar, dict):
+                        log.warning(
+                            "fetch_candles skipped non-object candle "
+                            "(symbol=%s timeframe=%s type=%s)",
+                            symbol,
+                            timeframe,
+                            type(bar).__name__,
+                        )
+                        continue
                     candle_time = _parse_candle_time(bar.get("time", ""))
                     if candle_time is None:
                         continue
@@ -643,10 +702,20 @@ async def fetch_candles(
                 )
         except Exception as exc:
             if attempt == 0:
-                log.warning(f"fetch_candles error (attempt 1) — reconnecting: {exc}")
+                log.exception(
+                    "fetch_candles error (attempt 1) — reconnecting "
+                    "(symbol=%s timeframe=%s)",
+                    symbol,
+                    timeframe,
+                )
                 _invalidate_connection()
                 continue
-            log.error(f"fetch_candles error after reconnect: {exc}")
+            log.exception(
+                "fetch_candles error after reconnect "
+                "(symbol=%s timeframe=%s)",
+                symbol,
+                timeframe,
+            )
             return []
     return []
 
