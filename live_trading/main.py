@@ -15,7 +15,7 @@ Required environment variables:
 Optional:
     SYMBOL               – default: XAUUSDb  (AMarkets uses the 'b' suffix; adjust for your broker)
     RISK_PERCENT         – default: 1.0
-    MIN_CONFIRMATIONS    – default: 2 (RANGE uses 2)
+    MIN_CONFIRMATIONS    – default: 1 (RANGE uses 1)
     DAILY_LOSS_LIMIT_PCT – default: 3.0
     MAX_DRAWDOWN_PCT     – default: 8.0
     SLIPPAGE_POINTS      – default: 30

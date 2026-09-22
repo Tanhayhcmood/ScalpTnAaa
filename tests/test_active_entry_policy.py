@@ -40,7 +40,7 @@ def test_only_active_strategy_can_pass_the_runtime_gate():
     assert result.strategy == ACTIVE_ENTRY_STRATEGY
 
 
-def test_range_entries_are_authorized_when_trend_and_price_action_agree():
+def test_range_entries_are_authorized_when_trend_confirms():
     result = evaluate_active_entry(
         _decision(regime="RANGE"),
         symbol="XAUUSD",
@@ -66,7 +66,7 @@ def test_standalone_price_action_without_trend_is_blocked():
     )
 
     assert result.allowed is False
-    assert "Trend + Price Action" in result.reason
+    assert "Trend confirmation" in result.reason
 
 
 def test_smc_and_wyckoff_cannot_authorize_entries_independently():
@@ -86,7 +86,7 @@ def test_smc_and_wyckoff_cannot_authorize_entries_independently():
         )
 
         assert result.allowed is False
-        assert "Trend + Price Action" in result.reason
+        assert "Trend confirmation" in result.reason
 
 
 def test_counter_trend_entries_are_blocked():
@@ -103,7 +103,7 @@ def test_counter_trend_entries_are_blocked():
     assert "counter-trend" in result.reason
 
 
-def test_old_generic_breakout_without_active_trend_breakout_pair_is_blocked():
+def test_trend_confirmation_does_not_require_a_price_action_breakout():
     result = evaluate_active_entry(
         _decision(
             pa=SimpleNamespace(
@@ -111,14 +111,19 @@ def test_old_generic_breakout_without_active_trend_breakout_pair_is_blocked():
                 valid_bear_breakout=False,
                 bullish_inside_breakout=False,
                 bearish_inside_breakout=False,
-            )
+            ),
+            entry_filter=SimpleNamespace(
+                trend=True,
+                price_action=False,
+                smc=False,
+                wyckoff=False,
+            ),
         ),
         symbol="XAUUSD",
         timeframe="1m",
     )
 
-    assert result.allowed is False
-    assert "no directional Price Action breakout" in result.reason
+    assert result.allowed is True
 
 
 def test_non_one_minute_execution_is_blocked_without_changing_config():

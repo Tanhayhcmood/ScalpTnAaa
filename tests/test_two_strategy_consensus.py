@@ -1,4 +1,4 @@
-"""Two-strategy consensus entry policy tests."""
+"""Trend-only live-entry authorization tests."""
 
 from types import SimpleNamespace
 
@@ -8,24 +8,24 @@ from live_trading.signals.gold_engine import OHLCV
 from live_trading.signals.quality_filter import apply_quality_filter
 
 
-def test_any_two_non_smc_strategies_can_open_an_entry():
+def test_trend_alone_can_open_an_entry():
     result = apply_entry_filter(
         smc_signal="NEUTRAL",
         ema_trend="BULLISH",
-        pa_signal="BUY",
+        pa_signal="NEUTRAL",
         wyckoff_signal="NEUTRAL",
         min_confirmations=2,
     )
 
     assert result.allowed is True
     assert result.direction == "BUY"
-    assert result.confirmation_count == 2
+    assert result.confirmation_count == 1
     assert result.smc is False
     assert result.trend is True
-    assert result.price_action is True
+    assert result.price_action is False
 
 
-def test_disabled_smc_and_wyckoff_do_not_authorize_entries():
+def test_diagnostic_engines_do_not_authorize_entries_without_trend():
     result = apply_entry_filter(
         smc_signal="BUY",
         ema_trend="NEUTRAL",
@@ -42,32 +42,32 @@ def test_disabled_smc_and_wyckoff_do_not_authorize_entries():
     assert result.wyckoff is False
 
 
-def test_opposing_two_to_two_vote_is_blocked():
+def test_diagnostic_disagreement_does_not_veto_trend():
     result = apply_entry_filter(
         smc_signal="BUY",
-        ema_trend="BEARISH",
-        pa_signal="BUY",
+        ema_trend="BULLISH",
+        pa_signal="SELL",
         wyckoff_signal="SELL",
         min_confirmations=2,
     )
 
-    assert result.allowed is False
-    assert result.direction == "NEUTRAL"
+    assert result.allowed is True
+    assert result.direction == "BUY"
 
 
-def test_single_strategy_vote_cannot_pass_two_confirmation_policy():
+def test_price_action_only_vote_cannot_pass_trend_only_policy():
     result = apply_entry_filter(
         smc_signal="NEUTRAL",
         ema_trend="NEUTRAL",
         pa_signal="BUY",
         wyckoff_signal="NEUTRAL",
-        min_confirmations=2,
-        price_action_standalone=False,
+        min_confirmations=1,
+        price_action_standalone=True,
     )
 
     assert result.allowed is False
     assert result.direction == "NEUTRAL"
-    assert result.confirmation_count == 1
+    assert result.confirmation_count == 0
 
 
 def test_candidate_direction_uses_the_consensus_not_smc_alone():
@@ -81,7 +81,7 @@ def test_candidate_direction_uses_the_consensus_not_smc_alone():
     assert result == "BUY"
 
 
-def test_candidate_direction_is_neutral_on_a_tie():
+def test_candidate_direction_ignores_diagnostic_votes():
     result = _candidate_direction(
         SimpleNamespace(smc_signal="BUY"),
         SimpleNamespace(wyckoff_signal="SELL"),
@@ -89,7 +89,7 @@ def test_candidate_direction_is_neutral_on_a_tie():
         SimpleNamespace(trend="BEARISH"),
     )
 
-    assert result == "NEUTRAL"
+    assert result == "SELL"
 
 
 def test_quality_filter_does_not_reintroduce_an_smc_mandate():

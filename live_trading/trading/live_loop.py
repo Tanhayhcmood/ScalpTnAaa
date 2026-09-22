@@ -1801,18 +1801,9 @@ class GoldScalperLive:
             return
 
         # Final defense-in-depth check for RANGE. The structural RANGE
-        # filters may be disabled for telemetry-only operation. An explicit
-        # standalone PA policy may lower only the confirmation floor to one
-        # aligned PA vote; all other entry gates remain mandatory.
-        _range_confirmation_floor = (
-            1
-            if (
-                PRICE_ACTION_STANDALONE
-                and decision.entry_filter is not None
-                and decision.entry_filter.price_action
-            )
-            else max(2, RANGE_MIN_CONFIRMATIONS)
-        )
+        # filters may be disabled for telemetry-only operation, but Trend
+        # remains the sole live-entry confirmation.
+        _range_confirmation_floor = max(1, RANGE_MIN_CONFIRMATIONS)
         if (
             decision.regime == "RANGE"
             and decision.entry_filter is not None

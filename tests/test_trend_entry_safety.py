@@ -4,7 +4,7 @@ from live_trading.risk.capital_manager import CapitalInput, calc_trade_parameter
 from live_trading.signals.entry_filter import apply_entry_filter
 
 
-def test_trend_only_entry_is_blocked_by_the_trend_confirmation_floor():
+def test_trend_only_entry_passes_the_single_engine_confirmation_floor():
     result = apply_entry_filter(
         smc_signal="NEUTRAL",
         ema_trend="BEARISH",
@@ -13,7 +13,7 @@ def test_trend_only_entry_is_blocked_by_the_trend_confirmation_floor():
         min_confirmations=2,
     )
 
-    assert result.allowed is False
+    assert result.allowed is True
     assert result.confirmation_count == 1
 
 

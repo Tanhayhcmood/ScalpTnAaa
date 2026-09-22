@@ -42,20 +42,6 @@ def _trend_direction(trend) -> str:
     return "NEUTRAL"
 
 
-def _is_directional_breakout(pa, direction: str) -> bool:
-    if direction == "BUY":
-        return bool(
-            getattr(pa, "valid_bull_breakout", False)
-            or getattr(pa, "bullish_inside_breakout", False)
-        )
-    if direction == "SELL":
-        return bool(
-            getattr(pa, "valid_bear_breakout", False)
-            or getattr(pa, "bearish_inside_breakout", False)
-        )
-    return False
-
-
 def evaluate_active_entry(
     decision,
     *,
@@ -65,9 +51,8 @@ def evaluate_active_entry(
     """Return whether ``decision`` belongs to the one live strategy.
 
     This is deliberately stricter than the legacy multi-engine decision
-    result. Trend must agree with the direction and Price Action must provide
-    the directional breakout; SMC and Wyckoff are never independent
-    authorities here.
+    result. Trend must agree with the direction; Price Action, SMC, and
+    Wyckoff are diagnostic-only and cannot authorize or veto this policy.
     """
     normalized_symbol = str(symbol or "").upper().strip()
     if normalized_symbol != ACTIVE_ENTRY_SYMBOL:
@@ -121,22 +106,11 @@ def evaluate_active_entry(
         )
 
     entry_filter = getattr(decision, "entry_filter", None)
-    if entry_filter is None or not (
-        bool(getattr(entry_filter, "trend", False))
-        and bool(getattr(entry_filter, "price_action", False))
-    ):
+    if entry_filter is None or not bool(getattr(entry_filter, "trend", False)):
         return ActiveEntryPolicyResult(
             False,
             ACTIVE_ENTRY_STRATEGY,
-            f"{ACTIVE_ENTRY_STRATEGY} blocked: Trend + Price Action "
-            "confirmation is required",
-        )
-
-    if not _is_directional_breakout(getattr(decision, "pa", None), direction):
-        return ActiveEntryPolicyResult(
-            False,
-            ACTIVE_ENTRY_STRATEGY,
-            f"{ACTIVE_ENTRY_STRATEGY} blocked: no directional Price Action breakout",
+            f"{ACTIVE_ENTRY_STRATEGY} blocked: Trend confirmation is required",
         )
 
     return ActiveEntryPolicyResult(True, ACTIVE_ENTRY_STRATEGY)

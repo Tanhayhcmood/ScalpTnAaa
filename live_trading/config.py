@@ -91,22 +91,22 @@ def _strategy_list(name: str, default: str) -> tuple[str, ...]:
     return strategies
 
 
-# Live entries are intentionally authorized by exactly these two engines.
-# SMC and Wyckoff continue to run for diagnostics and telemetry, but their
-# signals must never expand the entry consensus or become a required gate.
-LIVE_ENTRY_STRATEGIES = ("trend", "price_action")
+# Live entries are intentionally authorized by Trend only. Price Action, SMC,
+# and Wyckoff continue to run for diagnostics, telemetry, and confidence
+# scoring, but their signals must never authorize or veto a live entry.
+LIVE_ENTRY_STRATEGIES = ("trend",)
 
 
-def _entry_confirmation_floor(name: str, default: int = 2) -> int:
-    """Read a legacy confirmation setting without allowing a 3-of-4 floor.
+def _entry_confirmation_floor(name: str, default: int = 1) -> int:
+    """Read a confirmation setting without allowing a multi-engine floor.
 
     Render may retain an older environment value after a deployment. Capping
-    here keeps the two-engine policy authoritative even when that happens.
+    here keeps the Trend-only policy authoritative even when that happens.
     """
     value = _int(name, default, lo=1, hi=4)
     if value > len(LIVE_ENTRY_STRATEGIES):
         print(
-            f"WARNING: {name}={value} exceeds the two-engine live-entry "
+            f"WARNING: {name}={value} exceeds the Trend-only live-entry "
             f"policy; using {len(LIVE_ENTRY_STRATEGIES)} instead.",
             file=sys.stderr,
         )
@@ -239,17 +239,12 @@ RISK_PERCENT      = _float("RISK_PERCENT",      1.0,  lo=0.01, hi=10.0)
 # both live entry modes.
 NORMAL_MIN_CONFIDENCE = _float("NORMAL_MIN_CONFIDENCE", 40.0, lo=0.0, hi=100.0)
 RANGE_MIN_CONFIDENCE  = _float("RANGE_MIN_CONFIDENCE",  40.0, lo=0.0, hi=100.0)
-# Ordinary entries require two aligned engines. Price Action has a dedicated
-# standalone path below; this keeps SMC, Trend, and Wyckoff from opening a
-# trade alone.
-# Trend-aligned entries have their own safer floor below, so a Trend vote
-# cannot open a trade by itself after a transient candle signal.
+# Ordinary entries require the single authorized Trend engine.
 # RANGE has its own confirmation floor below, independent of
 # TREND_MIN_CONFIRMATIONS and the ordinary entry policy.
 MIN_CONFIRMATIONS = _entry_confirmation_floor("MIN_CONFIRMATIONS")
-# A Trend-aligned ordinary entry must have at least two independent votes by
-# default. This is deliberately separate from MIN_CONFIRMATIONS so the
-# operator can keep Trend entries stricter than Price Action entries.
+# A Trend-aligned ordinary entry has its own compatibility setting, capped to
+# the single authorized engine.
 TREND_MIN_CONFIRMATIONS = _entry_confirmation_floor("TREND_MIN_CONFIRMATIONS")
 # Dedicated RANGE playbook. Its confirmation floor is intentionally separate
 # from both MIN_CONFIRMATIONS and TREND_MIN_CONFIRMATIONS so RANGE can use a
@@ -278,15 +273,12 @@ RANGE_ENTRY_FILTERS_ENABLED = os.getenv(
     "RANGE_ENTRY_FILTERS_ENABLED", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
 MAX_RANGE_TRADES_PER_SESSION = _int("MAX_RANGE_TRADES_PER_SESSION", 2, lo=1, hi=20)
-# When enabled, a directional Price Action signal may authorize the strategy
-# vote by itself. Confidence, quality, regime, R:R, position, and risk gates
-# still decide whether that PA setup can become a live order.
+# Deprecated compatibility setting. Price Action is diagnostic-only and this
+# flag no longer authorizes a live entry.
 PRICE_ACTION_STANDALONE = os.getenv(
-    "PRICE_ACTION_STANDALONE", "true"
+    "PRICE_ACTION_STANDALONE", "false"
 ).strip().lower() in {"1", "true", "yes", "on"}
-# Minimum diagnostic PA score for the independent entry path.  The regular
-# PA detector can expose early/weak setups for telemetry; standalone trading
-# requires a stronger local setup before it can bypass other strategy votes.
+# Retained for compatibility/telemetry; it no longer controls authorization.
 PA_STANDALONE_MIN_SCORE = _float(
     "PA_STANDALONE_MIN_SCORE", 0.24, lo=0.15, hi=1.0
 )
@@ -319,9 +311,8 @@ QUALITY_ADX_MIN   = _float("QUALITY_ADX_MIN",    12.0, lo=5.0,  hi=40.0)
 # 300 bars on M5 is roughly 25 hours and is too permissive for scalping;
 # the default 24 closed bars keeps BOS/CHoCH actionable for about two hours.
 STRUCTURE_MAX_AGE_BARS = _int("STRUCTURE_MAX_AGE_BARS", 24, lo=3, hi=100)
-# One concurrent position is allowed per strategy slot. The default active
-# strategy set is Trend + Price Action, but legacy SMC/Wyckoff slots remain
-# understood so existing positions fail closed during the transition.
+# One concurrent position is allowed per strategy slot. Legacy SMC/Wyckoff
+# slots remain understood so existing positions fail closed during transition.
 MAX_OPEN_TRADES   = _int("MAX_OPEN_TRADES", 4, lo=1, hi=10)
 # The account is directional by default. Strategy slots may still be used for
 # scale-in decisions, but an opposite-side position is never opened while a

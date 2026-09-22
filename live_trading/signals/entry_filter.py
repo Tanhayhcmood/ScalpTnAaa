@@ -1,14 +1,14 @@
-"""Entry Filter — two-engine live entry confirmation policy.
+"""Entry Filter — Trend-only live entry confirmation policy.
 
-Trend and Price Action are the only engines that can authorize a live entry.
-SMC and Wyckoff remain available to callers for diagnostics, but are excluded
-from direction selection and confirmation counting.
+Trend is the only engine that can authorize a live entry. Price Action, SMC,
+and Wyckoff remain available to callers for diagnostics and confidence scoring,
+but are excluded from direction selection and confirmation counting.
 """
 from dataclasses import dataclass
 from typing import Iterable, Literal
 
-MIN_CONFIRMATIONS = 2
-ENTRY_STRATEGIES = ("trend", "price_action")
+MIN_CONFIRMATIONS = 1
+ENTRY_STRATEGIES = ("trend",)
 ALL_STRATEGIES = ENTRY_STRATEGIES
 
 
@@ -40,13 +40,16 @@ def apply_entry_filter(
     price_action_standalone: bool = False,
     enabled_strategies: Iterable[str] | None = None,
 ) -> EntryFilterResult:
-    """Allow an entry when the configured strategy policy is satisfied.
+    """Allow an entry when Trend confirms the candidate direction.
 
-    With ``price_action_standalone`` enabled, a directional Price Action vote
-    selects the candidate and may pass without SMC, Trend, or Wyckoff. The
-    production configuration keeps that override disabled.
+    The legacy policy arguments remain in the signature for callers that have
+    not migrated yet, but they cannot re-enable diagnostic engines as live
+    entry authorities.
     """
-    enabled = set(enabled_strategies or ENTRY_STRATEGIES)
+    # ``enabled_strategies`` is retained for API compatibility only. The live
+    # authority is intentionally fixed here so stale caller/config values
+    # cannot restore Price Action, SMC, or Wyckoff voting.
+    enabled = set(ENTRY_STRATEGIES)
     required_confirmations = min(
         max(1, int(min_confirmations)),
         len(ENTRY_STRATEGIES),
@@ -69,14 +72,7 @@ def apply_entry_filter(
     buy_count = sum(value == "BUY" for value in votes.values())
     sell_count = sum(value == "SELL" for value in votes.values())
 
-    standalone_pa = (
-        price_action_standalone
-        and votes["price_action"] in {"BUY", "SELL"}
-    )
-    if standalone_pa:
-        direction = votes["price_action"]
-        count = sum(value == direction for value in votes.values())
-    elif buy_count > sell_count:
+    if buy_count > sell_count:
         direction = "BUY"
         count = buy_count
     elif sell_count > buy_count:
@@ -98,15 +94,9 @@ def apply_entry_filter(
     pa_ok = votes["price_action"] == direction
     wyc_ok = votes["wyckoff"] == direction
 
-    if require_smc_price_action_wyckoff:
-        # Explicit legacy/operator override. Production defaults to false.
-        allowed = smc_ok and pa_ok and wyc_ok
-    elif standalone_pa:
-        allowed = pa_ok
-    else:
-        allowed = count >= required_confirmations and (
-            not require_price_action or pa_ok
-        )
+    # Only the Trend vote participates in this live-entry decision. The
+    # legacy Price Action/SMC/Wyckoff requirements are intentionally ignored.
+    allowed = count >= required_confirmations
 
     return EntryFilterResult(
         allowed=allowed,
