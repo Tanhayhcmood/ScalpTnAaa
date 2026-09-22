@@ -11,11 +11,13 @@ ACTIVE_ENTRY_STRATEGY = "XAUUSD_VOLATILITY_TREND_BREAKOUT"
 ACTIVE_ENTRY_SYMBOL = "XAUUSD"
 ACTIVE_ENTRY_TIMEFRAME = "1m"
 
-# RANGE, pullback, Wyckoff, accumulation/distribution, and low-volatility
-# paths are intentionally excluded from the Phase 1 strategy identity.
+# RANGE is allowed by the active strategy alongside the directional volatility
+# and trend regimes; pullback, Wyckoff, accumulation/distribution, and
+# low-volatility paths are not separate strategy identities.
 _ACTIVE_REGIMES = frozenset(
     {
         "HIGH_VOLATILITY",
+        "RANGE",
         "STRONG_TREND_BULL",
         "STRONG_TREND_BEAR",
         "WEAK_TREND_BULL",

@@ -40,15 +40,15 @@ def test_only_active_strategy_can_pass_the_runtime_gate():
     assert result.strategy == ACTIVE_ENTRY_STRATEGY
 
 
-def test_range_entries_are_blocked_even_when_legacy_decision_passes():
+def test_range_entries_are_authorized_when_trend_and_price_action_agree():
     result = evaluate_active_entry(
         _decision(regime="RANGE"),
         symbol="XAUUSD",
         timeframe="1m",
     )
 
-    assert result.allowed is False
-    assert "not an active volatility/trend regime" in result.reason
+    assert result.allowed is True
+    assert result.strategy == ACTIVE_ENTRY_STRATEGY
 
 
 def test_standalone_price_action_without_trend_is_blocked():
@@ -73,6 +73,7 @@ def test_smc_and_wyckoff_cannot_authorize_entries_independently():
     for engine in ("smc", "wyckoff"):
         result = evaluate_active_entry(
             _decision(
+                regime="RANGE",
                 entry_filter=SimpleNamespace(
                     trend=False,
                     price_action=False,
