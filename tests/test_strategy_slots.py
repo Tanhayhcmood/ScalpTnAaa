@@ -23,9 +23,9 @@ def _decision(**votes):
     return SimpleNamespace(entry_filter=entry_filter)
 
 
-def test_permitted_decision_claims_only_the_active_strategy_slot():
+def test_trend_only_decision_claims_only_the_active_strategy_slot():
     assert strategy_slots_for_decision(_decision(
-        smc=True, trend=True, price_action=True, wyckoff=True
+        trend=True,
     )) == (ACTIVE_STRATEGY_SLOT,)
 
 
@@ -48,6 +48,37 @@ def test_non_active_strategy_votes_cannot_claim_a_live_slot():
 
     assert allowed is False
     assert "No active strategy slot" in reason
+
+
+def test_trend_only_decision_passes_with_capacity_available():
+    candidate_slots = strategy_slots_for_decision(_decision(trend=True))
+
+    allowed, reason = available_for_strategy_slots(
+        [],
+        candidate_slots,
+        max_open_positions=4,
+    )
+
+    assert candidate_slots == (ACTIVE_STRATEGY_SLOT,)
+    assert allowed is True
+    assert reason == ""
+
+
+def test_max_open_positions_still_blocks_a_trend_only_decision_at_four():
+    candidate_slots = strategy_slots_for_decision(_decision(trend=True))
+    positions = [
+        {"comment": f"GSPv4|S=XVTB|position={index}"}
+        for index in range(4)
+    ]
+
+    allowed, reason = available_for_strategy_slots(
+        positions,
+        candidate_slots,
+        max_open_positions=4,
+    )
+
+    assert allowed is False
+    assert reason == "Maximum open positions reached (4)"
 
 
 def test_same_strategy_cannot_open_a_second_position():

@@ -97,10 +97,10 @@ def one_way_entry_allowed(
 def strategy_slots_for_decision(decision) -> tuple[str, ...]:
     """Return the single live strategy slot claimed by a permitted decision."""
     entry_filter = getattr(decision, "entry_filter", None)
-    if entry_filter is None or not (
-        bool(getattr(entry_filter, "trend", False))
-        and bool(getattr(entry_filter, "price_action", False))
-    ):
+    # Trend is the only live entry authority. Price Action, SMC, and Wyckoff
+    # remain diagnostic-only and must not be required to attach the active
+    # strategy slot.
+    if entry_filter is None or not bool(getattr(entry_filter, "trend", False)):
         return ()
     return (ACTIVE_STRATEGY_SLOT,)
 
