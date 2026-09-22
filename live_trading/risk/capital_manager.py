@@ -3,6 +3,7 @@ Capital Manager — Smart SL/TP/LotSize for XAUUSD.
 Ported from capitalManager.ts
 """
 from dataclasses import dataclass
+import math
 from typing import Optional
 
 DEFAULT_RISK_PCT    = 1.0
@@ -13,10 +14,7 @@ MAX_SL_ATR_MULT     = 3.50
 FIXED_TP_RR         = 2.00
 LOT_DOLLAR_PER_UNIT = 100
 MIN_LOT             = 0.01
-# Every order uses the broker-compatible fixed volume requested by the operator.
-FIXED_LOT           = 0.01
-# Hard dollar-risk ceiling for the fixed 0.01-lot policy.
-MAX_FIXED_LOT_RISK_USD = 20.0
+LOT_STEP            = 0.01
 MAX_LOT             = 50.0
 
 
@@ -55,6 +53,7 @@ class CapitalOutput:
     sl_distance_usd:        float
     sl_distance_pips:       float
     risk_budget:            float
+    risk_percent:            float
     min_lot_risk_exceeded:  bool
 
 
@@ -115,16 +114,23 @@ def _calc_smart_sl(direction: str, entry: float, atr: float, inp: CapitalInput) 
 
 
 def _calc_lot_size(sl_dist_usd: float, balance: float, risk_pct: float):
-    # Keep the order volume fixed at 0.01 lot. The dollar risk still depends
-    # on the computed stop-loss distance and is checked against the explicit
-    # fixed-lot ceiling below.
+    """Calculate a broker-stepped lot size from the percentage risk budget.
+
+    The lot is rounded down to the broker step so a valid stepped lot cannot
+    exceed the requested percentage budget.  If the broker minimum itself
+    exceeds that budget, the caller must reject the trade rather than silently
+    over-risk it.
+    """
     risk_budget = max(0.0, balance * risk_pct / 100)
-    lot_size    = FIXED_LOT
+    if sl_dist_usd <= 0:
+        return MIN_LOT, 0.0, _r2(risk_budget), True
+
+    raw_lot = risk_budget / (sl_dist_usd * LOT_DOLLAR_PER_UNIT)
+    stepped_lot = math.floor(raw_lot / LOT_STEP + 1e-9) * LOT_STEP
+    lot_size = _r4(_clamp(stepped_lot, MIN_LOT, MAX_LOT))
     actual_risk = _r2(lot_size * sl_dist_usd * LOT_DOLLAR_PER_UNIT)
-    fixed_lot_risk_exceeded = (
-        sl_dist_usd <= 0 or actual_risk > MAX_FIXED_LOT_RISK_USD + 0.01
-    )
-    return lot_size, actual_risk, _r2(risk_budget), fixed_lot_risk_exceeded
+    risk_budget_exceeded = actual_risk > risk_budget + 0.01
+    return lot_size, actual_risk, _r2(risk_budget), risk_budget_exceeded
 
 
 def calc_trade_parameters(inp: CapitalInput) -> CapitalOutput:
@@ -179,5 +185,6 @@ def calc_trade_parameters(inp: CapitalInput) -> CapitalOutput:
         sl_distance_usd=sl_dist,
         sl_distance_pips=sl_pips,
         risk_budget=risk_budget,
+        risk_percent=_r2(risk_pct),
         min_lot_risk_exceeded=min_lot_risk_exceeded,
     )

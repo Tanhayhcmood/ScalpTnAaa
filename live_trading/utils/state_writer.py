@@ -181,6 +181,7 @@ def write_robot_state(
                 "rr":     decision.trade_params.risk_reward_ratio,
                 "risk_usd": decision.trade_params.risk_amount,
                 "risk_budget_usd": decision.trade_params.risk_budget,
+                "risk_percent": decision.trade_params.risk_percent,
                 "risk_budget_exceeded": (
                     decision.trade_params.min_lot_risk_exceeded
                 ),

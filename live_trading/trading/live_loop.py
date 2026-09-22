@@ -67,7 +67,7 @@ from live_trading.risk.adaptive_trailing_stop import (
     AdaptiveTrailingConfig, atr, compute_adaptive_trail, should_apply,
 )
 from live_trading.risk.capital_manager import (
-    LOT_DOLLAR_PER_UNIT, MAX_FIXED_LOT_RISK_USD, CapitalOutput,
+    LOT_DOLLAR_PER_UNIT, CapitalOutput,
 )
 from live_trading.signals.decision_engine import run_decision_engine, DecisionResult, describe_strategy
 from live_trading.signals.gold_engine import calc_atr
@@ -3318,16 +3318,30 @@ class GoldScalperLive:
                 2,
             )
             tp_params.min_lot_risk_exceeded = (
-                tp_params.risk_amount > MAX_FIXED_LOT_RISK_USD + 0.01
+                tp_params.risk_amount > tp_params.risk_budget + 0.01
+            )
+            risk_cap_applied = (
+                "minimum_lot_exceeds_percentage_budget"
+                if tp_params.min_lot_risk_exceeded
+                else "risk_percent_budget"
+            )
+            log.info(
+                f"RISK_SIZING [{timeframe}] {decision.direction} {SYMBOL} "
+                f"lot={tp_params.lot_size:.4f} "
+                f"risk=${tp_params.risk_amount:.2f} "
+                f"cap=RISK_PERCENT {tp_params.risk_percent:.2f}% "
+                f"of balance (${tp_params.risk_budget:.2f}) "
+                f"cap_applied={risk_cap_applied}"
             )
             if tp_params.min_lot_risk_exceeded:
                 return (
                     None,
                     confirm_dicts,
                     "BROKER_STOP_DISTANCE_RISK",
-                    f"Broker minimum stop distance would risk "
+                    f"Rebased stop with lot {tp_params.lot_size:.4f} would risk "
                     f"${tp_params.risk_amount:.2f}, above the "
-                    f"${MAX_FIXED_LOT_RISK_USD:.2f} cap",
+                    f"{tp_params.risk_percent:.2f}% balance risk cap "
+                    f"(${tp_params.risk_budget:.2f})",
                 )
             direction_sign = 1 if decision.direction == "BUY" else -1
             tp_params.break_even_at = round(
