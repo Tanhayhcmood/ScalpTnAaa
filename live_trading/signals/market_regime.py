@@ -3,12 +3,17 @@ Market Regime Detector — 11 regimes with adaptive entry rules.
 Ported from marketRegimeDetector.ts
 """
 from dataclasses import dataclass
+import logging
 from typing import Literal
 from live_trading.signals.gold_engine import OHLCV
 from live_trading.signals.trend_engine import TrendResult
 from live_trading.signals.wyckoff_engine import WyckoffResult
 from live_trading.config import NORMAL_MIN_CONFIDENCE, RANGE_MIN_CONFIDENCE
 from typing import List
+
+
+log = logging.getLogger(__name__)
+STRONG_ADX_TREND_THRESHOLD = 45.0
 
 MarketRegime = Literal[
     "STRONG_TREND_BULL", "STRONG_TREND_BEAR",
@@ -80,9 +85,12 @@ def _calc_atr_values(candles: List[OHLCV], period: int = 20):
     return atr, atr_mean, atr_ratio
 
 
-def calc_adx(candles: List[OHLCV], period: int = 14) -> float:
+def _calc_adx_details(
+    candles: List[OHLCV], period: int = 14
+) -> tuple[float, str, float, float]:
+    """Return ADX plus the latest directional- movement index values."""
     if len(candles) < period * 2:
-        return 20.0  # conservative non-trending default when data is insufficient
+        return 20.0, "NEUTRAL", 0.0, 0.0
     n = len(candles)
     trs, dm_p, dm_m = [], [], []
     for i in range(1, n):
@@ -96,6 +104,7 @@ def calc_adx(candles: List[OHLCV], period: int = 14) -> float:
     s_dp = sum(dm_p[:period])
     s_dm = sum(dm_m[:period])
     dx_arr = []
+    di_p = di_m = 0.0
     for i in range(period, len(trs)):
         s_tr = s_tr - s_tr / period + trs[i]
         s_dp = s_dp - s_dp / period + dm_p[i]
@@ -105,8 +114,17 @@ def calc_adx(candles: List[OHLCV], period: int = 14) -> float:
         total = di_p + di_m
         dx_arr.append(100 * abs(di_p - di_m) / total if total > 0 else 0)
     if len(dx_arr) < period:
-        return 20.0  # conservative non-trending default
-    return round(sum(dx_arr[-period:]) / period, 2)
+        return 20.0, "NEUTRAL", di_p, di_m
+    direction = (
+        "BULLISH" if di_p > di_m
+        else "BEARISH" if di_m > di_p
+        else "NEUTRAL"
+    )
+    return round(sum(dx_arr[-period:]) / period, 2), direction, di_p, di_m
+
+
+def calc_adx(candles: List[OHLCV], period: int = 14) -> float:
+    return _calc_adx_details(candles, period)[0]
 
 
 def _detect_pullback(candles: List[OHLCV], trend: TrendResult):
@@ -128,9 +146,27 @@ def detect_market_regime(
     use_atr_high_vol: bool = False,
 ) -> RegimeResult:
     atr, atr_mean, atr_ratio = _calc_atr_values(candles, 20)
-    adx = calc_adx(candles, 14)
+    adx, adx_direction, di_plus, di_minus = _calc_adx_details(candles, 14)
 
     def make(regime: str, desc: str) -> RegimeResult:
+        log.info(
+            "REGIME_DECISION adx=%.2f adx_direction=%s di_plus=%.2f "
+            "di_minus=%.2f trend=%s strength=%s trend_score=%.1f "
+            "ema_slope50=%.3f ema_slope100=%.3f atr_ratio=%.3f "
+            "result=%s label=%s",
+            adx,
+            adx_direction,
+            di_plus,
+            di_minus,
+            trend.trend,
+            trend.strength,
+            trend.score,
+            trend.slope50,
+            trend.slope100,
+            atr_ratio,
+            regime,
+            REGIME_RULES[regime].label,
+        )
         return RegimeResult(
             regime=regime, rules=REGIME_RULES[regime],
             atr=atr, atr_mean=atr_mean, atr_ratio=atr_ratio,
@@ -142,6 +178,28 @@ def detect_market_regime(
 
     if atr_ratio < 0.60 and adx < 20:
         return make("LOW_VOLATILITY", f"ATR at {atr_ratio*100:.0f}% of mean + ADX {adx}")
+
+    # ADX measures trend strength, while the trend engine also requires
+    # long-EMA alignment and a score threshold. During a fast sustained move
+    # those slower structure checks can remain NEUTRAL even though directional
+    # movement is unambiguously one-sided. Use the latest +DI/-DI direction
+    # when ADX is decisively strong so that such moves are not mislabeled RANGE.
+    if adx >= STRONG_ADX_TREND_THRESHOLD:
+        strong_direction = (
+            adx_direction if adx_direction != "NEUTRAL" else trend.trend
+        )
+        if strong_direction == "BULLISH":
+            return make(
+                "STRONG_TREND_BULL",
+                f"ADX {adx} >= {STRONG_ADX_TREND_THRESHOLD:.0f} — "
+                f"directional movement bull",
+            )
+        if strong_direction == "BEARISH":
+            return make(
+                "STRONG_TREND_BEAR",
+                f"ADX {adx} >= {STRONG_ADX_TREND_THRESHOLD:.0f} — "
+                f"directional movement bear",
+            )
 
     if adx >= 30 and trend.strength == "STRONG":
         if trend.trend == "BULLISH":
