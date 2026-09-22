@@ -3,16 +3,16 @@ Market Regime Detector — 11 regimes with adaptive entry rules.
 Ported from marketRegimeDetector.ts
 """
 from dataclasses import dataclass
-import logging
 from typing import Literal
 from live_trading.signals.gold_engine import OHLCV
 from live_trading.signals.trend_engine import TrendResult
 from live_trading.signals.wyckoff_engine import WyckoffResult
 from live_trading.config import NORMAL_MIN_CONFIDENCE, RANGE_MIN_CONFIDENCE
+from live_trading.logger import get_logger
 from typing import List
 
 
-log = logging.getLogger(__name__)
+log = get_logger()
 STRONG_ADX_TREND_THRESHOLD = 45.0
 
 MarketRegime = Literal[

@@ -282,6 +282,21 @@ def _candidate_direction(
     return "NEUTRAL"
 
 
+def _resolve_entry_policy(
+    regime: RegimeResult,
+    trend: TrendResult,
+    regime_strength: Optional[str] = None,
+    regime_context: Optional[str] = None,
+) -> tuple[str, str]:
+    """Return the local timeframe's strength and regime for entry policy.
+
+    ``regime_strength`` and ``regime_context`` are retained for callers that
+    still pass the older HTF values.  MTF is a separate negative filter, so
+    those values must not relabel the local entry decision.
+    """
+    return str(trend.strength).upper(), str(regime.regime).upper()
+
+
 def _make_neutral(
     smc, wyckoff, pa, trend, blocked_reasons, reasoning=None,
     range_context: Optional[RangeContext] = None,
@@ -376,8 +391,18 @@ def run_decision_engine(
 
     # Detect regime early — needed to set the adaptive confirmation threshold.
     regime = detect_market_regime(candles, trend, wyckoff, use_atr_high_vol)
-    effective_regime_strength = str(regime_strength or trend.strength).upper()
-    policy_regime = str(regime_context or regime.regime).upper()
+    # The regime used by the entry policy must describe the same candle window
+    # that produced this decision.  The MTF context is a separate negative
+    # filter; allowing its RANGE label to replace a strong local regime makes a
+    # 1m ADX trend look like RANGE and incorrectly disables the trend policy.
+    # Keep the parameters for compatibility with older callers, but do not let
+    # a higher-timeframe context overwrite the local entry regime.
+    effective_regime_strength, policy_regime = _resolve_entry_policy(
+        regime,
+        trend,
+        regime_strength=regime_strength,
+        regime_context=regime_context,
+    )
     local_min_confirmations = _effective_min_confirmations(
         min_confirmations,
         regime.regime,
