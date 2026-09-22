@@ -108,9 +108,6 @@ _TF_MAP = {
     "H1": 60, "H4": 240, "D1": 1440,
 }
 
-_MIN_CANDLE_HISTORY = 200
-
-
 def _parse_candle_time(value: object) -> Optional[datetime]:
     """Parse an MTAPI candle timestamp into an aware UTC datetime."""
     raw = str(value).strip()
@@ -540,10 +537,10 @@ async def fetch_candles(
     """Fetch the latest completed OHLCV candles via MTAPI.
 
     The returned window is always the most recent completed history, never a
-    day-start slice. Keep a 200-bar floor so 1m entries and higher-timeframe
-    ATR/MTF calculations have enough warm-up data after a restart.
+    day-start slice. Callers choose the exact rolling window needed by their
+    indicator warm-up requirements.
     """
-    requested_count = max(_MIN_CANDLE_HISTORY, int(count))
+    requested_count = max(1, int(count))
     # Compatibility path for the historical RPC-shaped adapter contract.
     # This is only exercised when a caller supplies _account explicitly.
     legacy_account = globals().get("_account")

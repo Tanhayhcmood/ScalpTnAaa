@@ -77,15 +77,15 @@ def test_fetch_candles_requests_latest_window_without_worker_clock_anchor():
             patch.object(connector, "is_connected", return_value=True),
             patch.object(connector, "_account", fake_account),
         ):
-            return await connector.fetch_candles("XAUUSD", "M5", count=1)
+            return await connector.fetch_candles("XAUUSD", "M5", count=100)
 
     result = asyncio.run(run_fetch())
     assert [c.time for c in result] == [latest_closed]
     call = fake_account.get_historical_candles.await_args.kwargs
     assert call["symbol"] == "XAUUSD"
     assert call["timeframe"] == "5m"
-    assert call["limit"] == 205
+    assert call["limit"] == 105
     assert isinstance(call["start_time"], datetime)
     now = datetime.now(timezone.utc)
-    assert now - timedelta(minutes=1030) < call["start_time"]
-    assert call["start_time"] < now - timedelta(minutes=1020)
+    assert now - timedelta(minutes=530) < call["start_time"]
+    assert call["start_time"] < now - timedelta(minutes=520)

@@ -1143,6 +1143,7 @@ class GoldScalperLive:
             htf_candles = await fetch_candles(
                 SYMBOL, MTF_TIMEFRAME, MTF_CANDLE_WINDOW
             )
+            _log_candle_window(MTF_TIMEFRAME, htf_candles, "htf")
             if len(htf_candles) < 50:
                 reason = f"HTF candles insufficient ({len(htf_candles)})"
                 self._mtf_cache_bias = None
@@ -1216,7 +1217,7 @@ class GoldScalperLive:
             sl_candles = await fetch_candles(
                 SYMBOL,
                 SL_ATR_TIMEFRAME,
-                max(200, SL_ATR_PERIOD + 1),
+                max(100, SL_ATR_PERIOD + 1),
             )
             _log_candle_window(SL_ATR_TIMEFRAME, sl_candles, "sl_atr")
             if len(sl_candles) < SL_ATR_PERIOD + 1:
