@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 ACTIVE_ENTRY_STRATEGY = "XAUUSD_VOLATILITY_TREND_BREAKOUT"
 ACTIVE_ENTRY_SYMBOL = "XAUUSD"
-ACTIVE_ENTRY_TIMEFRAME = "1m"
+ACTIVE_ENTRY_TIMEFRAME = "5m"
 
 # RANGE is allowed by the active strategy alongside the directional volatility
 # and trend regimes; pullback, Wyckoff, accumulation/distribution, and

@@ -107,7 +107,7 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `REDIS_URL` | **YES (secret)** | — | Redis connection string (same instance as the panel, same region) |
 | `SYMBOL` | No | `XAUUSD` | Trading instrument (AMarkets reports gold as `XAUUSD`, not `XAUUSDb`) |
 | `TIMEFRAME` | No | `5m` | Primary M5 detection/context timeframe |
-| `TRADE_TIMEFRAMES` | No | `1m` | M1 entry scan timeframe |
+| `TRADE_TIMEFRAMES` | No | `5m` | M5 entry scan timeframe |
 | `CANDLE_WINDOW` | No | `300` | Bars fetched per candle request |
 | `SL_ATR_TIMEFRAME` | No | `M5` | Higher timeframe used for protective-stop ATR, independent of the signal timeframe |
 | `SL_ATR_PERIOD` | No | `14` | Wilder ATR period for protective stops |

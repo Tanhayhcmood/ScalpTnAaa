@@ -43,6 +43,8 @@ from live_trading.config import (
     ENABLED_STRATEGIES,
     SL_ATR_BASE_MULTIPLIER,
     LOW_VOLATILITY_SL_ATR_ADD,
+    SL_MIN_ATR_MULTIPLIER,
+    SL_STRUCTURE_BUFFER_ATR,
     TARGET_ROOM_BUFFER_ATR,
 )
 
@@ -369,7 +371,7 @@ def run_decision_engine(
     # The regime used by the entry policy must describe the same candle window
     # that produced this decision.  The MTF context is a separate negative
     # filter; allowing its RANGE label to replace a strong local regime makes a
-    # 1m ADX trend look like RANGE and incorrectly disables the trend policy.
+    # 5m ADX trend look like RANGE and incorrectly disables the trend policy.
     # Keep the parameters for compatibility with older callers, but do not let
     # a higher-timeframe context overwrite the local entry regime.
     effective_regime_strength, policy_regime = _resolve_entry_policy(
@@ -518,7 +520,7 @@ def run_decision_engine(
 
     # Protective-stop volatility is intentionally independent from the signal
     # timeframe. The live loop supplies ATR from SL_ATR_TIMEFRAME (normally
-    # M5), so a compressed M1 candle cannot create an unrealistically tight
+    # M5), so a compressed M5 candle cannot create an unrealistically tight
     # stop. LOW_VOLATILITY gets an additional configurable buffer because it
     # can precede a volatility expansion.
     protective_atr = float(sl_atr or regime.atr)
@@ -638,8 +640,28 @@ def run_decision_engine(
             range_resistance if candidate == "BUY" else range_support
         ),
         sl_atr_multiplier=protective_multiplier,
+        sl_min_atr_multiplier=SL_MIN_ATR_MULTIPLIER,
+        structure_buffer_atr=SL_STRUCTURE_BUFFER_ATR,
     )
     trade_params = calc_trade_parameters(cap_input)
+
+    # Never hide a structural stop that exceeds the configured risk envelope.
+    # Clipping it would place the protective stop inside the invalidation level.
+    if not getattr(trade_params, "stop_loss_valid", True):
+        stop_reason = (
+            f"SL blocked: {getattr(trade_params, 'stop_loss_reason', 'unsafe structural distance')}"
+        )
+        return DecisionResult(
+            allowed=False, direction=candidate,  # type: ignore
+            confidence=conf_result.confidence, components=conf_result.components,
+            grade=conf_result.grade, regime=regime.regime,
+            regime_label=regime.rules.label, regime_rules=regime.rules,
+            quality_filter=quality, blocked_reasons=[stop_reason],
+            reasoning=conf_result.reasoning + [stop_reason], trade_params=None,
+            smc=smc, wyckoff=wyckoff, pa=pa, trend=trend,
+            entry_filter=ef, divergence=divergence, dxy_signal=dxy_signal,
+            range_context=range_context,
+        )
 
     # For ordinary trend entries the nearest equal high/low is a hard
     # structural barrier even though the target remains the fixed 2R target.
@@ -744,7 +766,7 @@ def run_decision_engine(
 
     # ── PHASE 1 ACTIVE STRATEGY GATE ──────────────────────────────────────────
     # Legacy engines may still contribute diagnostics above, but only the
-    # named XAUUSD 1m volatility/trend breakout can reach the order path.
+    # named XAUUSD 5m volatility/trend breakout can reach the order path.
     permitted_decision = DecisionResult(
         allowed=True, direction=candidate,  # type: ignore
         confidence=conf_result.confidence, components=conf_result.components,

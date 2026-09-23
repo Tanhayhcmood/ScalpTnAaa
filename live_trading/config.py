@@ -190,10 +190,10 @@ METAAPI_ACCOUNT_ID = ""
 
 # ── Symbol & Timeframe ───────────────────────────────────────────────────────
 SYMBOL        = os.getenv("SYMBOL", "XAUUSD")
-TIMEFRAME     = _timeframe("TIMEFRAME", "1m")
+TIMEFRAME     = _timeframe("TIMEFRAME", "5m")
 CANDLE_WINDOW = _int("CANDLE_WINDOW", 300, lo=50, hi=5000)
 # Stop-loss volatility is intentionally independent from the signal timeframe.
-# The live default uses M5 ATR while the robot scans M1 entries.
+# The live default uses M5 ATR while the robot scans M5 entries.
 SL_ATR_TIMEFRAME = _timeframe("SL_ATR_TIMEFRAME", "M5")
 SL_ATR_PERIOD = _int("SL_ATR_PERIOD", 14, lo=2, hi=100)
 # A signal is only actionable while the executable broker price remains close
@@ -214,7 +214,7 @@ ENABLED_STRATEGIES = LIVE_ENTRY_STRATEGIES
 # entries.
 # CONF_HARD_MIN: trades below this confidence % are always rejected.
 # Base protective stop distance in higher-timeframe ATR units. The floor of
-# 3x prevents a compressed M1 signal candle from producing a tight stop.
+# 3x prevents a compressed M5 signal candle from producing a tight stop.
 SL_ATR_BASE_MULTIPLIER = _float(
     "SL_ATR_BASE_MULTIPLIER", 3.0, lo=3.0, hi=3.5
 )
@@ -222,6 +222,15 @@ SL_ATR_BASE_MULTIPLIER = _float(
 # retaining the global 3.5x cap in the capital manager.
 LOW_VOLATILITY_SL_ATR_ADD = _float(
     "LOW_VOLATILITY_SL_ATR_ADD", 0.5, lo=0.0, hi=1.0
+)
+
+# Smart structural-stop controls. These tune the distance around a valid
+# invalidation level without changing the protective ATR timeframe.
+SL_MIN_ATR_MULTIPLIER = _float(
+    "SL_MIN_ATR_MULTIPLIER", 1.5, lo=0.75, hi=3.0
+)
+SL_STRUCTURE_BUFFER_ATR = _float(
+    "SL_STRUCTURE_BUFFER_ATR", 0.20, lo=0.05, hi=1.0
 )
 # Minimum room beyond the next equal high/low before a target can be trusted.
 # This is deliberately small; the dominant requirement remains the regime R:R.
@@ -369,8 +378,8 @@ OPTION_TWO_MIN_TIMEFRAMES = _int("OPTION_TWO_MIN_TIMEFRAMES", 2, lo=2, hi=10)
 # computed on H1 regardless of which trade TFs are active, because H1
 # represents the directional context for the whole session.
 #
-# The live entry service currently watches only the 1m bar stream.
-TRADE_TIMEFRAMES  = _trade_timeframes("TRADE_TIMEFRAMES", "1m")
+# The live entry service currently watches only the 5m bar stream.
+TRADE_TIMEFRAMES  = _trade_timeframes("TRADE_TIMEFRAMES", "5m")
 
 
 
@@ -378,7 +387,7 @@ TRADE_TIMEFRAMES  = _trade_timeframes("TRADE_TIMEFRAMES", "1m")
 COMMENT = "GSPv4"
 
 # ── Loop Timing ──────────────────────────────────────────────────────────────
-# Poll frequently enough to notice a newly closed 1m candle promptly.  This
+# Poll frequently enough to notice a newly closed 5m candle promptly.  This
 # only checks bar timestamps; signal evaluation still uses closed candles.
 BAR_CHECK_INTERVAL = _int("BAR_CHECK_INTERVAL", 5, lo=1, hi=60)
 RECONNECT_DELAY    = 30       # seconds before reconnect attempt

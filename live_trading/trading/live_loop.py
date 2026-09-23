@@ -1634,6 +1634,18 @@ class GoldScalperLive:
                     ),
                 ),
                 "cache_reason": sl_atr_reason or "fresh",
+                "stop_mode": (
+                    getattr(decision.trade_params, "stop_loss_mode", None)
+                    if decision.trade_params is not None else None
+                ),
+                "stop_reason": (
+                    getattr(decision.trade_params, "stop_loss_reason", None)
+                    if decision.trade_params is not None else None
+                ),
+                "structural_level": (
+                    getattr(decision.trade_params, "structural_level", None)
+                    if decision.trade_params is not None else None
+                ),
             },
             "mtf": {
                 "enabled": bool(MTF_ENABLED),

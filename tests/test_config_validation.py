@@ -76,10 +76,10 @@ class TestConfigDefaults:
         assert cfg.ENTRY_SIGNAL_ATR_PERIOD == 14
         assert cfg.MAX_ENTRY_SIGNAL_ATR_DISTANCE == 0.75
 
-    def test_entry_timeframe_defaults_to_one_minute_only(self):
+    def test_entry_timeframe_defaults_to_five_minutes_only(self):
         cfg = _reload_config({})
-        assert cfg.TIMEFRAME == "1m"
-        assert cfg.TRADE_TIMEFRAMES == ["1m"]
+        assert cfg.TIMEFRAME == "5m"
+        assert cfg.TRADE_TIMEFRAMES == ["5m"]
 
     def test_confidence_threshold_defaults_are_forty_percent(self):
         cfg = _reload_config({})

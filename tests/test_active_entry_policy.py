@@ -33,7 +33,7 @@ def test_only_active_strategy_can_pass_the_runtime_gate():
     result = evaluate_active_entry(
         _decision(),
         symbol="XAUUSD",
-        timeframe="1m",
+        timeframe="5m",
     )
 
     assert result.allowed is True
@@ -44,7 +44,7 @@ def test_range_entries_are_authorized_when_trend_confirms():
     result = evaluate_active_entry(
         _decision(regime="RANGE"),
         symbol="XAUUSD",
-        timeframe="1m",
+        timeframe="5m",
     )
 
     assert result.allowed is True
@@ -62,7 +62,7 @@ def test_standalone_price_action_without_trend_is_blocked():
             )
         ),
         symbol="XAUUSD",
-        timeframe="1m",
+        timeframe="5m",
     )
 
     assert result.allowed is False
@@ -82,7 +82,7 @@ def test_smc_and_wyckoff_cannot_authorize_entries_independently():
                 )
             ),
             symbol="XAUUSD",
-            timeframe="1m",
+            timeframe="5m",
         )
 
         assert result.allowed is False
@@ -96,7 +96,7 @@ def test_counter_trend_entries_are_blocked():
             trend=SimpleNamespace(trend="BULLISH"),
         ),
         symbol="XAUUSD",
-        timeframe="1m",
+        timeframe="5m",
     )
 
     assert result.allowed is False
@@ -120,18 +120,18 @@ def test_trend_confirmation_does_not_require_a_price_action_breakout():
             ),
         ),
         symbol="XAUUSD",
-        timeframe="1m",
+        timeframe="5m",
     )
 
     assert result.allowed is True
 
 
-def test_non_one_minute_execution_is_blocked_without_changing_config():
+def test_non_five_minute_execution_is_blocked_without_changing_config():
     result = evaluate_active_entry(
         _decision(),
         symbol="XAUUSD",
-        timeframe="5m",
+        timeframe="1m",
     )
 
     assert result.allowed is False
-    assert "execution timeframe must remain 1m" in result.reason
+    assert "execution timeframe must remain 5m" in result.reason

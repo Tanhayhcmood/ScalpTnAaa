@@ -115,7 +115,7 @@ def test_historical_timeout_does_not_replace_healthy_session():
         connector._connected = True
         connector._consecutive_health_failures = 0
 
-        candles = await connector.fetch_candles("XAUUSD", "1m", count=50)
+        candles = await connector.fetch_candles("XAUUSD", "5m", count=50)
 
         assert candles == []
         assert connector._connected is True

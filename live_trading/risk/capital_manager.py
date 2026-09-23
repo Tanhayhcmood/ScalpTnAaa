@@ -9,7 +9,7 @@ from typing import Optional
 DEFAULT_RISK_PCT    = 1.0
 ATR_BUFFER_MULT     = 0.25
 DEFAULT_SL_ATR_MULT = 3.00
-MIN_SL_ATR_MULT     = 3.00
+MIN_SL_ATR_MULT     = 1.50
 MAX_SL_ATR_MULT     = 3.50
 FIXED_TP_RR         = 2.00
 LOT_DOLLAR_PER_UNIT = 100
@@ -36,6 +36,8 @@ class CapitalInput:
     # Protective stop distance is based on a higher-timeframe ATR supplied by
     # the decision engine, not the signal candle's ATR.
     sl_atr_multiplier:   float = DEFAULT_SL_ATR_MULT
+    sl_min_atr_multiplier: float = MIN_SL_ATR_MULT
+    structure_buffer_atr: float = 0.20
 
 
 @dataclass
@@ -55,6 +57,10 @@ class CapitalOutput:
     risk_budget:            float
     risk_percent:            float
     min_lot_risk_exceeded:  bool
+    stop_loss_mode:          str = "ATR_FALLBACK"
+    stop_loss_reason:        str = ""
+    stop_loss_valid:         bool = True
+    structural_level:        Optional[float] = None
 
 
 def _clamp(val: float, lo: float, hi: float) -> float:
@@ -65,53 +71,104 @@ def _r2(n: float) -> float: return round(n, 2)
 def _r4(n: float) -> float: return round(n, 4)
 
 
-def _calc_smart_sl(direction: str, entry: float, atr: float, inp: CapitalInput) -> float:
-    buffer = atr * ATR_BUFFER_MULT
-    requested_mult = _clamp(
-        float(inp.sl_atr_multiplier),
-        MIN_SL_ATR_MULT,
-        MAX_SL_ATR_MULT,
+def _finite_level(value: Optional[float], entry: float, direction: str) -> Optional[float]:
+    try:
+        level = float(value) if value is not None else 0.0
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(level) or level <= 0:
+        return None
+    if direction == "BUY" and level < entry:
+        return level
+    if direction == "SELL" and level > entry:
+        return level
+    return None
+
+@dataclass(frozen=True)
+class SmartStopPlan:
+    stop_loss: float
+    valid: bool
+    mode: str
+    reason: str
+    structural_level: Optional[float]
+    distance_atr: float
+
+
+def _calc_smart_stop(direction: str, entry: float, atr: float, inp: CapitalInput) -> SmartStopPlan:
+    """Build a bounded structural stop and refuse unsafe clipping.
+
+    A valid structural invalidation level is preferred over a stale outer
+    level. The stop receives an ATR buffer, is protected by a noise floor,
+    and is rejected when the structure is farther away than the configured
+    risk envelope; placing a stop inside invalidation would be misleading.
+    """
+    normalized_direction = str(direction).upper().strip()
+    safe_entry = float(entry)
+    safe_atr = max(float(atr), 1e-9)
+    min_mult = _clamp(float(inp.sl_min_atr_multiplier), 0.75, MAX_SL_ATR_MULT)
+    max_mult = _clamp(float(inp.sl_atr_multiplier), min_mult, MAX_SL_ATR_MULT)
+    min_distance = safe_atr * min_mult
+    max_distance = safe_atr * max_mult
+    buffer = safe_atr * max(0.0, float(inp.structure_buffer_atr))
+
+    raw_levels = (
+        (inp.order_block_bottom, inp.swing_low, inp.support_level)
+        if normalized_direction == "BUY"
+        else (inp.order_block_top, inp.swing_high, inp.resistance_level)
     )
-    min_sl = atr * requested_mult
-    max_sl = atr * MAX_SL_ATR_MULT
-    raw_sl = None
+    levels = [
+        level for level in (
+            _finite_level(value, safe_entry, normalized_direction)
+            for value in raw_levels
+        )
+        if level is not None
+    ]
 
-    if direction == "BUY":
-        cands = []
-        if inp.order_block_bottom is not None and inp.order_block_bottom < entry:
-            cands.append(inp.order_block_bottom)
-        if inp.swing_low is not None and inp.swing_low < entry:
-            cands.append(inp.swing_low)
-        if inp.support_level is not None and inp.support_level < entry:
-            cands.append(inp.support_level)
-        if cands:
-            # Use the outer structural invalidation for a long as well. The
-            # nearest support can be a wick or the edge of the active order
-            # block; use the lowest valid level and keep the ATR cap below.
-            level  = min(cands)
-            raw_sl = entry - (entry - level + buffer)
+    if levels:
+        structural_level = max(levels) if normalized_direction == "BUY" else min(levels)
+        raw_distance = abs(safe_entry - structural_level) + buffer
+        if raw_distance > max_distance + 1e-9:
+            fallback_stop = (
+                safe_entry - max_distance
+                if normalized_direction == "BUY"
+                else safe_entry + max_distance
+            )
+            return SmartStopPlan(
+                stop_loss=_r2(fallback_stop),
+                valid=False,
+                mode="STRUCTURE_TOO_FAR",
+                reason=(f"structural invalidation is {raw_distance / safe_atr:.2f} ATR "
+                        f"beyond the {max_mult:.2f} ATR risk envelope"),
+                structural_level=_r2(structural_level),
+                distance_atr=round(max_distance / safe_atr, 4),
+            )
+        distance = max(raw_distance, min_distance)
+        mode = "STRUCTURAL" if raw_distance >= min_distance else "STRUCTURAL_MIN_FLOOR"
+        reason = "structural invalidation plus ATR buffer"
     else:
-        cands = []
-        if inp.order_block_top is not None and inp.order_block_top > entry:
-            cands.append(inp.order_block_top)
-        if inp.swing_high is not None and inp.swing_high > entry:
-            cands.append(inp.swing_high)
-        if inp.resistance_level is not None and inp.resistance_level > entry:
-            cands.append(inp.resistance_level)
-        if cands:
-            # Use the outer structural invalidation for a short. The nearest
-            # resistance is often only a wick or the edge of the active
-            # order block; putting the stop there lets a normal retracement
-            # invalidate a still-valid trend. MAX_SL_ATR_MULT below still
-            # bounds the result.
-            level  = max(cands)
-            raw_sl = entry + (level - entry + buffer)
+        structural_level = None
+        distance = max_distance
+        mode = "ATR_FALLBACK"
+        reason = "no valid directional structure was available"
 
-    fallback  = atr * requested_mult
-    sl_dist   = abs(entry - raw_sl) if raw_sl is not None else fallback
-    clamped   = _clamp(sl_dist, min_sl, max_sl)
-    return _r2(entry - clamped if direction == "BUY" else entry + clamped)
+    stop = (
+        safe_entry - distance
+        if normalized_direction == "BUY"
+        else safe_entry + distance
+    )
+    return SmartStopPlan(
+        stop_loss=_r2(stop),
+        valid=True,
+        mode=mode,
+        reason=reason,
+        structural_level=(_r2(structural_level) if structural_level is not None else None),
+        distance_atr=round(distance / safe_atr, 4),
+    )
 
+
+def _calc_smart_sl(direction: str, entry: float, atr: float, inp: CapitalInput) -> float:
+    """Backward-compatible scalar wrapper for callers/tests."""
+    return _calc_smart_stop(direction, entry, atr, inp).stop_loss
 
 def _calc_lot_size(sl_dist_usd: float, balance: float, risk_pct: float):
     """Calculate a broker-stepped lot size from the percentage risk budget.
@@ -139,7 +196,8 @@ def calc_trade_parameters(inp: CapitalInput) -> CapitalOutput:
     atr        = inp.atr
     risk_pct   = inp.risk_percent
 
-    sl         = _calc_smart_sl(direction, entry, atr, inp)
+    stop_plan  = _calc_smart_stop(direction, entry, atr, inp)
+    sl         = stop_plan.stop_loss
     sl_dist    = _r2(abs(entry - sl))
     sl_pips    = _r2(sl_dist * 100)
 
@@ -187,4 +245,8 @@ def calc_trade_parameters(inp: CapitalInput) -> CapitalOutput:
         risk_budget=risk_budget,
         risk_percent=_r2(risk_pct),
         min_lot_risk_exceeded=min_lot_risk_exceeded,
+        stop_loss_mode=stop_plan.mode,
+        stop_loss_reason=stop_plan.reason,
+        stop_loss_valid=stop_plan.valid,
+        structural_level=stop_plan.structural_level,
     )
