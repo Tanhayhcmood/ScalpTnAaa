@@ -301,7 +301,15 @@ class BotApplication:
             if pos is None:
                 return
             msg = formatter.trade_opened(pos)
-            await notif_svc.notify_all_admins(NotificationType.TRADE_OPEN, msg)
+            ticket = getattr(pos, "ticket", 0)
+            await notif_svc.notify_all_admins(
+                NotificationType.TRADE_OPEN,
+                msg,
+                metadata={
+                    "dedupe_key": f"trade_open:{ticket}",
+                    "ticket": ticket,
+                },
+            )
 
         self._event_bus.subscribe(Events.HEARTBEAT, on_heartbeat)
         self._event_bus.subscribe(Events.CONNECTION_LOST, on_connection_lost)

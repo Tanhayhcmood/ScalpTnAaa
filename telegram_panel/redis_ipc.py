@@ -36,6 +36,7 @@ _GUARDIAN_KEY = "goldscalper:guardian"
 _STATE_TTL    = 300    # 5 min — prevents stale reads if robot crashes
 _CMD_TTL      = 300    # 5 min — stale commands become irrelevant
 _GUARDIAN_TTL = 97200  # 27h — covers the 26h freshness window after a restart
+_NOTIFICATION_DEDUP_TTL = 30 * 24 * 60 * 60  # keep trade-open claims for 30 days
 
 _client              = None
 _last_failure_time: float = 0.0   # monotonic timestamp of last connection failure
@@ -253,6 +254,42 @@ def redis_send_command(command: str, payload: Optional[dict] = None) -> bool:
         logger.warning("Redis send_command: %s", exc)
         _reset_client()
         return False
+
+
+# ─── Notification idempotency ────────────────────────────────────────────────
+
+def redis_claim_notification(dedupe_key: str) -> Optional[bool]:
+    """
+    Atomically claim a notification key for the panel.
+
+    Returns:
+      True  — this caller claimed the key and may enqueue the notification.
+      False — another delivery already claimed it.
+      None  — Redis is unavailable; callers may use a process-local fallback.
+
+    Redis-backed claims prevent a previously delivered trade-open event from
+    being sent again after the panel restarts or temporarily reads an empty
+    position snapshot.
+    """
+    if not dedupe_key or not dedupe_key.strip():
+        return True
+
+    r = _get_client()
+    if r is None:
+        return None
+    try:
+        return bool(
+            r.set(
+                f"goldscalper:notification:{dedupe_key.strip()}",
+                "1",
+                ex=_NOTIFICATION_DEDUP_TTL,
+                nx=True,
+            )
+        )
+    except Exception as exc:
+        logger.warning("Redis claim_notification: %s", exc)
+        _reset_client()
+        return None
 
 
 # ─── Guardian state (panel reads halt state set by robot) ─────────────────────

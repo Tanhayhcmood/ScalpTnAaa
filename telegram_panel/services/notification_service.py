@@ -38,6 +38,11 @@ class NotificationService:
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
         self._worker_task: Optional[asyncio.Task] = None
         self._running = False
+        # Redis provides cross-restart deduplication. This local set also
+        # suppresses duplicate events during a Redis outage while this panel
+        # process remains alive.
+        self._dedupe_keys: set[str] = set()
+        self._dedupe_lock = asyncio.Lock()
 
     def set_bot(self, bot_app) -> None:
         """Inject bot reference after startup (break circular dep)."""
@@ -88,11 +93,17 @@ class NotificationService:
         if recipients is None:
             recipients = self._get_default_recipients(notification_type)
 
+        metadata = metadata or {}
+        dedupe_key = str(metadata.get("dedupe_key", "")).strip()
+        if dedupe_key and not await self._claim_dedupe_key(dedupe_key):
+            logger.info("Skipping duplicate notification: %s", dedupe_key)
+            return
+
         payload = {
             "type": notification_type,
             "message": message,
             "recipients": recipients,
-            "metadata": metadata or {},
+            "metadata": metadata,
         }
 
         try:
@@ -101,10 +112,24 @@ class NotificationService:
             logger.warning(f"Notification queue full — dropped {notification_type}")
 
     async def notify_all_admins(
-        self, notification_type: NotificationType, message: str
+        self,
+        notification_type: NotificationType,
+        message: str,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> None:
-        recipients = [self._owner_id] + self._admin_ids
-        await self.notify(notification_type, message, recipients=recipients)
+        # An owner may also appear in TELEGRAM_ADMIN_IDS. Deduplicate before
+        # queueing so one event can never create two messages in one chat.
+        recipients = list(dict.fromkeys(
+            recipient
+            for recipient in [self._owner_id] + self._admin_ids
+            if recipient
+        ))
+        await self.notify(
+            notification_type,
+            message,
+            recipients=recipients,
+            metadata=metadata,
+        )
 
     async def get_settings(
         self, telegram_id: Optional[int] = None
@@ -138,6 +163,28 @@ class NotificationService:
                 await self._repo.upsert_setting(setting)
 
     # ─── Private ─────────────────────────────────────────────────────────────
+
+    async def _claim_dedupe_key(self, dedupe_key: str) -> bool:
+        """Claim a notification once across restarts when Redis is available."""
+        async with self._dedupe_lock:
+            if dedupe_key in self._dedupe_keys:
+                return False
+
+            try:
+                from ..redis_ipc import redis_claim_notification
+                redis_claim = redis_claim_notification(dedupe_key)
+            except Exception as exc:
+                logger.debug("Notification Redis dedupe unavailable: %s", exc)
+                redis_claim = None
+
+            # False means Redis atomically found an existing claim. None means
+            # Redis is unavailable, so keep a process-local claim instead of
+            # dropping the event.
+            if redis_claim is False:
+                return False
+
+            self._dedupe_keys.add(dedupe_key)
+            return True
 
     async def _worker(self) -> None:
         while self._running:
