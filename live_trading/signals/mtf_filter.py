@@ -1,8 +1,8 @@
 """
 Multi-Timeframe (HTF) Filter — GoldScalperPro v4
 
-Computes a Higher TimeFrame directional bias by reusing the existing
-Trend, SMC, Wyckoff, and Regime engines on HTF candles (default H1).
+Computes a Higher TimeFrame directional bias from the existing Trend,
+Wyckoff, and Regime engines on HTF candles (default H1).
 
 The live loop uses this module as a *negative* filter.  A normal entry keeps
 its existing approval path; MTF only rejects an entry when the higher-timeframe
@@ -17,7 +17,6 @@ from typing import List, Literal, Optional
 
 from live_trading.signals.gold_engine import OHLCV
 from live_trading.signals.trend_engine import analyze_trend, TrendResult
-from live_trading.signals.smc_engine import analyze_smc_structure, SmcResult
 from live_trading.signals.wyckoff_engine import analyze_wyckoff, WyckoffResult
 from live_trading.signals.market_regime import detect_market_regime, RegimeResult
 
@@ -40,7 +39,7 @@ class MtfBias:
         directional entry and must block new trades.
 
     trend     : HTF EMA trend string (BULLISH / BEARISH / NEUTRAL).
-    smc_signal: HTF SMC signal       (BUY / SELL / NEUTRAL).
+    smc_signal: Legacy telemetry field, always NEUTRAL.
     regime    : HTF regime label     (e.g. STRONG_TREND_BULL, RANGE, …).
     strength  : STRONG | MODERATE | WEAK — derived from trend engine.
     reasoning : Ordered list of human-readable explanation strings.  Each
@@ -88,7 +87,7 @@ def _neutral(reason: str) -> MtfBias:
 
 def compute_mtf_bias(htf_candles: List[OHLCV]) -> MtfBias:
     """
-    Derive the HTF directional bias from Trend + SMC + Regime analysis.
+    Derive the HTF directional bias from Trend + Regime analysis.
 
     NEVER raises — any exception produces a NEUTRAL bias (fail-closed).
     Returns NEUTRAL when data is insufficient or engines conflict.
@@ -110,7 +109,6 @@ def compute_mtf_bias(htf_candles: List[OHLCV]) -> MtfBias:
 
     try:
         trend   : TrendResult  = analyze_trend(htf_candles)
-        smc     : SmcResult    = analyze_smc_structure(htf_candles, timeframe="H1")
         wyckoff : WyckoffResult = analyze_wyckoff(htf_candles)
         regime  : RegimeResult  = detect_market_regime(
             htf_candles, trend, wyckoff, use_atr_high_vol=False
@@ -144,58 +142,33 @@ def compute_mtf_bias(htf_candles: List[OHLCV]) -> MtfBias:
             f"EMA200={trend.ema200:.2f}) — no alignment"
         )
 
-    # ── 2. SMC vote (structural confirmation) ────────────────────────────────
-    # HTF SMC gives structural confirmation (BOS, CHoCH, OB), but is
-    # NOT allowed to override a neutral trend — it can only reinforce.
-    smc_vote = smc.smc_signal   # BUY | SELL | NEUTRAL
-    if smc_vote != "NEUTRAL":
-        reasoning.append(
-            f"HTF SMC signal: {smc_vote} "
-            f"(BOS={len(smc.bos_signals)}, "
-            f"CHoCH={len(smc.choch_signals)}, "
-            f"OBs={len(smc.order_blocks)}, "
-            f"FVGs={len(smc.fair_value_gaps)})"
-        )
-    else:
-        reasoning.append("HTF SMC: no structural direction signal")
-
-    # ── 3. Regime context (informational) ────────────────────────────────────
+    # ── 2. Regime context (informational) ────────────────────────────────────
     reasoning.append(
         f"HTF regime: {regime.regime} "
         f"(ADX={regime.adx:.1f}, ATR_ratio={regime.atr_ratio:.2f})"
     )
 
-    # ── 4. Combine → final bias ───────────────────────────────────────────────
-    # Rule matrix:
-    #   Trend NEUTRAL            → NEUTRAL (no filter regardless of SMC)
-    #   Trend directional + SMC agrees or NEUTRAL → bias = trend direction
-    #   Trend directional + SMC actively opposes  → NEUTRAL (conflicted HTF)
+    # ── 3. Combine → final bias ───────────────────────────────────────────────
+    # MTF is a Trend-only directional filter. SMC is intentionally absent from
+    # this path; the legacy result field stays NEUTRAL for telemetry shape
+    # compatibility.
     if trend_vote == "NEUTRAL":
         direction : Literal["BUY", "SELL", "NEUTRAL"] = "NEUTRAL"
         strength  : Literal["STRONG", "MODERATE", "WEAK"] = "WEAK"
         reasoning.append(
             "HTF bias: NEUTRAL (trend not aligned — no M5 filter applied)"
         )
-    elif smc_vote == "NEUTRAL" or smc_vote == trend_vote:
+    else:
         direction = trend_vote  # type: ignore[assignment]
         strength  = trend.strength
-        smc_note  = "SMC confirms" if smc_vote == trend_vote else "SMC neutral"
         reasoning.append(
-            f"Bias CONFIRMED: {direction} ({smc_note}, strength={strength})"
-        )
-    else:
-        # Trend and SMC conflict — HTF is transitioning; pass-through
-        direction = "NEUTRAL"
-        strength  = "WEAK"
-        reasoning.append(
-            f"HTF CONFLICT: Trend={trend_vote} vs SMC={smc_vote} "
-            f"— bias NEUTRAL, no M5 filter applied"
+            f"Bias CONFIRMED: {direction} (Trend-only, strength={strength})"
         )
 
     return MtfBias(
         direction=direction,
         trend=trend.trend,
-        smc_signal=smc_vote,
+        smc_signal="NEUTRAL",
         regime=regime.regime,
         strength=strength,
         reasoning=reasoning,

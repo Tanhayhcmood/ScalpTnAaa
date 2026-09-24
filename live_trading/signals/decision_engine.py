@@ -538,6 +538,7 @@ def run_decision_engine(
         smc, wyckoff, pa, trend, regime, session, candidate,
         divergence_signal=divergence.signal,
          price_action_standalone=False,
+         candles=candles,
     )
 
     if conf_result.confidence < CONF_HARD_MIN:

@@ -4,6 +4,7 @@ Ported from confidenceEngine.ts
 """
 from dataclasses import dataclass
 from typing import List, Literal
+from live_trading.signals.gold_engine import OHLCV
 from live_trading.signals.smc_engine import SmcResult
 from live_trading.signals.wyckoff_engine import WyckoffResult
 from live_trading.signals.price_action_engine import PriceActionResult
@@ -153,20 +154,41 @@ def _calc_wyckoff_score(wyckoff: WyckoffResult, candidate: str):
     return _cap(pts, 15), reasons
 
 
-def _calc_liquidity_score(smc: SmcResult, candidate: str):
+def _calc_liquidity_score(candles: List[OHLCV], candidate: str):
+    """Score candle-derived liquidity without consulting SMC structures."""
     reasons = []
     pts = 0.0
-    sweep_dir = "BULLISH" if candidate == "BUY" else "BEARISH"
-    aligned_sweeps = [s for s in smc.liquidity_sweeps if s.type == sweep_dir]
-    if aligned_sweeps:
-        pts += 2.5; reasons.append("Liquidity sweep in direction")
+    if len(candles) < 3 or candidate not in {"BUY", "SELL"}:
+        return pts, reasons
 
-    eq_count = (len(smc.equal_lows) if candidate == "BUY" else len(smc.equal_highs))
-    if eq_count >= 2:   pts += 1.5; reasons.append("Multiple equal-level pools")
-    elif eq_count == 1: pts += 0.75; reasons.append("Equal-level pool")
+    recent = candles[-21:-1]
+    signal = candles[-1]
+    if not recent:
+        return pts, reasons
 
-    if aligned_sweeps and any(b.type == candidate for b in smc.bos_signals):
-        pts += 1.0; reasons.append("Sweep + BOS confluence")
+    prior_low = min(c.low for c in recent)
+    prior_high = max(c.high for c in recent)
+    if candidate == "BUY" and signal.low < prior_low and signal.close > prior_low:
+        pts += 3.5
+        reasons.append("Independent bullish liquidity sweep")
+    elif (
+        candidate == "SELL"
+        and signal.high > prior_high
+        and signal.close < prior_high
+    ):
+        pts += 3.5
+        reasons.append("Independent bearish liquidity sweep")
+
+    reference = prior_low if candidate == "BUY" else prior_high
+    tolerance = max(0.05, abs(reference) * 0.0005)
+    levels = (
+        [c.low for c in recent]
+        if candidate == "BUY"
+        else [c.high for c in recent]
+    )
+    if sum(abs(level - reference) <= tolerance for level in levels) >= 2:
+        pts += 1.5
+        reasons.append("Repeated candle liquidity level")
 
     return _cap(pts, 5), reasons
 
@@ -253,6 +275,7 @@ def calc_confidence(
     divergence_signal: str = "NEUTRAL",
     dxy_signal:        str = "NEUTRAL",
     price_action_standalone: bool = False,
+    candles:            List[OHLCV] | None = None,
 ) -> ConfidenceResult:
     smc_s,  smc_r  = _calc_smc_score(smc, candidate)
     tr_s,   tr_r   = _calc_trend_score(trend, candidate)
@@ -271,7 +294,7 @@ def calc_confidence(
             f"({standalone_pa:.1f} confidence points)"
         ]
     wy_s,   wy_r   = _calc_wyckoff_score(wyckoff, candidate)
-    liq_s,  liq_r  = _calc_liquidity_score(smc, candidate)
+    liq_s,  liq_r  = _calc_liquidity_score(candles or [], candidate)
     vol_s,  vol_r  = _calc_volatility_score(regime, session)
 
     div_s, div_r = _calc_divergence_score(divergence_signal, candidate)

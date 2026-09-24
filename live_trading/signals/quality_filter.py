@@ -127,8 +127,6 @@ def _is_late_entry(candles: List[OHLCV], last_bos_bar: Optional[int]) -> bool:
             shrinking = all(bodies[i] <= bodies[i - 1] for i in range(1, len(bodies)))
             if shrinking:
                 return True
-    if last_bos_bar is not None and (n - 1) - last_bos_bar > STRUCTURE_MAX_AGE_BARS:
-        return True
     return False
 
 
@@ -162,12 +160,9 @@ def apply_quality_filter(
     if len(candles) < 30:
         blocked.blocked_reasons = ["Insufficient candle data (< 30)"]
         return blocked
-    # The ordinary entry filter is Trend-only, but the legacy hard gate used
-    # to discard authorized entries whenever SMC was neutral. Only the
-    # decision engine can explicitly open this path after Trend confirms.
-    if smc_signal == "NEUTRAL" and not allow_without_smc:
-        blocked.blocked_reasons = ["No SMC direction signal"]
-        return blocked
+    # ``smc_signal`` and ``allow_without_smc`` remain in the signature for
+    # compatibility with older callers. Quality is independent of SMC and
+    # never blocks or authorizes an entry from that signal.
     reasons = []
     last_candle = candles[-1]
 
@@ -189,9 +184,11 @@ def apply_quality_filter(
     if sev_range:
         reasons.append("Severe range / compressed volatility — ADX too low")
 
-    late = _is_late_entry(candles, last_bos_bar)
+    # ``last_bos_bar`` used to come from SMC. The remaining late-entry checks
+    # are candle/EMA based, so no SMC structure can affect this gate.
+    late = _is_late_entry(candles, None)
     if late:
-        reasons.append("Late entry: price over-extended from EMA50 or BOS/CHoCH is stale")
+        reasons.append("Late entry: price over-extended from EMA50 or momentum exhausted")
 
     # ADX momentum check — configurable via QUALITY_ADX_MIN env var (default 12).
     # Set higher (e.g. 20) for stricter momentum confirmation,

@@ -1,8 +1,8 @@
 """Dedicated RANGE entry gate.
 
-The trend engines remain unchanged.  This module is deliberately additive and
-fail-closed: a range trade is only eligible at a validated range edge after a
-liquidity sweep and a closed-candle reversal pattern.
+The trend engines remain unchanged. This module is deliberately additive and
+fail-closed: a range trade is only eligible at a validated range edge after an
+independent candle liquidity sweep and a closed-candle reversal pattern.
 """
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from typing import Literal, Optional
 
 from live_trading.signals.gold_engine import OHLCV
 from live_trading.signals.price_action_engine import PriceActionResult
-from live_trading.signals.smc_engine import SmcResult
 
 
 RangeLocation = Literal["SUPPORT", "RESISTANCE", "MIDDLE", "OUTSIDE", "UNKNOWN"]
@@ -48,13 +47,37 @@ def _atr(candles: list[OHLCV], period: int = 14) -> float:
     return sum(window) / len(window) if window else 0.0
 
 
-def _latest_sweep(smc: SmcResult, direction: str, last_bar: int) -> bool:
-    """Require a sweep on the signal candle or one immediately before it."""
+def _latest_sweep(
+    candles: list[OHLCV],
+    direction: str,
+    last_bar: int,
+    lookback: int = 20,
+) -> bool:
+    """Detect a fresh wick sweep from raw candle liquidity levels."""
     wanted = "BULLISH" if direction == "BUY" else "BEARISH"
-    return any(
-        sweep.type == wanted and sweep.bar_index >= last_bar - 1
-        for sweep in smc.liquidity_sweeps
-    )
+    first_bar = max(1, len(candles) - 2)
+    for bar_index in range(first_bar, len(candles)):
+        if bar_index > last_bar:
+            continue
+        history = candles[max(0, bar_index - lookback):bar_index]
+        if not history:
+            continue
+        prior_low = min(c.low for c in history)
+        prior_high = max(c.high for c in history)
+        candle = candles[bar_index]
+        if (
+            wanted == "BULLISH"
+            and candle.low < prior_low
+            and candle.close > prior_low
+        ):
+            return True
+        if (
+            wanted == "BEARISH"
+            and candle.high > prior_high
+            and candle.close < prior_high
+        ):
+            return True
+    return False
 
 
 def _reversal_candle(pa: PriceActionResult, direction: str) -> bool:
@@ -66,7 +89,7 @@ def _reversal_candle(pa: PriceActionResult, direction: str) -> bool:
 def evaluate_range_entry(
     candles: list[OHLCV],
     direction: str,
-    smc: SmcResult,
+    smc: object | None,
     pa: PriceActionResult,
     confirmation_count: int,
     min_confirmations: int,
@@ -121,7 +144,9 @@ def evaluate_range_entry(
     else:
         location = "MIDDLE"
 
-    sweep = _latest_sweep(smc, direction, len(candles) - 1)
+    # ``smc`` is retained only for caller compatibility and is intentionally
+    # ignored. Liquidity is derived exclusively from the candle window.
+    sweep = _latest_sweep(candles, direction, len(candles) - 1)
     reversal = _reversal_candle(pa, direction)
     correct_edge = location == ("SUPPORT" if direction == "BUY" else "RESISTANCE")
     if confirmation_count < min_confirmations:
