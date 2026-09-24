@@ -1,14 +1,13 @@
-"""Entry Filter — Trend-only live entry confirmation policy.
+"""Entry Filter — Trend and Price Action live entry confirmation policy.
 
-Trend is the only engine that can authorize a live entry. Price Action, SMC,
-and Wyckoff remain available to callers for diagnostics and confidence scoring,
-but are excluded from direction selection and confirmation counting.
+Trend and Price Action can authorize a live entry. SMC and Wyckoff remain
+available to callers for diagnostics, but cannot affect entry decisions.
 """
 from dataclasses import dataclass
 from typing import Iterable, Literal
 
 MIN_CONFIRMATIONS = 1
-ENTRY_STRATEGIES = ("trend",)
+ENTRY_STRATEGIES = ("trend", "price_action")
 ALL_STRATEGIES = ENTRY_STRATEGIES
 
 
@@ -40,11 +39,10 @@ def apply_entry_filter(
     price_action_standalone: bool = False,
     enabled_strategies: Iterable[str] | None = None,
 ) -> EntryFilterResult:
-    """Allow an entry when Trend confirms the candidate direction.
+    """Allow an entry when Trend or Price Action confirms the candidate.
 
     The legacy policy arguments remain in the signature for callers that have
-    not migrated yet, but they cannot re-enable diagnostic engines as live
-    entry authorities.
+    not migrated yet. SMC and Wyckoff are always excluded from voting.
     """
     # ``enabled_strategies`` is retained for API compatibility only. The live
     # authority is intentionally fixed here so stale caller/config values
@@ -64,7 +62,8 @@ def apply_entry_filter(
         "wyckoff": _vote(wyckoff_signal),
     }
     # Keep disabled engines visible to the caller as telemetry inputs, but
-    # remove their votes from direction selection and confirmation counting.
+    # remove diagnostic-engine votes from direction selection and confirmation
+    # counting. SMC must never be able to confirm or reject an entry.
     votes = {
         name: value if name in enabled else "NEUTRAL"
         for name, value in raw_votes.items()
@@ -89,13 +88,11 @@ def apply_entry_filter(
             wyckoff=False,
         )
 
-    smc_ok = votes["smc"] == direction
+    smc_ok = False
     trend_ok = votes["trend"] == direction
     pa_ok = votes["price_action"] == direction
     wyc_ok = votes["wyckoff"] == direction
 
-    # Only the Trend vote participates in this live-entry decision. The
-    # legacy Price Action/SMC/Wyckoff requirements are intentionally ignored.
     allowed = count >= required_confirmations
 
     return EntryFilterResult(

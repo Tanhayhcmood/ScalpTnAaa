@@ -1,5 +1,6 @@
 """
-Confidence Score Engine — weighted 0–100 score across 6 components.
+Confidence Score Engine — weighted score across Trend, Price Action,
+Volatility, and Liquidity.
 Ported from confidenceEngine.ts
 """
 from dataclasses import dataclass
@@ -14,10 +15,13 @@ from live_trading.config import CONF_HARD_MIN
 
 @dataclass
 class ConfidenceComponents:
-    smc_score:        float   # 0–35
+    # Retained as a zero-valued compatibility field. SMC is diagnostic only.
+    smc_score:        float   # always 0
     trend_score:      float   # 0–20
     pa_score:         float   # 0–20 normally; up to 35 in standalone PA mode
-    wyckoff_score:    float   # 0–15
+    # Retained as zero-valued compatibility fields. Wyckoff, divergence, and
+    # DXY are not confidence components.
+    wyckoff_score:    float   # always 0
     liquidity_score:  float   # 0–5
     volatility_score: float   # 0–5
     total:            float   # 0–100
@@ -40,45 +44,9 @@ def _cap(val: float, max_val: float) -> float:
 
 
 def _calc_smc_score(smc: SmcResult, candidate: str):
-    reasons = []
-    pts = 0.0
-    d = candidate
-
-    if smc.trend == ("BULLISH" if d == "BUY" else "BEARISH"):
-        pts += 4; reasons.append("Structural trend aligned")
-
-    aligned_bos = [b for b in smc.bos_signals if b.type == d]
-    if len(aligned_bos) >= 2:
-        pts += 7; reasons.append("Multiple BOS confirmed")
-    elif len(aligned_bos) == 1:
-        pts += 5; reasons.append("BOS confirmed")
-
-    last_choch = smc.choch_signals[-1] if smc.choch_signals else None
-    if last_choch and last_choch.type == d:
-        pts += 8; reasons.append("CHoCH (structural reversal) confirmed")
-
-    ob_pts = 0; ob_count = 0
-    for ob in smc.order_blocks:
-        if ob.type != ("BULLISH" if d == "BUY" else "BEARISH"): continue
-        if ob_count >= 2: break
-        body = abs(ob.close - ob.open)
-        rng  = max(ob.high - ob.low, 0.01)
-        ob_pts += 4 if body / rng >= 0.5 else 3
-        ob_count += 1
-    if ob_pts > 0:
-        pts += _cap(ob_pts, 8)
-        reasons.append(f"Order Block{'s ×' + str(ob_count) if ob_count > 1 else ''} in zone")
-
-    fvg_count = sum(1 for f in smc.fair_value_gaps
-                    if f.type == ("BULLISH" if d == "BUY" else "BEARISH"))
-    if fvg_count >= 2:   pts += 4; reasons.append("Multiple FVGs in direction")
-    elif fvg_count == 1: pts += 2; reasons.append("FVG in direction")
-
-    last_sweep = smc.liquidity_sweeps[-1] if smc.liquidity_sweeps else None
-    if last_sweep and last_sweep.type == ("BULLISH" if d == "BUY" else "BEARISH"):
-        pts += 4; reasons.append("Liquidity sweep confirmed")
-
-    return _cap(pts, 35), reasons
+    # SMC remains available to callers for diagnostics, but never contributes
+    # to confidence. Liquidity is scored separately below.
+    return 0.0, []
 
 
 def _calc_trend_score(trend: TrendResult, candidate: str):
@@ -254,7 +222,7 @@ def calc_confidence(
     dxy_signal:        str = "NEUTRAL",
     price_action_standalone: bool = False,
 ) -> ConfidenceResult:
-    smc_s,  smc_r  = _calc_smc_score(smc, candidate)
+    smc_s,  smc_r  = 0.0, []
     tr_s,   tr_r   = _calc_trend_score(trend, candidate)
     pa_s,   pa_r   = _calc_pa_score(pa, candidate)
     if price_action_standalone and pa.pa_signal == candidate:
@@ -270,17 +238,16 @@ def calc_confidence(
             f"Standalone PA evidence {pa.pa_score:.2f} "
             f"({standalone_pa:.1f} confidence points)"
         ]
-    wy_s,   wy_r   = _calc_wyckoff_score(wyckoff, candidate)
+    wy_s,   wy_r   = 0.0, []
     liq_s,  liq_r  = _calc_liquidity_score(smc, candidate)
     vol_s,  vol_r  = _calc_volatility_score(regime, session)
 
-    div_s, div_r = _calc_divergence_score(divergence_signal, candidate)
-    # Option 3: DXY must not influence entry confidence in either direction.
-    # Keep the argument for compatibility with existing callers and telemetry,
-    # but deliberately do not evaluate it here.
+    # Keep the legacy arguments for compatibility, but confidence is composed
+    # only from Trend, Price Action, Liquidity, and Volatility.
+    div_s, div_r = 0.0, []
     dxy_s, dxy_r = 0.0, []
 
-    raw_total  = smc_s + tr_s + pa_s + wy_s + liq_s + vol_s + div_s + dxy_s
+    raw_total  = tr_s + pa_s + liq_s + vol_s
     total_capped = round(min(100.0, max(0.0, raw_total)), 1)
 
     comp = ConfidenceComponents(
