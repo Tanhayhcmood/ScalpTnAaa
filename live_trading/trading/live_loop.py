@@ -1270,6 +1270,16 @@ class GoldScalperLive:
             return 0.0, reason
 
     async def _on_new_bar(self, bar_time: datetime, tf: str = TIMEFRAME) -> None:
+        if str(SYMBOL).upper() != "XAUUSD":
+            reason = f"Only XAUUSD is permitted for live entries (got {SYMBOL})"
+            self._set_trade_permission(False, "SYMBOL_BLOCKED", [reason])
+            log.warning(reason)
+            self._write_state(
+                "SCANNING",
+                self._last_acc_info,
+                extra={"symbol": SYMBOL, "allowed_symbols": ["XAUUSD"]},
+            )
+            return
         self._set_trade_permission(
             False,
             "EVALUATING",
@@ -3155,6 +3165,13 @@ class GoldScalperLive:
         safety boundary immediately before the broker request.
         """
         async with self._entry_lock:
+            if str(SYMBOL).upper() != "XAUUSD":
+                return (
+                    None,
+                    [],
+                    "SYMBOL_BLOCKED",
+                    f"Only XAUUSD is permitted for live entries (got {SYMBOL})",
+                )
             active_entry = evaluate_active_entry(
                 decision,
                 symbol=SYMBOL,
