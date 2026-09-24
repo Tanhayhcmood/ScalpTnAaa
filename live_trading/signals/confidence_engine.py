@@ -41,45 +41,9 @@ def _cap(val: float, max_val: float) -> float:
 
 
 def _calc_smc_score(smc: SmcResult, candidate: str):
-    reasons = []
-    pts = 0.0
-    d = candidate
-
-    if smc.trend == ("BULLISH" if d == "BUY" else "BEARISH"):
-        pts += 4; reasons.append("Structural trend aligned")
-
-    aligned_bos = [b for b in smc.bos_signals if b.type == d]
-    if len(aligned_bos) >= 2:
-        pts += 7; reasons.append("Multiple BOS confirmed")
-    elif len(aligned_bos) == 1:
-        pts += 5; reasons.append("BOS confirmed")
-
-    last_choch = smc.choch_signals[-1] if smc.choch_signals else None
-    if last_choch and last_choch.type == d:
-        pts += 8; reasons.append("CHoCH (structural reversal) confirmed")
-
-    ob_pts = 0; ob_count = 0
-    for ob in smc.order_blocks:
-        if ob.type != ("BULLISH" if d == "BUY" else "BEARISH"): continue
-        if ob_count >= 2: break
-        body = abs(ob.close - ob.open)
-        rng  = max(ob.high - ob.low, 0.01)
-        ob_pts += 4 if body / rng >= 0.5 else 3
-        ob_count += 1
-    if ob_pts > 0:
-        pts += _cap(ob_pts, 8)
-        reasons.append(f"Order Block{'s ×' + str(ob_count) if ob_count > 1 else ''} in zone")
-
-    fvg_count = sum(1 for f in smc.fair_value_gaps
-                    if f.type == ("BULLISH" if d == "BUY" else "BEARISH"))
-    if fvg_count >= 2:   pts += 4; reasons.append("Multiple FVGs in direction")
-    elif fvg_count == 1: pts += 2; reasons.append("FVG in direction")
-
-    last_sweep = smc.liquidity_sweeps[-1] if smc.liquidity_sweeps else None
-    if last_sweep and last_sweep.type == ("BULLISH" if d == "BUY" else "BEARISH"):
-        pts += 4; reasons.append("Liquidity sweep confirmed")
-
-    return _cap(pts, 35), reasons
+    # SMC remains available on SmcResult for diagnostics, but cannot contribute
+    # to the entry confidence score.
+    return 0.0, []
 
 
 def _calc_trend_score(trend: TrendResult, candidate: str):

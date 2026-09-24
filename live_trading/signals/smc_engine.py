@@ -1,8 +1,9 @@
 """
 Smart Money Concepts Engine — BOS, CHoCH, Order Blocks, FVG, Liquidity
 Ported from smcEngine.ts
-This engine is self-contained: it only uses OHLCV input.
-Cross-engine combining (Wyckoff, PA, Trend) is done in decision_engine.py.
+This engine is self-contained and uses OHLCV input only. Its results are
+telemetry for logs and panels; they must not authorize entries or change
+confidence, sizing, stops, or targets.
 """
 from dataclasses import dataclass, field, replace
 from typing import List, Literal, Optional, Set
@@ -167,6 +168,7 @@ class SmcResult:
     equal_highs: List[SmcEqualLevel]
     equal_lows: List[SmcEqualLevel]
     mitigation_blocks: List[SmcMitigationBlock]
+    # Diagnostic fields only; never consume these for entry/confidence logic.
     smc_signal: Literal["BUY", "SELL", "NEUTRAL"]
     smc_score: float
 

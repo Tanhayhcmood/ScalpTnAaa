@@ -9,7 +9,6 @@ from live_trading.signals.smc_engine import (
     SmcResult,
     analyze_smc_structure,
     detect_order_block_fake_breakout,
-    get_latest_structure_event,
 )
 from live_trading.signals.wyckoff_engine import WyckoffResult, analyze_wyckoff
 from live_trading.signals.price_action_engine import PriceActionResult, analyze_price_action
@@ -235,25 +234,9 @@ def _candidate_direction(
     enabled_strategies = None,
 ) -> str:
     """Return the direction from the Trend engine only."""
-    enabled = {"trend"}
-    votes = {
-        "smc": smc.smc_signal,
-        "trend": (
-            "BUY" if trend.trend == "BULLISH" else
-            "SELL" if trend.trend == "BEARISH" else "NEUTRAL"
-        ),
-        "price_action": pa.pa_signal,
-        "wyckoff": wyckoff.wyckoff_signal,
-    }
-    votes = tuple(
-        vote for name, vote in votes.items()
-        if name in enabled
-    )
-    buy_count = sum(vote == "BUY" for vote in votes)
-    sell_count = sum(vote == "SELL" for vote in votes)
-    if buy_count > sell_count:
+    if trend.trend == "BULLISH":
         return "BUY"
-    if sell_count > buy_count:
+    if trend.trend == "BEARISH":
         return "SELL"
     return "NEUTRAL"
 
@@ -407,8 +390,8 @@ def run_decision_engine(
     # Price Action extension remains available in telemetry and confidence,
     # but a diagnostic engine cannot veto a Trend-authorized live entry.
 
-    # Entry filter — Trend-only live-entry authority. The other engines remain
-    # active for diagnostics and confidence scoring.
+    # Entry filter — Trend-only live-entry authority. SMC remains diagnostic;
+    # Price Action and Wyckoff retain their independent confidence components.
     is_range_regime = regime.regime == "RANGE"
     is_weak_range = (
         effective_regime_strength == "WEAK"
@@ -420,7 +403,7 @@ def run_decision_engine(
         1, max(1, int(effective_min_confirmations))
     )
     ef = apply_entry_filter(
-        smc_signal      = smc.smc_signal,
+        smc_signal      = "NEUTRAL",
         ema_trend       = trend.trend,
         pa_signal       = pa.pa_signal,
         wyckoff_signal  = wyckoff.wyckoff_signal,
@@ -430,7 +413,7 @@ def run_decision_engine(
         # entries. SMC, Price Action, and Wyckoff are diagnostic-only.
         require_smc_price_action_wyckoff = False,
         price_action_standalone=False,
-        enabled_strategies=ENABLED_STRATEGIES,
+        enabled_strategies=("trend",),
     )
     # The RANGE confirmation floor is mandatory even when the optional
     # structural filters (edge, sweep, reversal) are disabled.
@@ -557,13 +540,10 @@ def run_decision_engine(
         )
         return n
 
-    latest_structure = get_latest_structure_event(smc)
-    last_structure_bar = (latest_structure.bar_index
-                          if latest_structure is not None else None)
-    # Feed the newest BOS/CHoCH bar through the existing quality-filter slot
-    # so both event types share the same freshness gate.
+    # Keep the legacy structure argument empty so SMC cannot affect entry
+    # quality or freshness decisions.
     quality  = apply_quality_filter(candles, candidate, conf_result.confidence,
-                                    last_structure_bar, regime.adx, regime.atr_ratio,
+                                    None, regime.adx, regime.atr_ratio,
                                     allow_without_smc=_allow_without_smc_for_quality(
                                         ef,
                                         effective_min_confirmations,
@@ -589,26 +569,10 @@ def run_decision_engine(
     # Price Action location and extension checks remain visible through the
     # PA telemetry fields, but are not live-entry authority.
 
-    # Capital manager inputs
-    aligned_obs = [ob for ob in smc.order_blocks
-                   if ob.type == ("BULLISH" if candidate == "BUY" else "BEARISH")]
-    latest_ob = aligned_obs[-1] if aligned_obs else None
-
+    # SMC structure is telemetry only; stops and targets use ATR and the
+    # candle-derived RANGE levels, never SMC zones or structure.
     entry = last_candle.close
 
-    # H-1 FIX: use most-recent directionally-valid BOS price as the SL anchor,
-    # not the global max/min across all time.
-    # BUY SL anchor: most recent SELL-BOS price below entry (= broken swing low)
-    # SELL SL anchor: most recent BUY-BOS price above entry (= broken swing high)
-    sell_bos_below = [b.price for b in smc.bos_signals if b.type == "SELL" and b.price < entry]
-    buy_bos_above  = [b.price for b in smc.bos_signals if b.type == "BUY"  and b.price > entry]
-
-    # H-2 FIX: populate support/resistance from SMC equal levels (previously always None).
-    # Equal lows = institutional demand / support; equal highs = supply / resistance.
-    eq_support    = (smc.equal_lows[-1].price
-                     if smc.equal_lows  and smc.equal_lows[-1].price  < entry else None)
-    eq_resistance = (smc.equal_highs[-1].price
-                     if smc.equal_highs and smc.equal_highs[-1].price > entry else None)
     range_support = (
         range_context.support
         if range_context is not None and range_context.support < entry
@@ -631,12 +595,12 @@ def run_decision_engine(
             else risk_percent
         ),
         take_profit_rr=range_min_rr if regime.regime == "RANGE" else FIXED_TP_RR,
-        order_block_top=latest_ob.high if latest_ob else None,
-        order_block_bottom=latest_ob.low if latest_ob else None,
-        swing_high=buy_bos_above[-1]  if buy_bos_above  else None,
-        swing_low=sell_bos_below[-1]  if sell_bos_below else None,
-        support_level=range_support or eq_support,
-        resistance_level=range_resistance or eq_resistance,
+        order_block_top=None,
+        order_block_bottom=None,
+        swing_high=None,
+        swing_low=None,
+        support_level=range_support,
+        resistance_level=range_resistance,
         take_profit_level=(
             range_resistance if candidate == "BUY" else range_support
         ),
@@ -661,46 +625,6 @@ def run_decision_engine(
             reasoning=conf_result.reasoning + [stop_reason], trade_params=None,
             smc=smc, wyckoff=wyckoff, pa=pa, trend=trend,
             entry_filter=ef, divergence=divergence, dxy_signal=dxy_signal,
-            range_context=range_context,
-        )
-
-    # For ordinary trend entries the nearest equal high/low is a hard
-    # structural barrier even though the target remains the fixed 2R target.
-    # RANGE already supplies its own explicit target and R:R check, so it does
-    # not pass through this additional room gate.
-    structural_target = (
-        eq_resistance if candidate == "BUY" else eq_support
-    ) if regime.regime != "RANGE" else None
-    required_rr_for_room = regime.rules.min_rr
-    room_reason = _target_room_block_reason(
-        candidate,
-        trade_params.entry_price,
-        trade_params.stop_loss,
-        structural_target,
-        required_rr_for_room,
-        protective_atr,
-    )
-    if room_reason is not None:
-        return DecisionResult(
-            allowed=False,
-            direction=candidate,  # type: ignore
-            confidence=conf_result.confidence,
-            components=conf_result.components,
-            grade=conf_result.grade,
-            regime=regime.regime,
-            regime_label=regime.rules.label,
-            regime_rules=regime.rules,
-            quality_filter=quality,
-            blocked_reasons=[room_reason],
-            reasoning=conf_result.reasoning + [room_reason],
-            trade_params=None,
-            smc=smc,
-            wyckoff=wyckoff,
-            pa=pa,
-            trend=trend,
-            entry_filter=ef,
-            divergence=divergence,
-            dxy_signal=dxy_signal,
             range_context=range_context,
         )
 
