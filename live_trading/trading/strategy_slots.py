@@ -1,8 +1,8 @@
-"""One-open-position capacity for the single live strategy.
+"""Bounded position capacity for the single live strategy.
 
 Positions opened before strategy-slot tagging was introduced are treated as
 occupying every slot.  That fail-closed behavior prevents a legacy position
-from being duplicated while the robot cannot identify its owner.
+from being duplicated or scaled into while the robot cannot identify its owner.
 """
 
 from __future__ import annotations
@@ -94,6 +94,7 @@ def one_way_entry_allowed(
     return True, ""
 
 
+
 def strategy_slots_for_decision(decision) -> tuple[str, ...]:
     """Return the single live strategy slot claimed by a permitted decision."""
     entry_filter = getattr(decision, "entry_filter", None)
@@ -147,13 +148,31 @@ def occupied_strategy_slots(positions: Iterable[Mapping]) -> frozenset[str]:
     return frozenset(occupied)
 
 
+def _is_current_active_position(position: Mapping) -> bool:
+    """Return whether a position has the current strategy's exact tag.
+
+    Older positions may be mapped to the active slot by
+    ``strategy_slots_from_position`` for compatibility, but they must not be
+    treated as safe scale-in candidates because their original ownership is
+    uncertain.
+    """
+    comment = str(position.get("comment") or "")
+    if not comment and isinstance(position.get("_raw"), Mapping):
+        comment = str(position["_raw"].get("comment") or "")
+    match = _SLOT_PATTERN.search(comment)
+    return bool(
+        match
+        and match.group(1) == _SLOT_CODES[ACTIVE_STRATEGY_SLOT]
+    )
+
+
 def available_for_strategy_slots(
     positions: Iterable[Mapping],
     candidate_slots: Iterable[str],
     *,
     max_open_positions: int,
 ) -> tuple[bool, str]:
-    """Check total capacity and prevent duplicate ownership per strategy."""
+    """Check total capacity and permit only safe active-strategy scale-in."""
     position_list = list(positions)
     if len(position_list) >= max_open_positions:
         return False, f"Maximum open positions reached ({max_open_positions})"
@@ -164,10 +183,10 @@ def available_for_strategy_slots(
     if not candidates:
         return False, "No active strategy slot is attached to the permitted decision"
 
-    occupied = occupied_strategy_slots(position_list)
-    duplicate_slots = tuple(slot for slot in candidates if slot in occupied)
-    if duplicate_slots:
-        labels = ", ".join(_SLOT_CODES[slot] for slot in duplicate_slots)
-        return False, f"Strategy slot already has an open position: {labels}"
+    if any(not _is_current_active_position(position) for position in position_list):
+        return False, (
+            "Cannot safely scale in while a legacy or untagged "
+            "position is open"
+        )
 
     return True, ""

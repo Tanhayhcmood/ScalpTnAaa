@@ -81,15 +81,29 @@ def test_max_open_positions_still_blocks_a_trend_only_decision_at_four():
     assert reason == "Maximum open positions reached (4)"
 
 
-def test_same_strategy_cannot_open_a_second_position():
+def test_same_strategy_can_scale_in_within_capacity():
     positions = [{"comment": "GSPv4|S=XVTB"}]
 
     allowed, reason = available_for_strategy_slots(
-        positions, (ACTIVE_STRATEGY_SLOT,), max_open_positions=4
+        positions, (ACTIVE_STRATEGY_SLOT,), max_open_positions=5
+    )
+
+    assert allowed is True
+    assert reason == ""
+
+
+def test_same_strategy_scale_in_stops_at_five_positions():
+    positions = [
+        {"comment": f"GSPv4|S=XVTB|position={index}"}
+        for index in range(5)
+    ]
+
+    allowed, reason = available_for_strategy_slots(
+        positions, (ACTIVE_STRATEGY_SLOT,), max_open_positions=5
     )
 
     assert allowed is False
-    assert "XVTB" in reason
+    assert reason == "Maximum open positions reached (5)"
 
 
 def test_legacy_strategy_position_occupies_the_active_slot():

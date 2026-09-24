@@ -113,13 +113,13 @@ services:
       - key: MAX_RANGE_TRADES_PER_SESSION
         value: "2"
       - key: MAX_OPEN_TRADES
-        value: "4"
+        value: "5"
       # Directional scalping is one-way by default. Opposite positions are
       # blocked even when they would occupy different strategy slots.
       - key: ALLOW_HEDGED_POSITIONS
         value: "false"
-      # One concurrent position per enabled strategy slot. Legacy untagged
-      # positions fail closed and occupy all known slots.
+      # Bounded scale-in is allowed for current XVTB-tagged positions up to
+      # MAX_OPEN_TRADES. Legacy or untagged positions still fail closed.
       # Price Action may authorize the strategy vote alone. All independent
       # confidence, quality, regime, MTF, and risk gates stay active.
       - key: REQUIRE_PRICE_ACTION

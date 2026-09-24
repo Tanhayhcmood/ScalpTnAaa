@@ -320,9 +320,10 @@ QUALITY_ADX_MIN   = _float("QUALITY_ADX_MIN",    12.0, lo=5.0,  hi=40.0)
 # 300 bars on M5 is roughly 25 hours and is too permissive for scalping;
 # the default 24 closed bars keeps BOS/CHoCH actionable for about two hours.
 STRUCTURE_MAX_AGE_BARS = _int("STRUCTURE_MAX_AGE_BARS", 24, lo=3, hi=100)
-# One concurrent position is allowed per strategy slot. Legacy SMC/Wyckoff
-# slots remain understood so existing positions fail closed during transition.
-MAX_OPEN_TRADES   = _int("MAX_OPEN_TRADES", 4, lo=1, hi=10)
+# Allow bounded scale-in for the active strategy while keeping the aggregate
+# position cap explicit. Legacy SMC/Wyckoff slots still fail closed during
+# transition, and the live loop retains its one-way and within-tick guards.
+MAX_OPEN_TRADES   = _int("MAX_OPEN_TRADES", 5, lo=1, hi=10)
 # The account is directional by default. Strategy slots may still be used for
 # scale-in decisions, but an opposite-side position is never opened while a
 # position on this symbol is live unless the operator explicitly opts into

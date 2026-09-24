@@ -114,9 +114,9 @@ class TestConfigDefaults:
         cfg = _reload_config({})
         assert cfg.PRICE_ACTION_STANDALONE is False
 
-    def test_max_open_trades_default_is_one_per_strategy_slot(self):
+    def test_max_open_trades_default_is_five_for_bounded_scale_in(self):
         cfg = _reload_config({})
-        assert cfg.MAX_OPEN_TRADES == 4
+        assert cfg.MAX_OPEN_TRADES == 5
         assert isinstance(cfg.MAX_OPEN_TRADES, int)
 
     def test_daily_loss_limit_default(self):

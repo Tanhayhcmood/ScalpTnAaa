@@ -126,7 +126,7 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `RANGE_RISK_PERCENT` | No | `0.25` | Risk per RANGE trade (% of balance) |
 | `RANGE_ENTRY_FILTERS_ENABLED` | No | `true` | Require RANGE edge, liquidity sweep, reversal, and two-confirmation validation |
 | `MAX_RANGE_TRADES_PER_SESSION` | No | `2` | Successful RANGE entries allowed per UTC session |
-| `MAX_OPEN_TRADES` | No | `4` | Maximum simultaneous open positions (one per strategy slot) |
+| `MAX_OPEN_TRADES` | No | `5` | Maximum simultaneous open positions for bounded active-strategy scale-in |
 | `ALLOW_HEDGED_POSITIONS` | No | `false` | Allow opposite BUY/SELL positions on the same symbol; keep disabled for one-way scalping |
 | `CONF_HARD_MIN` | No | `35` | Balanced confidence-engine hard floor |
 | `MTF_ENABLED` | No | `true` | Enable the higher-timeframe negative-only opposition check |
