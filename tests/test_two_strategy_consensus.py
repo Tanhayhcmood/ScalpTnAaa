@@ -14,7 +14,7 @@ def test_trend_alone_can_open_an_entry():
         ema_trend="BULLISH",
         pa_signal="NEUTRAL",
         wyckoff_signal="NEUTRAL",
-        min_confirmations=2,
+        min_confirmations=1,
     )
 
     assert result.allowed is True
@@ -42,11 +42,11 @@ def test_diagnostic_engines_do_not_authorize_entries_without_trend():
     assert result.wyckoff is False
 
 
-def test_diagnostic_disagreement_does_not_veto_trend():
+def test_smc_and_wyckoff_disagreement_does_not_veto_trend_pa_vote():
     result = apply_entry_filter(
         smc_signal="BUY",
         ema_trend="BULLISH",
-        pa_signal="SELL",
+        pa_signal="BUY",
         wyckoff_signal="SELL",
         min_confirmations=2,
     )
@@ -84,8 +84,8 @@ def test_candidate_direction_uses_the_consensus_not_smc_alone():
 def test_candidate_direction_ignores_diagnostic_votes():
     result = _candidate_direction(
         SimpleNamespace(smc_signal="BUY"),
-        SimpleNamespace(wyckoff_signal="SELL"),
-        SimpleNamespace(pa_signal="BUY"),
+        SimpleNamespace(wyckoff_signal="BUY"),
+        SimpleNamespace(pa_signal="SELL"),
         SimpleNamespace(trend="BEARISH"),
     )
 

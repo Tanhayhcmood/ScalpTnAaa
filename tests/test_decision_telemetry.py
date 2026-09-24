@@ -2,8 +2,12 @@
 
 from types import SimpleNamespace
 
-from live_trading.signals.decision_engine import _make_neutral
-from live_trading.signals.entry_filter import EntryFilterResult
+from live_trading.signals.decision_engine import (
+    _candidate_direction,
+    _make_neutral,
+    describe_strategy,
+)
+from live_trading.signals.entry_filter import EntryFilterResult, apply_entry_filter
 from live_trading.signals.market_regime import REGIME_RULES, RegimeResult
 from live_trading.signals.gold_engine import OHLCV
 
@@ -114,5 +118,64 @@ def test_blocked_decision_telemetry_reports_aligned_confirmations():
     assert telemetry["confirmations"] == [
         "Trend (EMA alignment)",
     ]
-    assert telemetry["confirmation_total"] == 1
-    assert telemetry["consensus"]["total"] == 1
+    assert telemetry["confirmation_total"] == 2
+    assert telemetry["consensus"]["total"] == 2
+
+
+def test_consensus_excludes_smc_and_wyckoff_from_trend_pa_entry_vote():
+    smc, wyckoff, pa, trend = _signals()
+    smc.smc_signal = "SELL"
+    wyckoff.wyckoff_signal = "SELL"
+    pa.pa_signal = "BUY"
+    trend.trend = "BULLISH"
+
+    candidate = _candidate_direction(smc, wyckoff, pa, trend)
+    actual = apply_entry_filter(
+        smc_signal=smc.smc_signal,
+        ema_trend=trend.trend,
+        pa_signal=pa.pa_signal,
+        wyckoff_signal=wyckoff.wyckoff_signal,
+        min_confirmations=2,
+    )
+    diagnostics_neutral = apply_entry_filter(
+        smc_signal="NEUTRAL",
+        ema_trend=trend.trend,
+        pa_signal=pa.pa_signal,
+        wyckoff_signal="NEUTRAL",
+        min_confirmations=2,
+    )
+
+    assert candidate == "BUY"
+    assert actual == diagnostics_neutral
+    assert actual.allowed is True
+    assert actual.direction == "BUY"
+    assert actual.confirmation_count == 2
+    assert actual.trend is True
+    assert actual.price_action is True
+    assert actual.smc is False
+    assert actual.wyckoff is False
+
+    decision = _make_neutral(
+        smc,
+        wyckoff,
+        pa,
+        trend,
+        ["telemetry-only test"],
+        entry_filter=actual,
+        direction=candidate,
+    )
+    consensus = describe_strategy(decision)["consensus"]
+
+    assert consensus["candidate"] == "BUY"
+    assert consensus["engines"] == {"trend": "BUY", "price_action": "BUY"}
+    assert consensus["confirmed"] == 2
+    assert consensus["total"] == 2
+    assert consensus["allowed"] is True
+    assert consensus["informational_engines"] == {
+        "smc": "SELL",
+        "wyckoff": "SELL",
+    }
+    assert consensus["informational_only"] == {
+        "engines": ["smc", "wyckoff"],
+        "excluded_from": ["candidate", "confirmed", "allowed", "total"],
+    }

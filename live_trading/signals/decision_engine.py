@@ -16,7 +16,11 @@ from live_trading.signals.trend_engine import TrendResult, analyze_trend
 from live_trading.signals.market_regime import RegimeResult, RegimeEntryRules, detect_market_regime
 from live_trading.signals.confidence_engine import ConfidenceResult, ConfidenceComponents, calc_confidence
 from live_trading.signals.quality_filter import QualityFilterResult, apply_quality_filter, get_session_quality
-from live_trading.signals.entry_filter import apply_entry_filter, EntryFilterResult
+from live_trading.signals.entry_filter import (
+    ENTRY_STRATEGIES,
+    apply_entry_filter,
+    EntryFilterResult,
+)
 from live_trading.signals.range_strategy import RangeContext, evaluate_range_entry
 from live_trading.signals.divergence_engine import analyze_divergence, DivergenceResult
 from live_trading.risk.capital_manager import (
@@ -52,9 +56,8 @@ from live_trading.config import (
 # 1.3 = profitable in expectancy even at 45% win rate (1.3 × 0.45 > 0.55).
 CONF_MARGINAL_RR = 1.3
 
-# Trend is the only engine with live-entry authority. SMC, Price Action, and
-# Wyckoff still run for diagnostics/telemetry/confidence, but never participate
-# in direction selection, confirmation counting, or mandatory entry gates.
+# Trend selects the candidate direction; Price Action can confirm or oppose it.
+# SMC and Wyckoff remain available for diagnostics/confidence but never vote.
 # RANGE keeps its separate structural safeguards.
 _CHOPPY_REGIMES = {"ACCUMULATION", "DISTRIBUTION", "HIGH_VOLATILITY"}
 
@@ -211,9 +214,8 @@ class DecisionResult:
     wyckoff: WyckoffResult
     pa:     PriceActionResult
     trend:  TrendResult
-    # Additive, optional — which of the 4 independent engines (SMC/Trend/
-    # PriceAction/Wyckoff) voted for this trade's direction. None on the
-    # early "no SMC signal" path, where the vote was never computed.
+    # Additive, optional — which eligible engines (Trend/Price Action)
+    # confirmed the candidate. SMC and Wyckoff are diagnostic-only.
     # Existing callers that construct/consume DecisionResult are unaffected
     # since this has a default and nothing reads it unless it asks for it.
     entry_filter:    Optional[EntryFilterResult] = None
@@ -233,12 +235,18 @@ def _candidate_direction(
     price_action_standalone: bool = False,
     enabled_strategies = None,
 ) -> str:
-    """Return the direction from the Trend engine only."""
+    """Use Trend for direction; an opposing PA vote makes it a tie."""
     if trend.trend == "BULLISH":
-        return "BUY"
-    if trend.trend == "BEARISH":
-        return "SELL"
-    return "NEUTRAL"
+        trend_direction = "BUY"
+    elif trend.trend == "BEARISH":
+        trend_direction = "SELL"
+    else:
+        return "NEUTRAL"
+
+    pa_direction = pa.pa_signal
+    if pa_direction in {"BUY", "SELL"} and pa_direction != trend_direction:
+        return "NEUTRAL"
+    return trend_direction
 
 
 def _resolve_entry_policy(
@@ -397,8 +405,8 @@ def run_decision_engine(
         effective_regime_strength == "WEAK"
         and (is_range_regime or policy_regime == "RANGE")
     )
-    # The Trend-only policy uses the configured single-engine floor for both
-    # ordinary and RANGE entries. Legacy callers cannot raise it above one.
+    # Keep the one-vote minimum used by the live policy; an opposing Trend/PA
+    # pair has no unique candidate and is rejected before reaching this gate.
     effective_min_confirmations = min(
         1, max(1, int(effective_min_confirmations))
     )
@@ -409,11 +417,10 @@ def run_decision_engine(
         wyckoff_signal  = wyckoff.wyckoff_signal,
         min_confirmations = effective_min_confirmations,
         require_price_action = require_price_action and not is_range_regime,
-        # Legacy multi-engine options are intentionally ignored for live
-        # entries. SMC, Price Action, and Wyckoff are diagnostic-only.
+        # Legacy multi-engine options cannot re-enable SMC or Wyckoff voting.
         require_smc_price_action_wyckoff = False,
         price_action_standalone=False,
-        enabled_strategies=("trend",),
+        enabled_strategies=ENTRY_STRATEGIES,
     )
     # The RANGE confirmation floor is mandatory even when the optional
     # structural filters (edge, sweep, reversal) are disabled.
@@ -433,12 +440,10 @@ def run_decision_engine(
             candles=candles,
             )
     elif not is_range_regime and not ef.allowed:
-        votes = (f"SMC={'✓' if ef.smc else '✗'}  "
-                 f"Trend={'✓' if ef.trend else '✗'}  "
-                 f"PA={'✓' if ef.price_action else '✗'}  "
-                 f"Wyckoff={'✓' if ef.wyckoff else '✗'}")
+        votes = (f"Trend={'✓' if ef.trend else '✗'}  "
+                 f"PA={'✓' if ef.price_action else '✗'}")
         reason = (
-            f"Entry filter: Trend confirmation required — {votes} "
+            f"Entry filter: Trend/Price Action consensus required — {votes} "
             f"[regime={regime.regime}]"
         )
         return _make_neutral(
@@ -734,15 +739,13 @@ def describe_strategy(decision: "DecisionResult") -> dict:
     """
     ef = decision.entry_filter
     _ENGINE_NAMES = {
-        "smc":          "Smart Money Concepts (structure)",
         "trend":        "Trend (EMA alignment)",
         "price_action": "Price Action",
-        "wyckoff":      "Wyckoff",
     }
     if ef is not None:
         confirmations = [
             _ENGINE_NAMES[key]
-            for key in ("trend",)
+            for key in ENTRY_STRATEGIES
             if getattr(ef, key)
         ]
         confirmation_count = ef.confirmation_count
@@ -805,7 +808,7 @@ def describe_strategy(decision: "DecisionResult") -> dict:
         "regime_label":        decision.regime_label,
         "confirmations":       confirmations,
         "confirmation_count":  confirmation_count,
-        "confirmation_total":  1,
+        "confirmation_total":  len(ENTRY_STRATEGIES),
         # Top signal-level reasons behind the confidence score (e.g. "BOS
         # confirmed", "Strong EMA alignment (50/100/200)", "Spring confirmed").
         "signals":             list(decision.reasoning[:6]),
@@ -815,14 +818,20 @@ def describe_strategy(decision: "DecisionResult") -> dict:
         "consensus": {
             "candidate": decision.direction,
             "engines": {
-                "smc": decision.smc.smc_signal,
                 "trend": trend_vote,
                 "price_action": pa.pa_signal,
-                "wyckoff": decision.wyckoff.wyckoff_signal,
             },
             "confirmed": confirmation_count,
-            "total": 1,
+            "total": len(ENTRY_STRATEGIES),
             "allowed": bool(ef.allowed) if ef is not None else False,
+            "informational_engines": {
+                "smc": decision.smc.smc_signal,
+                "wyckoff": decision.wyckoff.wyckoff_signal,
+            },
+            "informational_only": {
+                "engines": ["smc", "wyckoff"],
+                "excluded_from": ["candidate", "confirmed", "allowed", "total"],
+            },
         },
         "confidence_stage": {
             "total": round(components.total, 1),

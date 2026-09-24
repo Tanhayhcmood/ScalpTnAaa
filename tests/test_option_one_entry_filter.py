@@ -37,7 +37,7 @@ def test_legacy_option_cannot_override_trend_only_authorization():
 
     assert result.allowed is True
     assert result.direction == "BUY"
-    assert result.confirmation_count == 1
+    assert result.confirmation_count == 2
 
 
 def test_trend_can_authorize_without_price_action():
@@ -46,7 +46,7 @@ def test_trend_can_authorize_without_price_action():
         ema_trend="BEARISH",
         pa_signal="NEUTRAL",
         wyckoff_signal="SELL",
-        min_confirmations=2,
+        min_confirmations=1,
         require_smc_price_action_wyckoff=True,
     )
 
@@ -94,7 +94,7 @@ def test_trend_only_authorization_reaches_quality_gate_without_smc():
         ema_trend="BULLISH",
         pa_signal="NEUTRAL",
         wyckoff_signal="NEUTRAL",
-        min_confirmations=2,
+        min_confirmations=1,
         price_action_standalone=True,
     )
 
