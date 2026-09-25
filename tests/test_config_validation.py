@@ -52,19 +52,19 @@ class TestConfigDefaults:
         assert isinstance(cfg.RISK_PERCENT, float)
 
     def test_min_confirmations_default(self):
-        """Ordinary entries require the single live entry engine."""
+        """Ordinary entries default to both active voters."""
         cfg = _reload_config({})
-        assert cfg.MIN_CONFIRMATIONS == 1
+        assert cfg.MIN_CONFIRMATIONS == 2
         assert isinstance(cfg.MIN_CONFIRMATIONS, int)
 
-    def test_live_entry_strategies_are_fixed_to_trend_only(self):
+    def test_live_entry_strategies_are_fixed_to_trend_and_price_action(self):
         cfg = _reload_config({"ENABLED_STRATEGIES": "smc,trend,price_action,wyckoff"})
-        assert cfg.LIVE_ENTRY_STRATEGIES == ("trend",)
-        assert cfg.ENABLED_STRATEGIES == ("trend",)
+        assert cfg.LIVE_ENTRY_STRATEGIES == ("trend", "price_action")
+        assert cfg.ENABLED_STRATEGIES == ("trend", "price_action")
 
     def test_trend_min_confirmations_default(self):
         cfg = _reload_config({})
-        assert cfg.TREND_MIN_CONFIRMATIONS == 1
+        assert cfg.TREND_MIN_CONFIRMATIONS == 2
         assert isinstance(cfg.TREND_MIN_CONFIRMATIONS, int)
 
     def test_protective_sl_atr_defaults(self):
@@ -81,11 +81,11 @@ class TestConfigDefaults:
         assert cfg.TIMEFRAME == "5m"
         assert cfg.TRADE_TIMEFRAMES == ["5m"]
 
-    def test_confidence_threshold_defaults_are_forty_percent(self):
+    def test_regime_and_hard_confidence_threshold_defaults(self):
         cfg = _reload_config({})
         assert cfg.NORMAL_MIN_CONFIDENCE == 40.0
         assert cfg.RANGE_MIN_CONFIDENCE == 40.0
-        assert cfg.CONF_HARD_MIN == 40.0
+        assert cfg.CONF_HARD_MIN == 30.0
         assert cfg.OPTION_TWO_MIN_CONFIDENCE == 40.0
 
     def test_range_min_confirmations_default(self):
@@ -93,17 +93,17 @@ class TestConfigDefaults:
         assert cfg.RANGE_MIN_CONFIRMATIONS == 1
         assert isinstance(cfg.RANGE_MIN_CONFIRMATIONS, int)
 
-    def test_confirmation_floors_are_capped_at_one_engine(self):
+    def test_confirmation_floors_are_capped_at_two_live_engines(self):
         cfg = _reload_config({
             "MIN_CONFIRMATIONS": "4",
             "TREND_MIN_CONFIRMATIONS": "3",
             "RANGE_MIN_CONFIRMATIONS": "4",
             "RANGE_WEAK_MIN_CONFIRMATIONS": "3",
         })
-        assert cfg.MIN_CONFIRMATIONS == 1
-        assert cfg.TREND_MIN_CONFIRMATIONS == 1
-        assert cfg.RANGE_MIN_CONFIRMATIONS == 1
-        assert cfg.RANGE_WEAK_MIN_CONFIRMATIONS == 1
+        assert cfg.MIN_CONFIRMATIONS == 2
+        assert cfg.TREND_MIN_CONFIRMATIONS == 2
+        assert cfg.RANGE_MIN_CONFIRMATIONS == 2
+        assert cfg.RANGE_WEAK_MIN_CONFIRMATIONS == 2
 
     def test_quality_adx_min_default_is_balanced(self):
         cfg = _reload_config({})

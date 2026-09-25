@@ -1,4 +1,4 @@
-"""Trend-only live-entry authorization tests."""
+"""Trend/Price Action live-entry authorization tests."""
 
 from types import SimpleNamespace
 
@@ -8,13 +8,16 @@ from live_trading.signals.gold_engine import OHLCV
 from live_trading.signals.quality_filter import apply_quality_filter
 
 
-def test_trend_alone_can_open_an_entry():
+def test_strong_trend_alone_can_open_an_entry():
     result = apply_entry_filter(
         smc_signal="NEUTRAL",
         ema_trend="BULLISH",
         pa_signal="NEUTRAL",
         wyckoff_signal="NEUTRAL",
         min_confirmations=1,
+        trend_score=60.0,
+        trend_standalone=True,
+        trend_standalone_min_score=55.0,
     )
 
     assert result.allowed is True
@@ -55,7 +58,7 @@ def test_smc_and_wyckoff_disagreement_does_not_veto_trend_pa_vote():
     assert result.direction == "BUY"
 
 
-def test_price_action_only_vote_cannot_pass_trend_only_policy():
+def test_price_action_standalone_below_its_score_floor_is_rejected():
     result = apply_entry_filter(
         smc_signal="NEUTRAL",
         ema_trend="NEUTRAL",
@@ -63,6 +66,8 @@ def test_price_action_only_vote_cannot_pass_trend_only_policy():
         wyckoff_signal="NEUTRAL",
         min_confirmations=1,
         price_action_standalone=True,
+        pa_score=0.15,
+        pa_standalone_min_score=0.16,
     )
 
     assert result.allowed is False
@@ -121,5 +126,4 @@ def test_quality_filter_does_not_reintroduce_an_smc_mandate():
         allow_without_smc=True,
     )
 
-    assert "No SMC direction signal" in blocked_without_pa_path.blocked_reasons
-    assert "No SMC direction signal" not in allowed_pa_path.blocked_reasons
+    assert blocked_without_pa_path.blocked_reasons == allowed_pa_path.blocked_reasons

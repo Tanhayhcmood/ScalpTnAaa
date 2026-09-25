@@ -40,7 +40,7 @@ def test_legacy_option_cannot_override_trend_only_authorization():
     assert result.confirmation_count == 2
 
 
-def test_trend_can_authorize_without_price_action():
+def test_strong_trend_can_authorize_without_price_action():
     result = apply_entry_filter(
         smc_signal="SELL",
         ema_trend="BEARISH",
@@ -48,6 +48,9 @@ def test_trend_can_authorize_without_price_action():
         wyckoff_signal="SELL",
         min_confirmations=1,
         require_smc_price_action_wyckoff=True,
+        trend_score=-60.0,
+        trend_standalone=True,
+        trend_standalone_min_score=55.0,
     )
 
     assert result.allowed is True

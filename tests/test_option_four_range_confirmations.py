@@ -108,4 +108,4 @@ def test_weak_range_accepts_single_trend_vote():
 def test_non_range_regime_keeps_global_confirmation_setting():
     assert _effective_min_confirmations(
         2, "WEAK_TREND_BULL", False, strength="WEAK"
-    ) == 1
+    ) == 2

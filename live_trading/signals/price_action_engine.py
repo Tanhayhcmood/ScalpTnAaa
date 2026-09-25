@@ -1,11 +1,14 @@
 """
 Price Action Engine — Patterns, S/R Levels, Breakouts
-Ported from priceActionEngine.ts — confirmation only.
+Ported from priceActionEngine.ts — signal confirmation and standalone paths.
 """
 from dataclasses import dataclass, replace
 from typing import List, Literal
 from live_trading.signals.gold_engine import OHLCV
-from live_trading.config import PA_MAX_BREAKOUT_EXTENSION_ATR
+from live_trading.config import (
+    PA_MAX_BREAKOUT_EXTENSION_ATR,
+    PA_STANDALONE_MIN_SCORE,
+)
 
 
 @dataclass
@@ -406,13 +409,20 @@ def _compute_pa_signal(
         or (strong_bear and (near_resist or near_supply))
     )
 
-    # A one-point breakout/pullback trigger is allowed at ~15% of the
-    # diagnostic ceiling; this is intentionally lower than the old 30% score
-    # threshold, which made a standalone valid engulfing (1.5/5.3 = 28%) and
-    # many legitimate continuation setups NEUTRAL.
-    if buy > sell and buy_trigger and buy >= 1.0 and score >= 0.15:
+    # A clear engulfing, valid breakout, or inside-bar breakout remains
+    # directional even below the standalone score floor. Other triggers use
+    # the configured floor, now below the old 0.24 level.
+    clear_buy_trigger = bull_engulf or vbull or bull_inside
+    clear_sell_trigger = bear_engulf or vbear or bear_inside
+    if (
+        buy > sell and buy_trigger and buy >= 1.0
+        and (score >= PA_STANDALONE_MIN_SCORE or clear_buy_trigger)
+    ):
         signal = "BUY"
-    elif sell > buy and sell_trigger and sell >= 1.0 and score >= 0.15:
+    elif (
+        sell > buy and sell_trigger and sell >= 1.0
+        and (score >= PA_STANDALONE_MIN_SCORE or clear_sell_trigger)
+    ):
         signal = "SELL"
     else:
         signal = "NEUTRAL"

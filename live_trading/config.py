@@ -91,22 +91,21 @@ def _strategy_list(name: str, default: str) -> tuple[str, ...]:
     return strategies
 
 
-# Live entries are intentionally authorized by Trend only. Price Action, SMC,
-# and Wyckoff continue to run for diagnostics, telemetry, and confidence
-# scoring, but their signals must never authorize or veto a live entry.
-LIVE_ENTRY_STRATEGIES = ("trend",)
+# Live entries use Trend and Price Action. SMC and Wyckoff continue to run for
+# diagnostics and telemetry, but their signals never authorize or veto entries.
+LIVE_ENTRY_STRATEGIES = ("trend", "price_action")
 
 
 def _entry_confirmation_floor(name: str, default: int = 1) -> int:
-    """Read a confirmation setting without allowing a multi-engine floor.
+    """Read a confirmation setting without allowing diagnostic-engine votes.
 
     Render may retain an older environment value after a deployment. Capping
-    here keeps the Trend-only policy authoritative even when that happens.
+    here keeps the Trend/Price Action policy authoritative even when that happens.
     """
     value = _int(name, default, lo=1, hi=4)
     if value > len(LIVE_ENTRY_STRATEGIES):
         print(
-            f"WARNING: {name}={value} exceeds the Trend-only live-entry "
+            f"WARNING: {name}={value} exceeds the Trend/Price Action live-entry "
             f"policy; using {len(LIVE_ENTRY_STRATEGIES)} instead.",
             file=sys.stderr,
         )
@@ -248,13 +247,15 @@ RISK_PERCENT      = _float("RISK_PERCENT",      1.0,  lo=0.01, hi=10.0)
 # both live entry modes.
 NORMAL_MIN_CONFIDENCE = _float("NORMAL_MIN_CONFIDENCE", 40.0, lo=0.0, hi=100.0)
 RANGE_MIN_CONFIDENCE  = _float("RANGE_MIN_CONFIDENCE",  40.0, lo=0.0, hi=100.0)
-# Ordinary entries require the single authorized Trend engine.
+# Ordinary entries use Trend and Price Action. A single-engine entry must
+# separately pass its enabled standalone policy and score threshold.
 # RANGE has its own confirmation floor below, independent of
 # TREND_MIN_CONFIRMATIONS and the ordinary entry policy.
-MIN_CONFIRMATIONS = _entry_confirmation_floor("MIN_CONFIRMATIONS")
-# A Trend-aligned ordinary entry has its own compatibility setting, capped to
-# the single authorized engine.
-TREND_MIN_CONFIRMATIONS = _entry_confirmation_floor("TREND_MIN_CONFIRMATIONS")
+MIN_CONFIRMATIONS = _entry_confirmation_floor("MIN_CONFIRMATIONS", default=2)
+# A Trend-aligned ordinary entry has its own compatibility setting.
+TREND_MIN_CONFIRMATIONS = _entry_confirmation_floor(
+    "TREND_MIN_CONFIRMATIONS", default=2
+)
 # Dedicated RANGE playbook. Its confirmation floor is intentionally separate
 # from both MIN_CONFIRMATIONS and TREND_MIN_CONFIRMATIONS so RANGE can use a
 # lighter vote requirement without changing ordinary or TREND entries.
@@ -282,14 +283,23 @@ RANGE_ENTRY_FILTERS_ENABLED = os.getenv(
     "RANGE_ENTRY_FILTERS_ENABLED", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
 MAX_RANGE_TRADES_PER_SESSION = _int("MAX_RANGE_TRADES_PER_SESSION", 2, lo=1, hi=20)
-# Deprecated compatibility setting. Price Action is diagnostic-only and this
-# flag no longer authorizes a live entry.
+# When enabled, a clear Price Action signal may authorize a standalone entry.
 PRICE_ACTION_STANDALONE = os.getenv(
     "PRICE_ACTION_STANDALONE", "false"
 ).strip().lower() in {"1", "true", "yes", "on"}
-# Retained for compatibility/telemetry; it no longer controls authorization.
+# Standalone PA entries still require a directional signal and this minimum
+# score; clear engulfing, breakout, and inside-bar triggers remain directional
+# below it.
 PA_STANDALONE_MIN_SCORE = _float(
-    "PA_STANDALONE_MIN_SCORE", 0.24, lo=0.15, hi=1.0
+    "PA_STANDALONE_MIN_SCORE", 0.16, lo=0.15, hi=1.0
+)
+# A Trend-only entry is available only when the signed Trend score is strong
+# and aligned with its direction.
+TREND_STANDALONE = os.getenv(
+    "TREND_STANDALONE", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+TREND_STANDALONE_MIN_SCORE = _float(
+    "TREND_STANDALONE_MIN_SCORE", 55.0, lo=0.0, hi=100.0
 )
 # A closed-candle breakout that has already travelled this far beyond its
 # trigger level is not chased at market. The strategy waits for a retest on a
@@ -309,10 +319,9 @@ REQUIRE_SMC_PRICE_ACTION_WYCKOFF = os.getenv(
     "REQUIRE_SMC_PRICE_ACTION_WYCKOFF", "false"
 ).strip().lower() in {"1", "true", "yes", "on"}
 # CONF_HARD_MIN is the absolute confidence floor shared by normal and RANGE
-# entries. 40% is the safe default; operators can explicitly set a lower floor
-# for controlled testing while the MTF, R:R, quality, broker, and risk gates
-# remain active.
-CONF_HARD_MIN     = _float("CONF_HARD_MIN",      40.0, lo=0.0, hi=100.0)
+# entries. The floor is 30%; independent quality and risk gates remain active.
+# MTF, R:R, quality, broker, and risk gates remain active.
+CONF_HARD_MIN     = _float("CONF_HARD_MIN",      30.0, lo=0.0, hi=100.0)
 # QUALITY_ADX_MIN: minimum ADX value required to confirm usable momentum.
 # 12 blocks very weak/choppy entries without requiring a fully developed trend.
 QUALITY_ADX_MIN   = _float("QUALITY_ADX_MIN",    12.0, lo=5.0,  hi=40.0)

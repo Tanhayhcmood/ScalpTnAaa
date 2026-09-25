@@ -39,8 +39,13 @@ def apply_entry_filter(
     require_smc_price_action_wyckoff: bool = False,
     price_action_standalone: bool = False,
     enabled_strategies: Iterable[str] | None = None,
+    trend_score: float = 0.0,
+    trend_standalone: bool = False,
+    trend_standalone_min_score: float = 55.0,
+    pa_score: float = 0.0,
+    pa_standalone_min_score: float = 0.16,
 ) -> EntryFilterResult:
-    """Allow an entry from Trend/Price Action votes only.
+    """Allow aligned Trend/Price Action votes or an explicitly strong standalone.
 
     The legacy policy arguments remain in the signature for callers that have
     not migrated yet, but they cannot re-enable diagnostic engines as live
@@ -71,8 +76,29 @@ def apply_entry_filter(
     }
     direction = votes["trend"]
     pa_direction = votes["price_action"]
+
+    try:
+        numeric_trend_score = float(trend_score)
+    except (TypeError, ValueError):
+        numeric_trend_score = 0.0
+    try:
+        numeric_pa_score = float(pa_score)
+    except (TypeError, ValueError):
+        numeric_pa_score = 0.0
+
+    pa_standalone_ok = (
+        price_action_standalone
+        and direction == "NEUTRAL"
+        and pa_direction in {"BUY", "SELL"}
+        and numeric_pa_score >= pa_standalone_min_score
+    )
+    if direction == "NEUTRAL" and pa_standalone_ok:
+        direction = pa_direction
+
     if direction == "NEUTRAL" or (
-        pa_direction in {"BUY", "SELL"} and pa_direction != direction
+        pa_direction in {"BUY", "SELL"}
+        and votes["trend"] in {"BUY", "SELL"}
+        and pa_direction != votes["trend"]
     ):
         return EntryFilterResult(
             allowed=False,
@@ -90,9 +116,28 @@ def apply_entry_filter(
     pa_ok = votes["price_action"] == direction
     wyc_ok = votes["wyckoff"] == direction
 
-    # Only Trend and Price Action participate in live-entry authorization.
-    # Legacy SMC/Wyckoff requirements remain intentionally ignored.
-    allowed = count >= required_confirmations
+    aligned_trend_score = (
+        numeric_trend_score >= trend_standalone_min_score
+        if direction == "BUY"
+        else numeric_trend_score <= -trend_standalone_min_score
+    )
+    trend_standalone_ok = (
+        trend_standalone
+        and trend_ok
+        and pa_direction == "NEUTRAL"
+        and aligned_trend_score
+    )
+
+    # A one-vote entry can only use one of the explicit standalone paths.
+    # SMC and Wyckoff remain excluded from both vote counts and authorization.
+    allowed = (
+        (
+            count >= required_confirmations
+            and (count > 1 or pa_standalone_ok or trend_standalone_ok)
+        )
+        or pa_standalone_ok
+        or trend_standalone_ok
+    )
 
     return EntryFilterResult(
         allowed=allowed,

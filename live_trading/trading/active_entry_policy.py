@@ -51,8 +51,9 @@ def evaluate_active_entry(
     """Return whether ``decision`` belongs to the one live strategy.
 
     This is deliberately stricter than the legacy multi-engine decision
-    result. Trend must agree with the direction; Price Action, SMC, and
-    Wyckoff are diagnostic-only and cannot authorize or veto this policy.
+    result. Trend must agree with the direction unless the entry filter
+    approved a score-qualified standalone Price Action entry. SMC and Wyckoff
+    remain diagnostic-only and cannot authorize or veto this policy.
     """
     normalized_symbol = str(symbol or "").upper().strip()
     if normalized_symbol != ACTIVE_ENTRY_SYMBOL:
@@ -97,7 +98,13 @@ def evaluate_active_entry(
         )
 
     trend_direction = _trend_direction(getattr(decision, "trend", None))
-    if trend_direction != direction:
+    entry_filter = getattr(decision, "entry_filter", None)
+    trend_confirmed = bool(getattr(entry_filter, "trend", False))
+    pa_standalone_confirmed = (
+        trend_direction == "NEUTRAL"
+        and bool(getattr(entry_filter, "price_action", False))
+    )
+    if trend_direction != direction and not pa_standalone_confirmed:
         return ActiveEntryPolicyResult(
             False,
             ACTIVE_ENTRY_STRATEGY,
@@ -105,8 +112,7 @@ def evaluate_active_entry(
             f"{direction} vs trend {trend_direction}",
         )
 
-    entry_filter = getattr(decision, "entry_filter", None)
-    if entry_filter is None or not bool(getattr(entry_filter, "trend", False)):
+    if entry_filter is None or not (trend_confirmed or pa_standalone_confirmed):
         return ActiveEntryPolicyResult(
             False,
             ACTIVE_ENTRY_STRATEGY,

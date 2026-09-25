@@ -36,6 +36,8 @@ from live_trading.config import (
     MIN_CONFIRMATIONS,
     PRICE_ACTION_STANDALONE,
     PA_STANDALONE_MIN_SCORE,
+    TREND_STANDALONE,
+    TREND_STANDALONE_MIN_SCORE,
     PA_MAX_BREAKOUT_EXTENSION_ATR,
     RANGE_MIN_CONFIRMATIONS,
     RANGE_WEAK_MIN_CONFIRMATIONS,
@@ -139,13 +141,14 @@ def _effective_min_confirmations(
     range_weak_min_confirmations: int = RANGE_WEAK_MIN_CONFIRMATIONS,
     strength: str = "",
 ) -> int:
-    """Return the operator-selected Trend-only floor.
+    """Return the voter floor, with RANGE keeping its independent policy.
 
     Counter-trend and choppy-market handling remain covered by the existing
-    confidence, quality, regime, MTF, and risk gates; they do not silently
-    turn the configured one-strategy floor into a stricter vote requirement.
+    confidence, quality, regime, MTF, and risk gates.
     """
-    max_confirmations = 1
+    # RANGE keeps its existing single-vote floor. Ordinary directional entries
+    # can use both configured voters, with standalone exceptions checked later.
+    max_confirmations = 1 if regime == "RANGE" else 2
     base_min_confirmations = min(max(1, int(base_min_confirmations)), max_confirmations)
     range_min_confirmations = min(
         max(1, int(range_min_confirmations)), max_confirmations
@@ -153,8 +156,7 @@ def _effective_min_confirmations(
     range_weak_min_confirmations = min(
         max(1, int(range_weak_min_confirmations)), max_confirmations
     )
-    # Legacy env floors remain parsed for compatibility/telemetry, but can
-    # never expand the Trend-only live-entry vote.
+    # Legacy env floors remain capped to the active Trend/PA voter set.
     if regime == "RANGE":
         # RANGE owns its floor; never inherit the ordinary/TREND floor.
         if str(strength).upper() == "WEAK":
@@ -171,10 +173,15 @@ def _allow_without_smc_for_quality(
     effective_min_confirmations: int,
     price_action_standalone: bool,
 ) -> bool:
-    """Allow Trend-authorized entries to proceed without an SMC vote."""
-    return (
+    """Allow an authorized Trend/PA entry through quality without SMC."""
+    if (
         entry_filter.confirmation_count >= effective_min_confirmations
         and entry_filter.trend
+    ):
+        return True
+    return entry_filter.allowed and (
+        entry_filter.trend
+        or (price_action_standalone and entry_filter.price_action)
     )
 
 
@@ -183,7 +190,7 @@ def _range_confirmation_gate(
     min_confirmations: int,
     price_action_standalone: bool = False,
 ) -> tuple[bool, str]:
-    """Apply the Trend-only RANGE confirmation floor."""
+    """Apply the RANGE confirmation floor without bypassing structure checks."""
     effective_min_confirmations = min(1, max(1, int(min_confirmations)))
     if not entry_filter.trend:
         return False, "RANGE entry blocked: Trend confirmation is required"
@@ -234,13 +241,20 @@ def _candidate_direction(
     trend: TrendResult,
     price_action_standalone: bool = False,
     enabled_strategies = None,
+    pa_standalone_min_score: float = PA_STANDALONE_MIN_SCORE,
 ) -> str:
-    """Use Trend for direction; an opposing PA vote makes it a tie."""
+    """Use Trend direction, or configured PA standalone when Trend is neutral."""
     if trend.trend == "BULLISH":
         trend_direction = "BUY"
     elif trend.trend == "BEARISH":
         trend_direction = "SELL"
     else:
+        if (
+            price_action_standalone
+            and pa.pa_signal in {"BUY", "SELL"}
+            and pa.pa_score >= pa_standalone_min_score
+        ):
+            return pa.pa_signal
         return "NEUTRAL"
 
     pa_direction = pa.pa_signal
@@ -325,6 +339,8 @@ def run_decision_engine(
     timeframe: str = "M5",
     price_action_standalone: bool = PRICE_ACTION_STANDALONE,
     pa_standalone_min_score: float = PA_STANDALONE_MIN_SCORE,
+    trend_standalone: bool = TREND_STANDALONE,
+    trend_standalone_min_score: float = TREND_STANDALONE_MIN_SCORE,
     range_weak_min_confirmations: int = RANGE_WEAK_MIN_CONFIRMATIONS,
     regime_strength: Optional[str] = None,
     regime_context: Optional[str] = None,
@@ -345,6 +361,7 @@ def run_decision_engine(
         trend,
         price_action_standalone=price_action_standalone,
         enabled_strategies=ENABLED_STRATEGIES,
+        pa_standalone_min_score=pa_standalone_min_score,
     )
     if candidate == "NEUTRAL":
         return _make_neutral(
@@ -395,20 +412,21 @@ def run_decision_engine(
         policy_min_confirmations,
     )
 
-    # Price Action extension remains available in telemetry and confidence,
-    # but a diagnostic engine cannot veto a Trend-authorized live entry.
+    # Price Action remains a live voter only through its aligned consensus or
+    # score-qualified standalone path; SMC and Wyckoff remain diagnostic.
 
-    # Entry filter — Trend-only live-entry authority. SMC remains diagnostic;
-    # Price Action and Wyckoff retain their independent confidence components.
+    # Entry filter — Trend/Price Action live-entry authority. SMC and Wyckoff
+    # remain diagnostic and never participate in authorization.
     is_range_regime = regime.regime == "RANGE"
     is_weak_range = (
         effective_regime_strength == "WEAK"
         and (is_range_regime or policy_regime == "RANGE")
     )
-    # Keep the one-vote minimum used by the live policy; an opposing Trend/PA
-    # pair has no unique candidate and is rejected before reaching this gate.
+    # Ordinary entries require both voters unless a configured standalone
+    # threshold is met; RANGE retains its separate existing floor.
     effective_min_confirmations = min(
-        1, max(1, int(effective_min_confirmations))
+        1 if is_range_regime else 2,
+        max(1, int(effective_min_confirmations)),
     )
     ef = apply_entry_filter(
         smc_signal      = "NEUTRAL",
@@ -419,8 +437,13 @@ def run_decision_engine(
         require_price_action = require_price_action and not is_range_regime,
         # Legacy multi-engine options cannot re-enable SMC or Wyckoff voting.
         require_smc_price_action_wyckoff = False,
-        price_action_standalone=False,
+        price_action_standalone=price_action_standalone,
         enabled_strategies=ENTRY_STRATEGIES,
+        trend_score=trend.score,
+        trend_standalone=trend_standalone,
+        trend_standalone_min_score=trend_standalone_min_score,
+        pa_score=pa.pa_score,
+        pa_standalone_min_score=pa_standalone_min_score,
     )
     # The RANGE confirmation floor is mandatory even when the optional
     # structural filters (edge, sweep, reversal) are disabled.
@@ -525,7 +548,7 @@ def run_decision_engine(
     conf_result  = calc_confidence(
         smc, wyckoff, pa, trend, regime, session, candidate,
         divergence_signal=divergence.signal,
-         price_action_standalone=False,
+         price_action_standalone=price_action_standalone,
          candles=candles,
     )
 
@@ -552,7 +575,7 @@ def run_decision_engine(
                                     allow_without_smc=_allow_without_smc_for_quality(
                                         ef,
                                         effective_min_confirmations,
-                                        False,
+                                        price_action_standalone,
                                     ))
     if not quality.allowed:
         return DecisionResult(

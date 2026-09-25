@@ -103,11 +103,16 @@ services:
       # reversal, and at least two aligned strategy confirmations.
       - key: RANGE_ENTRY_FILTERS_ENABLED
         value: "true"
-      # A directional Price Action signal may authorize an entry by itself.
+      # A clear directional Price Action signal may authorize an entry by itself.
       - key: PRICE_ACTION_STANDALONE
         value: "true"
       - key: PA_STANDALONE_MIN_SCORE
-        value: "0.24"
+        value: "0.16"
+      # Trend-only entries require a strong, direction-aligned Trend score.
+      - key: TREND_STANDALONE
+        value: "true"
+      - key: TREND_STANDALONE_MIN_SCORE
+        value: "55"
       - key: PA_MAX_BREAKOUT_EXTENSION_ATR
         value: "0.75"
       - key: MAX_RANGE_TRADES_PER_SESSION
@@ -126,14 +131,14 @@ services:
         value: "false"
       - key: REQUIRE_SMC_PRICE_ACTION_WYCKOFF
         value: "false"
-      # Keep the hard floor at the balanced default. Standalone PA increases
-      # eligible setups without buying more trades by weakening quality.
+      # Keep regime confidence requirements independent from the lowered hard
+      # floor; standalone paths still pass quality, R:R, and risk gates.
       - key: NORMAL_MIN_CONFIDENCE
         value: "40"
       - key: RANGE_MIN_CONFIDENCE
         value: "40"
       - key: CONF_HARD_MIN
-        value: "40"
+        value: "30"
       - key: DAILY_LOSS_LIMIT_PCT
         value: "3.0"
       - key: MAX_DRAWDOWN_PCT

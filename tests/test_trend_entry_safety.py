@@ -4,13 +4,16 @@ from live_trading.risk.capital_manager import CapitalInput, calc_trade_parameter
 from live_trading.signals.entry_filter import apply_entry_filter
 
 
-def test_trend_only_entry_passes_the_single_engine_confirmation_floor():
+def test_strong_trend_only_entry_passes_the_standalone_confirmation_floor():
     result = apply_entry_filter(
         smc_signal="NEUTRAL",
         ema_trend="BEARISH",
         pa_signal="NEUTRAL",
         wyckoff_signal="NEUTRAL",
         min_confirmations=2,
+        trend_score=-55.0,
+        trend_standalone=True,
+        trend_standalone_min_score=55.0,
     )
 
     assert result.allowed is True
