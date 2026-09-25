@@ -72,7 +72,12 @@ from live_trading.risk.adaptive_trailing_stop import (
 from live_trading.risk.capital_manager import (
     LOT_DOLLAR_PER_UNIT, CapitalOutput,
 )
-from live_trading.signals.decision_engine import run_decision_engine, DecisionResult, describe_strategy
+from live_trading.signals.decision_engine import (
+    run_decision_engine,
+    DecisionResult,
+    describe_strategy,
+    _entry_breakout_block_reason,
+)
 from live_trading.signals.gold_engine import calc_atr
 from live_trading.signals.mtf_filter import (
     compute_mtf_bias,
@@ -3186,6 +3191,30 @@ class GoldScalperLive:
                     "ACTIVE_STRATEGY_BLOCKED",
                     active_entry.reason,
                 )
+
+            # Defense in depth: the decision engine is the primary authority,
+            # but the final order boundary must not trust a stale or manually
+            # constructed "allowed" decision that carries an explicit
+            # false-breakout/unsafe-breakout signal.
+            breakout_block_reason = _entry_breakout_block_reason(
+                decision.direction,
+                getattr(decision, "pa", None),
+                smc_fake_breakout=bool(
+                    getattr(
+                        getattr(decision, "quality_filter", None),
+                        "is_fake_breakout",
+                        False,
+                    )
+                ),
+            )
+            if breakout_block_reason is not None:
+                return (
+                    None,
+                    [],
+                    "BREAKOUT_SAFETY_BLOCKED",
+                    breakout_block_reason,
+                )
+
             try:
                 confirm_result = await get_open_positions(
                     SYMBOL,

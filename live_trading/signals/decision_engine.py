@@ -111,6 +111,63 @@ def _entry_location_block_reason(candidate: str, pa) -> Optional[str]:
     return None
 
 
+def _entry_breakout_block_reason(
+    candidate: str,
+    pa,
+    *,
+    smc_fake_breakout: bool = False,
+) -> Optional[str]:
+    """Return the existing breakout-safety reason for a live entry.
+
+    Price Action already distinguishes closed breakouts from wick-only moves
+    and already marks false breakouts/overextension.  This helper only wires
+    those existing signals into the live-entry authority; it does not add a
+    new threshold or reinterpret the PA detector.
+    """
+    candidate = str(candidate).upper()
+    if pa is None:
+        if smc_fake_breakout:
+            return f"{candidate} blocked: SMC explicitly identified a false breakout"
+        # Legacy callers may construct a decision without PA telemetry. Real
+        # decisions always carry PriceActionResult and take the full guards.
+        return None
+
+    pa_false_breakout = (
+        candidate == "BUY" and bool(getattr(pa, "fake_bull_breakout", False))
+    ) or (
+        candidate == "SELL" and bool(getattr(pa, "fake_bear_breakout", False))
+    )
+    if pa_false_breakout:
+        return f"{candidate} blocked: Price Action explicitly identified a false breakout"
+
+    if smc_fake_breakout:
+        return f"{candidate} blocked: SMC explicitly identified a false breakout"
+
+    aligned_breakout = (
+        candidate == "BUY"
+        and (
+            bool(getattr(pa, "valid_bull_breakout", False))
+            or bool(getattr(pa, "bullish_inside_breakout", False))
+        )
+    ) or (
+        candidate == "SELL"
+        and (
+            bool(getattr(pa, "valid_bear_breakout", False))
+            or bool(getattr(pa, "bearish_inside_breakout", False))
+        )
+    )
+    if aligned_breakout and bool(getattr(pa, "breakout_overextended", False)):
+        return (
+            f"{candidate} blocked: breakout is overextended "
+            f"beyond {PA_MAX_BREAKOUT_EXTENSION_ATR:.2f} ATR"
+        )
+
+    # This is also the live guard for a wick-only move: without a
+    # close-confirmed breakout or an existing pullback/reclaim, the candidate
+    # cannot enter merely because confidence is high.
+    return _entry_location_block_reason(candidate, pa)
+
+
 def _target_room_block_reason(
     candidate: str,
     entry: float,
@@ -612,14 +669,48 @@ def run_decision_engine(
             entry_filter=ef,
         )
 
-    # SMC fake-breakout detection remains telemetry only. It must not veto the
-    # Trend-authorized entry path.
+    def _blocked_after_quality(reason: str) -> DecisionResult:
+        quality.allowed = False
+        if reason not in quality.blocked_reasons:
+            quality.blocked_reasons.append(reason)
+        return DecisionResult(
+            allowed=False, direction=candidate,  # type: ignore
+            confidence=conf_result.confidence, components=conf_result.components,
+            grade=conf_result.grade, regime=regime.regime,
+            regime_label=regime.rules.label, regime_rules=regime.rules,
+            quality_filter=quality,
+            blocked_reasons=[reason],
+            reasoning=conf_result.reasoning + [reason],
+            trade_params=None,
+            smc=smc, wyckoff=wyckoff, pa=pa, trend=trend,
+            entry_filter=ef,
+            divergence=divergence,
+            dxy_signal=dxy_signal,
+            range_context=range_context,
+            effective_min_confirmations=effective_min_confirmations,
+            regime_strength=effective_regime_strength,
+            policy_regime=policy_regime,
+        )
+
     fake_ob = detect_order_block_fake_breakout(candles, smc, candidate)
     if fake_ob is not None:
         quality.is_fake_breakout = True
 
-    # Price Action location and extension checks remain visible through the
-    # PA telemetry fields, but are not live-entry authority.
+    pa_fake_breakout = (
+        candidate == "BUY" and pa.fake_bull_breakout
+    ) or (
+        candidate == "SELL" and pa.fake_bear_breakout
+    )
+    if pa_fake_breakout:
+        quality.is_fake_breakout = True
+
+    breakout_block_reason = _entry_breakout_block_reason(
+        candidate,
+        pa,
+        smc_fake_breakout=fake_ob is not None,
+    )
+    if breakout_block_reason is not None:
+        return _blocked_after_quality(breakout_block_reason)
 
     # SMC structure is telemetry only; stops and targets use ATR and the
     # candle-derived RANGE levels, never SMC zones or structure.
