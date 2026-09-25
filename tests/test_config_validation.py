@@ -52,10 +52,17 @@ class TestConfigDefaults:
         assert isinstance(cfg.RISK_PERCENT, float)
 
     def test_min_confirmations_default(self):
-        """Ordinary entries default to both active voters."""
+        """Entry-policy floors use the restored single-confirmation defaults."""
         cfg = _reload_config({})
-        assert cfg.MIN_CONFIRMATIONS == 2
+        assert cfg.MIN_CONFIRMATIONS == 1
+        assert cfg.RANGE_MIN_CONFIRMATIONS == 1
+        assert cfg.TREND_MIN_CONFIRMATIONS == 1
         assert isinstance(cfg.MIN_CONFIRMATIONS, int)
+        from live_trading.signals.decision_engine import _effective_min_confirmations
+        assert _effective_min_confirmations(
+            cfg.MIN_CONFIRMATIONS, "TREND", False,
+            range_min_confirmations=cfg.RANGE_MIN_CONFIRMATIONS,
+        ) == 1
 
     def test_live_entry_strategies_are_fixed_to_trend_and_price_action(self):
         cfg = _reload_config({"ENABLED_STRATEGIES": "smc,trend,price_action,wyckoff"})
@@ -64,7 +71,7 @@ class TestConfigDefaults:
 
     def test_trend_min_confirmations_default(self):
         cfg = _reload_config({})
-        assert cfg.TREND_MIN_CONFIRMATIONS == 2
+        assert cfg.TREND_MIN_CONFIRMATIONS == 1
         assert isinstance(cfg.TREND_MIN_CONFIRMATIONS, int)
 
     def test_protective_sl_atr_defaults(self):
