@@ -168,18 +168,17 @@ services:
         value: "2"
       - key: HISTORICAL_RETRY_BACKOFF
         value: "1.0"
-      # HTF is a hard directional safety gate: lower-timeframe entries must
-      # agree with a confirmed H1 bias, not merely avoid strong opposition.
+      # MTF is disabled so HTF alignment/opposition cannot block live entries.
       - key: MTF_ENABLED
-        value: "true"
+        value: "false"
       - key: MTF_TIMEFRAME
         value: "H1"
       - key: MTF_CANDLE_WINDOW
         value: "300"
       - key: MTF_REQUIRE_ALIGNMENT
-        value: "true"
-      - key: MTF_DRY_RUN
         value: "false"
+      - key: MTF_DRY_RUN
+        value: "true"
       - key: OPTION_TWO_MIN_TIMEFRAMES
         value: "2"
       - key: PYTHON_VERSION

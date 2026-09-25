@@ -126,6 +126,16 @@ class TestConfigDefaults:
         assert cfg.CONF_HARD_MIN == 30.0
         assert cfg.PA_STANDALONE_MIN_SCORE == 0.16
 
+    def test_mtf_filter_is_locked_off_even_with_legacy_env_flags(self):
+        cfg = _reload_config({
+            "MTF_ENABLED": "true",
+            "MTF_REQUIRE_ALIGNMENT": "true",
+            "MTF_DRY_RUN": "false",
+        })
+        assert cfg.MTF_ENABLED is False
+        assert cfg.MTF_REQUIRE_ALIGNMENT is False
+        assert cfg.MTF_DRY_RUN is True
+
     def test_quality_adx_min_default_is_balanced(self):
         cfg = _reload_config({})
         assert cfg.QUALITY_ADX_MIN == 12.0

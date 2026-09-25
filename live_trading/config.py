@@ -87,6 +87,20 @@ def _locked_float(
     return expected
 
 
+def _locked_bool(name: str, expected: bool) -> bool:
+    """Keep a runtime feature flag authoritative over stale ENV values."""
+    raw = os.getenv(name)
+    if raw is not None:
+        requested = raw.strip().lower() in {"1", "true", "yes", "on"}
+        if requested != expected:
+            print(
+                f"WARNING: {name}={requested} is legacy; using locked value "
+                f"{expected}.",
+                file=sys.stderr,
+            )
+    return expected
+
+
 def _strategy_list(name: str, default: str) -> tuple[str, ...]:
     """Parse the signal engines that are allowed to authorize live entries."""
     valid = ("smc", "trend", "price_action", "wyckoff")
@@ -383,15 +397,12 @@ ALLOW_HEDGED_POSITIONS = os.getenv(
 
 USE_ATR_HIGH_VOL_FILTER = os.getenv("USE_ATR_HIGH_VOL_FILTER", "false").lower() == "true"
 # ── Multi-Timeframe (HTF) negative filter ────────────────────────────────────
-# MTF_ENABLED       : enable the HTF opposition check (default on).
-#                     It is a negative-only filter: ordinary entries remain
-#                     allowed unless HTF opposition is clearly strong.
+# MTF_ENABLED       : retained for compatibility, but locked off so HTF data
+#                     cannot block live entries.
 # MTF_TIMEFRAME     : the Higher TimeFrame to use for bias detection.
 #                     "H1" is the recommended default for M5 scalping of gold.
 # MTF_CANDLE_WINDOW : number of HTF bars to fetch (needs ≥ 210 for EMA-200).
-MTF_ENABLED       = os.getenv("MTF_ENABLED", "true").strip().lower() in {
-    "1", "true", "yes", "on",
-}
+MTF_ENABLED       = _locked_bool("MTF_ENABLED", False)
 MTF_TIMEFRAME     = _timeframe("MTF_TIMEFRAME", "H1")
 MTF_CANDLE_WINDOW = _int("MTF_CANDLE_WINDOW", 300, lo=50, hi=1000)
 # Only strong opposition at or above this Trend Engine score can be rejected.
@@ -403,16 +414,9 @@ MTF_OPPOSITION_THRESHOLD = _float(
 # Require the executable timeframe to agree with a confirmed HTF bias.  This
 # is stricter than the legacy opposition-only filter and prevents a lower-TF
 # bullish candle from buying directly into a bearish H1 structure.
-MTF_REQUIRE_ALIGNMENT = os.getenv(
-    "MTF_REQUIRE_ALIGNMENT", "true"
-).strip().lower() in {
-    "1", "true", "yes", "on",
-}
-# Start in observation mode. The filter computes and logs would_block but does
-# not reject orders until the operator explicitly sets this to false on Render.
-MTF_DRY_RUN = os.getenv("MTF_DRY_RUN", "true").strip().lower() in {
-    "1", "true", "yes", "on",
-}
+MTF_REQUIRE_ALIGNMENT = _locked_bool("MTF_REQUIRE_ALIGNMENT", False)
+# Retained for telemetry/config compatibility; MTF itself is locked off.
+MTF_DRY_RUN = _locked_bool("MTF_DRY_RUN", True)
 # Deprecated compatibility settings retained for panel/config consumers. They
 # no longer act as MTF approval gates.
 OPTION_TWO_MIN_CONFIDENCE = _float("OPTION_TWO_MIN_CONFIDENCE", 40.0, lo=0.0, hi=100.0)
