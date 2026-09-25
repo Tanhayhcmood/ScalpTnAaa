@@ -65,6 +65,22 @@ CONF_MARGINAL_RR = 1.3
 _CHOPPY_REGIMES = {"ACCUMULATION", "DISTRIBUTION", "HIGH_VOLATILITY"}
 
 
+def _protective_sl_atr_multiplier(
+    regime: RegimeResult,
+    base_multiplier: float,
+    low_volatility_add: float,
+) -> float:
+    """Apply the active regime's existing SL adjustment.
+
+    LOW_VOLATILITY already uses its configurable additive buffer; keep that
+    path unchanged rather than also applying its regime multiplier.
+    """
+    base = float(base_multiplier)
+    if regime.regime == "LOW_VOLATILITY":
+        return base + float(low_volatility_add)
+    return base * float(regime.rules.sl_atr_mult_adjust)
+
+
 def _entry_location_block_reason(candidate: str, pa) -> Optional[str]:
     """Reject entries that arrive at the wrong side of a nearby level.
 
@@ -538,12 +554,14 @@ def run_decision_engine(
     # Protective-stop volatility is intentionally independent from the signal
     # timeframe. The live loop supplies ATR from SL_ATR_TIMEFRAME (normally
     # M5), so a compressed M5 candle cannot create an unrealistically tight
-    # stop. LOW_VOLATILITY gets an additional configurable buffer because it
-    # can precede a volatility expansion.
+    # stop. Regime-specific multipliers adjust the existing ATR envelope;
+    # LOW_VOLATILITY keeps its separate configurable additive buffer.
     protective_atr = float(sl_atr or regime.atr)
-    protective_multiplier = float(sl_atr_multiplier)
-    if regime.regime == "LOW_VOLATILITY":
-        protective_multiplier += float(low_volatility_sl_atr_add)
+    protective_multiplier = _protective_sl_atr_multiplier(
+        regime,
+        sl_atr_multiplier,
+        low_volatility_sl_atr_add,
+    )
 
     last_candle  = candles[-1]
     session      = get_session_quality(last_candle.time)
