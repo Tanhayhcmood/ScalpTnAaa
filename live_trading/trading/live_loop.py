@@ -3347,9 +3347,24 @@ class GoldScalperLive:
             tp_params.take_profit = rebased["take_profit"]
             tp_params.sl_distance_usd = round(rebased["sl_distance"], 2)
             tp_params.sl_distance_pips = round(rebased["sl_distance_pips"], 2)
-            tp_params.risk_reward_ratio = round(
-                rebased["tp_distance"] / rebased["sl_distance"], 2
-            )
+            final_rr = rebased["tp_distance"] / rebased["sl_distance"]
+            tp_params.risk_reward_ratio = round(final_rr, 2)
+            minimum_rr = float(decision.regime_rules.min_rr)
+            if final_rr + 1e-9 < minimum_rr:
+                reason = (
+                    f"Final R:R {final_rr:.2f} < {minimum_rr:.2f} "
+                    f"minimum for {decision.regime_rules.label}"
+                )
+                log.warning(
+                    f"⛔ Entry blocked after SL/TP rebase [{timeframe}] "
+                    f"{decision.direction} {SYMBOL}: {reason}"
+                )
+                return (
+                    None,
+                    confirm_dicts,
+                    "FINAL_RR_BELOW_REGIME_MINIMUM",
+                    reason,
+                )
             tp_params.risk_amount = round(
                 tp_params.lot_size
                 * rebased["sl_distance"]
