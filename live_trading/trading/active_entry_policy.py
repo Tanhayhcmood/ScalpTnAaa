@@ -6,7 +6,10 @@ module is the only policy that can authorize the live order path.
 
 from dataclasses import dataclass
 
-from live_trading.signals.market_regime import REGIME_RULES
+from live_trading.signals.market_regime import (
+    REGIME_RULES,
+    STRONG_ADX_TREND_THRESHOLD,
+)
 
 
 ACTIVE_ENTRY_STRATEGY = "XAUUSD_VOLATILITY_TREND_BREAKOUT"
@@ -27,6 +30,89 @@ def _trend_direction(trend) -> str:
     if value == "BEARISH":
         return "SELL"
     return "NEUTRAL"
+
+
+def _strong_trend_direction(regime: str) -> str:
+    if regime == "STRONG_TREND_BULL":
+        return "BUY"
+    if regime == "STRONG_TREND_BEAR":
+        return "SELL"
+    return "NEUTRAL"
+
+
+def _pa_has_structural_confirmation(pa, direction: str) -> bool:
+    if pa is None:
+        return False
+    if str(getattr(pa, "pa_signal", "")).upper().strip() != direction:
+        return False
+
+    if direction == "BUY":
+        structural_flags = (
+            "valid_bull_breakout",
+            "bullish_inside_breakout",
+            "bullish_pullback",
+        )
+    else:
+        structural_flags = (
+            "valid_bear_breakout",
+            "bearish_inside_breakout",
+            "bearish_pullback",
+        )
+    return any(bool(getattr(pa, flag, False)) for flag in structural_flags)
+
+
+def strong_trend_validation_reason(decision) -> str | None:
+    """Return a fail-closed reason for an unconfirmed ADX-driven strong regime.
+
+    This is intentionally a final-order-only validation.  It does not classify
+    regimes or change the Trend/Price Action engines.  Regimes below the
+    existing ADX threshold are outside this guard and retain their current
+    behavior.
+    """
+    regime = str(getattr(decision, "regime", "")).upper().strip()
+    expected_direction = _strong_trend_direction(regime)
+    if expected_direction == "NEUTRAL":
+        return None
+
+    quality = getattr(decision, "quality_filter", None)
+    raw_adx = getattr(quality, "adx", None)
+    try:
+        adx = float(raw_adx)
+    except (TypeError, ValueError):
+        return (
+            "Strong Trend final validation blocked: ADX is missing or invalid "
+            f"for {regime}"
+        )
+
+    # ADX < 45 deliberately stays on the existing path.  The detector's
+    # current 45 threshold is the boundary for this additional validation.
+    if adx < STRONG_ADX_TREND_THRESHOLD:
+        return None
+
+    direction = str(getattr(decision, "direction", "")).upper().strip()
+    if direction != expected_direction:
+        return (
+            "Strong Trend final validation blocked: decision direction "
+            f"{direction or 'UNKNOWN'} does not match regime direction "
+            f"{expected_direction}"
+        )
+
+    trend_direction = _trend_direction(getattr(decision, "trend", None))
+    if trend_direction == expected_direction:
+        return None
+
+    if _pa_has_structural_confirmation(
+        getattr(decision, "pa", None),
+        expected_direction,
+    ):
+        return None
+
+    return (
+        "Strong Trend final validation blocked: ADX "
+        f"{adx:.1f} >= {STRONG_ADX_TREND_THRESHOLD:.0f} for {regime}, "
+        f"but Trend Engine is {trend_direction} and no structural Price "
+        f"Action confirmation exists for {expected_direction}"
+    )
 
 
 def evaluate_active_entry(

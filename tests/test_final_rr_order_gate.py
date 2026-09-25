@@ -29,6 +29,8 @@ def _decision(initial_rr: float):
         regime="STRONG_TREND_BULL",
         regime_rules=SimpleNamespace(min_rr=1.5, label="Strong Bull Trend"),
         confidence=80.0,
+        quality_filter=SimpleNamespace(adx=50.0),
+        trend=SimpleNamespace(trend="BULLISH"),
         trade_params=trade_params,
     )
 
@@ -148,4 +150,44 @@ async def test_explicit_false_breakout_is_blocked_at_final_order_boundary(monkey
     assert positions == []
     assert stage == "BREAKOUT_SAFETY_BLOCKED"
     assert "false breakout" in reason
+    assert order_calls == []
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_strong_trend_is_blocked_before_position_check(
+    monkeypatch,
+):
+    order_calls = []
+    _patch_order_dependencies(monkeypatch, order_calls)
+    async def unexpected_position_check(*_args, **_kwargs):
+        raise AssertionError("position check must not run after Strong Trend block")
+
+    monkeypatch.setattr(live_loop, "get_open_positions", unexpected_position_check)
+    robot = GoldScalperLive()
+    decision = _decision(2.0)
+    decision.trend = SimpleNamespace(trend="NEUTRAL")
+    decision.pa = SimpleNamespace(
+        pa_signal="BUY",
+        near_resistance=False,
+        near_support=False,
+        valid_bull_breakout=False,
+        bullish_inside_breakout=False,
+        bullish_pullback=False,
+        fake_bull_breakout=False,
+        fake_bear_breakout=False,
+        breakout_overextended=False,
+    )
+
+    result, positions, stage, reason = await robot._safe_entry_order(
+        decision,
+        (ACTIVE_STRATEGY_SLOT,),
+        "5m",
+        datetime(2026, 9, 25, tzinfo=timezone.utc),
+        1.0,
+    )
+
+    assert result is None
+    assert positions == []
+    assert stage == "STRONG_TREND_STRUCTURE_BLOCKED"
+    assert "no structural Price Action confirmation" in reason
     assert order_calls == []

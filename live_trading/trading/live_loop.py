@@ -111,6 +111,7 @@ from live_trading.trading.entry_guard import (
 )
 from live_trading.trading.active_entry_policy import (
     evaluate_active_entry,
+    strong_trend_validation_reason,
 )
 from live_trading.utils.state_writer import (
     write_robot_state, write_mt5_snapshot,
@@ -3213,6 +3214,18 @@ class GoldScalperLive:
                     [],
                     "BREAKOUT_SAFETY_BLOCKED",
                     breakout_block_reason,
+                )
+
+            # Final defense in depth for the ADX-driven strong-regime path.
+            # Keep this at the broker boundary so stale/manual allowed
+            # DecisionResults cannot submit an unconfirmed Strong Trend.
+            strong_trend_block_reason = strong_trend_validation_reason(decision)
+            if strong_trend_block_reason is not None:
+                return (
+                    None,
+                    [],
+                    "STRONG_TREND_STRUCTURE_BLOCKED",
+                    strong_trend_block_reason,
                 )
 
             try:
