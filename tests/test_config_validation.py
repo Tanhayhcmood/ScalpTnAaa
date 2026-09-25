@@ -81,7 +81,19 @@ class TestConfigDefaults:
         assert cfg.SL_ATR_BASE_MULTIPLIER == 3.0
         assert cfg.LOW_VOLATILITY_SL_ATR_ADD == 0.5
         assert cfg.ENTRY_SIGNAL_ATR_PERIOD == 14
-        assert cfg.MAX_ENTRY_SIGNAL_ATR_DISTANCE == 0.75
+        assert cfg.STALENESS_LIMIT_STRONG_TREND == 1.30
+        assert cfg.STALENESS_LIMIT_WEAK_TREND == 1.00
+        assert cfg.STALENESS_LIMIT_RANGE == 0.75
+
+    def test_staleness_limits_are_environment_configurable(self):
+        cfg = _reload_config({
+            "STALENESS_LIMIT_STRONG_TREND": "1.5",
+            "STALENESS_LIMIT_WEAK_TREND": "1.1",
+            "STALENESS_LIMIT_RANGE": "0.8",
+        })
+        assert cfg.STALENESS_LIMIT_STRONG_TREND == 1.5
+        assert cfg.STALENESS_LIMIT_WEAK_TREND == 1.1
+        assert cfg.STALENESS_LIMIT_RANGE == 0.8
 
     def test_entry_timeframe_defaults_to_five_minutes_only(self):
         cfg = _reload_config({})

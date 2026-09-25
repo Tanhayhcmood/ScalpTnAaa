@@ -8,6 +8,17 @@ from dataclasses import dataclass
 import math
 
 
+_STRONG_TREND_REGIMES = frozenset({
+    "STRONG_TREND_BULL",
+    "STRONG_TREND_BEAR",
+    "HIGH_VOLATILITY",
+})
+_WEAK_TREND_REGIMES = frozenset({
+    "WEAK_TREND_BULL",
+    "WEAK_TREND_BEAR",
+})
+
+
 @dataclass(frozen=True)
 class EntryPriceGuardResult:
     allowed: bool
@@ -17,12 +28,31 @@ class EntryPriceGuardResult:
     distance_atr: float
 
 
+def staleness_limit_for_regime(
+    regime: str,
+    strong_trend_limit: float,
+    weak_trend_limit: float,
+    range_limit: float,
+) -> float:
+    """Choose the signal-price drift limit for the current market regime.
+
+    Unlisted regimes intentionally retain the tighter range limit.
+    """
+    normalized_regime = str(regime or "").strip().upper()
+    if normalized_regime in _STRONG_TREND_REGIMES:
+        return strong_trend_limit
+    if normalized_regime in _WEAK_TREND_REGIMES:
+        return weak_trend_limit
+    return range_limit
+
+
 def validate_entry_price_distance(
     direction: str,
     signal_price: float,
     execution_price: float,
     atr: float,
     max_atr_distance: float,
+    regime: str = "UNKNOWN",
 ) -> EntryPriceGuardResult:
     """Reject entries whose live executable price drifted from the signal.
 
@@ -61,13 +91,15 @@ def validate_entry_price_distance(
     distance = round(abs(execution_price - signal_price), 6)
     max_distance = round(atr * max_atr_distance, 6)
     distance_atr = round(distance / atr, 6)
+    normalized_regime = str(regime or "UNKNOWN").strip().upper()
     if distance > max_distance:
         return EntryPriceGuardResult(
             False,
             (
                 f"{normalized_direction} signal stale: execution moved "
                 f"{distance:.2f} ({distance_atr:.2f} ATR) from signal; "
-                f"limit is {max_distance:.2f} ({max_atr_distance:.2f} ATR)"
+                f"limit is {max_distance:.2f} ({max_atr_distance:.2f} ATR, "
+                f"regime={normalized_regime})"
             ),
             distance,
             max_distance,
@@ -79,7 +111,7 @@ def validate_entry_price_distance(
         (
             f"{normalized_direction} signal price valid: drift "
             f"{distance:.2f} ({distance_atr:.2f} ATR) within "
-            f"{max_atr_distance:.2f} ATR limit"
+            f"{max_atr_distance:.2f} ATR limit (regime={normalized_regime})"
         ),
         distance,
         max_distance,

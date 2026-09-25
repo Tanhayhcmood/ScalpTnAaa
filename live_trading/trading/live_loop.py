@@ -33,7 +33,8 @@ from typing import List, Optional
 from live_trading.config import (
     SYMBOL, TIMEFRAME, CANDLE_WINDOW, RISK_PERCENT,
     SL_ATR_TIMEFRAME, SL_ATR_PERIOD, SL_ATR_BASE_MULTIPLIER,
-    ENTRY_SIGNAL_ATR_PERIOD, MAX_ENTRY_SIGNAL_ATR_DISTANCE,
+    ENTRY_SIGNAL_ATR_PERIOD, STALENESS_LIMIT_STRONG_TREND,
+    STALENESS_LIMIT_WEAK_TREND, STALENESS_LIMIT_RANGE,
     LOW_VOLATILITY_SL_ATR_ADD,
     MAX_OPEN_TRADES, COMMENT,
     BAR_CHECK_INTERVAL, RECONNECT_DELAY, SYNC_TIMEOUT, RPC_CALL_TIMEOUT,
@@ -99,7 +100,10 @@ from live_trading.trading.strategy_slots import (
     available_for_strategy_slots,
     one_way_entry_allowed,
 )
-from live_trading.trading.entry_guard import validate_entry_price_distance
+from live_trading.trading.entry_guard import (
+    staleness_limit_for_regime,
+    validate_entry_price_distance,
+)
 from live_trading.trading.active_entry_policy import (
     evaluate_active_entry,
 )
@@ -3284,19 +3288,27 @@ class GoldScalperLive:
                     "QUOTE_UNAVAILABLE",
                     f"Could not read executable {SYMBOL} price before order",
                 )
+            max_staleness_atr = staleness_limit_for_regime(
+                decision.regime,
+                STALENESS_LIMIT_STRONG_TREND,
+                STALENESS_LIMIT_WEAK_TREND,
+                STALENESS_LIMIT_RANGE,
+            )
             entry_guard = validate_entry_price_distance(
                 decision.direction,
                 original_entry_price,
                 execution_price,
                 signal_atr,
-                MAX_ENTRY_SIGNAL_ATR_DISTANCE,
+                max_staleness_atr,
+                regime=decision.regime,
             )
             self._last_candle_telemetry.setdefault("entry_price_guard", {}).update({
                 "direction": decision.direction,
+                "regime": decision.regime,
                 "signal_price": original_entry_price,
                 "execution_price": execution_price,
                 "atr": signal_atr,
-                "max_atr_distance": MAX_ENTRY_SIGNAL_ATR_DISTANCE,
+                "max_atr_distance": max_staleness_atr,
                 "distance": entry_guard.distance,
                 "distance_atr": entry_guard.distance_atr,
                 "max_distance": entry_guard.max_distance,

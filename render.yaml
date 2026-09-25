@@ -51,11 +51,16 @@ services:
         value: "M15"
       - key: SL_ATR_PERIOD
         value: "14"
-      # Do not chase a closed-candle signal after a fast move. The live
-      # executable price must remain within 0.75 signal-timeframe ATR.
+      # Signal freshness limits in signal-timeframe ATRs. Strong trends and
+      # HIGH_VOLATILITY use the strong-trend allowance; unlisted regimes keep
+      # the tight range limit.
       - key: ENTRY_SIGNAL_ATR_PERIOD
         value: "14"
-      - key: MAX_ENTRY_SIGNAL_ATR_DISTANCE
+      - key: STALENESS_LIMIT_STRONG_TREND
+        value: "1.3"
+      - key: STALENESS_LIMIT_WEAK_TREND
+        value: "1.0"
+      - key: STALENESS_LIMIT_RANGE
         value: "0.75"
       # Extra room required beyond the next equal high/low before a fixed-R
       # target is considered reachable.

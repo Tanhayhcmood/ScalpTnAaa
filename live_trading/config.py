@@ -242,8 +242,14 @@ SL_ATR_PERIOD = _int("SL_ATR_PERIOD", 14, lo=2, hi=100)
 # to the price that produced it. This is deliberately based on the signal
 # timeframe ATR, not the wider protective-stop ATR.
 ENTRY_SIGNAL_ATR_PERIOD = _int("ENTRY_SIGNAL_ATR_PERIOD", 14, lo=2, hi=100)
-MAX_ENTRY_SIGNAL_ATR_DISTANCE = _float(
-    "MAX_ENTRY_SIGNAL_ATR_DISTANCE", 0.75, lo=0.10, hi=3.0
+STALENESS_LIMIT_STRONG_TREND = _float(
+    "STALENESS_LIMIT_STRONG_TREND", 1.30, lo=0.10, hi=3.0
+)
+STALENESS_LIMIT_WEAK_TREND = _float(
+    "STALENESS_LIMIT_WEAK_TREND", 1.00, lo=0.10, hi=3.0
+)
+STALENESS_LIMIT_RANGE = _float(
+    "STALENESS_LIMIT_RANGE", 0.75, lo=0.10, hi=3.0
 )
 
 # ── Risk & Trade Rules ───────────────────────────────────────────────────────
