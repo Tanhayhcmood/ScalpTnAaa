@@ -100,17 +100,31 @@ class TestConfigDefaults:
         assert cfg.RANGE_MIN_CONFIRMATIONS == 1
         assert isinstance(cfg.RANGE_MIN_CONFIRMATIONS, int)
 
-    def test_confirmation_floors_are_capped_at_two_live_engines(self):
+    def test_policy_confirmation_floors_are_locked_to_one(self):
         cfg = _reload_config({
             "MIN_CONFIRMATIONS": "4",
             "TREND_MIN_CONFIRMATIONS": "3",
             "RANGE_MIN_CONFIRMATIONS": "4",
             "RANGE_WEAK_MIN_CONFIRMATIONS": "3",
         })
-        assert cfg.MIN_CONFIRMATIONS == 2
-        assert cfg.TREND_MIN_CONFIRMATIONS == 2
-        assert cfg.RANGE_MIN_CONFIRMATIONS == 2
+        assert cfg.MIN_CONFIRMATIONS == 1
+        assert cfg.TREND_MIN_CONFIRMATIONS == 1
+        assert cfg.RANGE_MIN_CONFIRMATIONS == 1
         assert cfg.RANGE_WEAK_MIN_CONFIRMATIONS == 2
+
+    def test_legacy_threshold_envs_cannot_override_policy(self):
+        cfg = _reload_config({
+            "MIN_CONFIRMATIONS": "2",
+            "TREND_MIN_CONFIRMATIONS": "2",
+            "RANGE_MIN_CONFIRMATIONS": "2",
+            "CONF_HARD_MIN": "40.0",
+            "PA_STANDALONE_MIN_SCORE": "0.24",
+        })
+        assert cfg.MIN_CONFIRMATIONS == 1
+        assert cfg.TREND_MIN_CONFIRMATIONS == 1
+        assert cfg.RANGE_MIN_CONFIRMATIONS == 1
+        assert cfg.CONF_HARD_MIN == 30.0
+        assert cfg.PA_STANDALONE_MIN_SCORE == 0.16
 
     def test_quality_adx_min_default_is_balanced(self):
         cfg = _reload_config({})

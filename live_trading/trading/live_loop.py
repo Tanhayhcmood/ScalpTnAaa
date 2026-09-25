@@ -38,6 +38,7 @@ from live_trading.config import (
     MAX_OPEN_TRADES, COMMENT,
     BAR_CHECK_INTERVAL, RECONNECT_DELAY, SYNC_TIMEOUT, RPC_CALL_TIMEOUT,
     MIN_CONFIRMATIONS, TREND_MIN_CONFIRMATIONS,
+    ENTRY_CONFIRMATION_FLOOR,
     PRICE_ACTION_STANDALONE, PA_STANDALONE_MIN_SCORE,
     TREND_STANDALONE, TREND_STANDALONE_MIN_SCORE, REQUIRE_PRICE_ACTION,
     REQUIRE_SMC_PRICE_ACTION_WYCKOFF, USE_ATR_HIGH_VOL_FILTER,
@@ -3057,8 +3058,9 @@ class GoldScalperLive:
             clear_command("update_risk")
 
         # "update_strategy" — sent by Telegram panel strategy settings.
-        # Payload keys (all optional): min_confirmations (int),
-        # price_action_standalone (bool).
+        # The confirmation floor is intentionally locked to the active
+        # Trend/Price Action policy so stale Telegram/Redis payloads cannot
+        # restore the previous value.
         if cmds.get("update_strategy"):
             payload = cmds["update_strategy"]
             if isinstance(payload, dict):
@@ -3066,7 +3068,15 @@ class GoldScalperLive:
                 _g = globals()
                 try:
                     if "min_confirmations" in payload:
-                        v = int(float(payload["min_confirmations"]))
+                        requested = int(float(payload["min_confirmations"]))
+                        v = ENTRY_CONFIRMATION_FLOOR
+                        if requested != v:
+                            log.warning(
+                                "Ignoring legacy Telegram min_confirmations=%s; "
+                                "using locked value %s",
+                                requested,
+                                v,
+                            )
                         _live_cfg.MIN_CONFIRMATIONS = v; _g["MIN_CONFIRMATIONS"] = v
                     if "price_action_standalone" in payload:
                         raw = payload["price_action_standalone"]

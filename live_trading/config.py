@@ -71,6 +71,22 @@ def _float(name: str, default: float, lo: float | None = None, hi: float | None 
     return val
 
 
+def _locked_float(
+    name: str,
+    expected: float,
+    lo: float | None = None,
+    hi: float | None = None,
+) -> float:
+    """Keep a safety-critical threshold authoritative over stale ENV values."""
+    value = _float(name, expected, lo=lo, hi=hi)
+    if value != expected:
+        print(
+            f"WARNING: {name}={value} is legacy; using locked value {expected}.",
+            file=sys.stderr,
+        )
+    return expected
+
+
 def _strategy_list(name: str, default: str) -> tuple[str, ...]:
     """Parse the signal engines that are allowed to authorize live entries."""
     valid = ("smc", "trend", "price_action", "wyckoff")
@@ -96,13 +112,26 @@ def _strategy_list(name: str, default: str) -> tuple[str, ...]:
 LIVE_ENTRY_STRATEGIES = ("trend", "price_action")
 
 
-def _entry_confirmation_floor(name: str, default: int = 1) -> int:
+def _entry_confirmation_floor(
+    name: str,
+    default: int = 1,
+    *,
+    locked_to: int | None = None,
+) -> int:
     """Read a confirmation setting without allowing diagnostic-engine votes.
 
     Render may retain an older environment value after a deployment. Capping
     here keeps the Trend/Price Action policy authoritative even when that happens.
     """
     value = _int(name, default, lo=1, hi=4)
+    if locked_to is not None:
+        if value != locked_to:
+            print(
+                f"WARNING: {name}={value} is legacy; using locked value "
+                f"{locked_to}.",
+                file=sys.stderr,
+            )
+        return locked_to
     if value > len(LIVE_ENTRY_STRATEGIES):
         print(
             f"WARNING: {name}={value} exceeds the Trend/Price Action live-entry "
@@ -251,10 +280,17 @@ RANGE_MIN_CONFIDENCE  = _float("RANGE_MIN_CONFIDENCE",  40.0, lo=0.0, hi=100.0)
 # separately pass its enabled standalone policy and score threshold.
 # RANGE has its own confirmation floor below, independent of
 # TREND_MIN_CONFIRMATIONS and the ordinary entry policy.
-MIN_CONFIRMATIONS = _entry_confirmation_floor("MIN_CONFIRMATIONS", default=1)
+ENTRY_CONFIRMATION_FLOOR = 1
+MIN_CONFIRMATIONS = _entry_confirmation_floor(
+    "MIN_CONFIRMATIONS",
+    default=ENTRY_CONFIRMATION_FLOOR,
+    locked_to=ENTRY_CONFIRMATION_FLOOR,
+)
 # A Trend-aligned ordinary entry has its own compatibility setting.
 TREND_MIN_CONFIRMATIONS = _entry_confirmation_floor(
-    "TREND_MIN_CONFIRMATIONS", default=1
+    "TREND_MIN_CONFIRMATIONS",
+    default=ENTRY_CONFIRMATION_FLOOR,
+    locked_to=ENTRY_CONFIRMATION_FLOOR,
 )
 # Dedicated RANGE playbook. Its confirmation floor is intentionally separate
 # from both MIN_CONFIRMATIONS and TREND_MIN_CONFIRMATIONS so RANGE can use a
@@ -263,7 +299,9 @@ RANGE_TRADING_ENABLED = os.getenv("RANGE_TRADING_ENABLED", "true").strip().lower
     "1", "true", "yes", "on",
 }
 RANGE_MIN_CONFIRMATIONS = _entry_confirmation_floor(
-    "RANGE_MIN_CONFIRMATIONS", default=1
+    "RANGE_MIN_CONFIRMATIONS",
+    default=ENTRY_CONFIRMATION_FLOOR,
+    locked_to=ENTRY_CONFIRMATION_FLOOR,
 )
 # Weak RANGE conditions are noisier, so the entry policy can require a
 # stronger consensus without changing the normal RANGE floor.
@@ -292,7 +330,7 @@ PRICE_ACTION_STANDALONE = os.getenv(
 # Standalone PA entries still require a directional signal and this minimum
 # score; clear engulfing, breakout, and inside-bar triggers remain directional
 # below it.
-PA_STANDALONE_MIN_SCORE = _float(
+PA_STANDALONE_MIN_SCORE = _locked_float(
     "PA_STANDALONE_MIN_SCORE", 0.16, lo=0.15, hi=1.0
 )
 # A Trend-only entry is available only when the signed Trend score is strong
@@ -323,7 +361,7 @@ REQUIRE_SMC_PRICE_ACTION_WYCKOFF = os.getenv(
 # CONF_HARD_MIN is the absolute confidence floor shared by normal and RANGE
 # entries. The floor is 30%; independent quality and risk gates remain active.
 # MTF, R:R, quality, broker, and risk gates remain active.
-CONF_HARD_MIN     = _float("CONF_HARD_MIN",      30.0, lo=0.0, hi=100.0)
+CONF_HARD_MIN = _locked_float("CONF_HARD_MIN", 30.0, lo=0.0, hi=100.0)
 # QUALITY_ADX_MIN: minimum ADX value required to confirm usable momentum.
 # 12 blocks very weak/choppy entries without requiring a fully developed trend.
 QUALITY_ADX_MIN   = _float("QUALITY_ADX_MIN",    12.0, lo=5.0,  hi=40.0)

@@ -114,12 +114,12 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `SL_ATR_BASE_MULTIPLIER` | No | `3.0` | Minimum protective-stop distance in higher-timeframe ATR units; capped at `3.5` |
 | `LOW_VOLATILITY_SL_ATR_ADD` | No | `0.5` | Additional ATR multiplier for LOW_VOLATILITY stops; total remains capped at `3.5` |
 | `RISK_PERCENT` | No | `1.0` | Risk per trade (% of balance) |
-| `MIN_CONFIRMATIONS` | No | `2` | Every ordinary entry requires two aligned engine confirmations |
-| `TREND_MIN_CONFIRMATIONS` | No | `2` | Minimum confirmations when Trend votes for the entry direction |
+| `MIN_CONFIRMATIONS` | No | `1` | Locked base confirmation floor for ordinary entries |
+| `TREND_MIN_CONFIRMATIONS` | No | `1` | Locked confirmation floor when Trend votes for the entry direction |
 | `ENABLED_STRATEGIES` | No | `trend,price_action` | Signal engines allowed to authorize live entries; SMC and Wyckoff remain diagnostic-only by default |
 | `PRICE_ACTION_STANDALONE` | No | `true` | Allow a directional Price Action signal to authorize an entry alone; other quality/risk gates remain active |
 | `RANGE_TRADING_ENABLED` | No | `true` | Enable the dedicated edge/sweep/reversal RANGE playbook |
-| `RANGE_MIN_CONFIRMATIONS` | No | `2` | Normal RANGE confirmation floor |
+| `RANGE_MIN_CONFIRMATIONS` | No | `1` | Locked normal RANGE confirmation floor |
 | `RANGE_WEAK_MIN_CONFIRMATIONS` | No | `2` | Weak RANGE confirmation floor; capped at the two live entry engines |
 | `RANGE_MIN_RR` | No | `1.5` | Minimum RANGE risk/reward |
 | `RANGE_EDGE_ATR_DISTANCE` | No | `0.25` | Maximum distance from a RANGE edge in ATR units |
@@ -128,7 +128,7 @@ Full reference with descriptions: [`live_trading/.env.example`](live_trading/.en
 | `MAX_RANGE_TRADES_PER_SESSION` | No | `2` | Successful RANGE entries allowed per UTC session |
 | `MAX_OPEN_TRADES` | No | `5` | Maximum simultaneous open positions for bounded active-strategy scale-in |
 | `ALLOW_HEDGED_POSITIONS` | No | `false` | Allow opposite BUY/SELL positions on the same symbol; keep disabled for one-way scalping |
-| `CONF_HARD_MIN` | No | `35` | Balanced confidence-engine hard floor |
+| `CONF_HARD_MIN` | No | `30` | Locked confidence-engine hard floor |
 | `MTF_ENABLED` | No | `true` | Enable the higher-timeframe negative-only opposition check |
 | `MTF_TIMEFRAME` | No | `H1` | Higher timeframe used for trend opposition |
 | `MTF_CANDLE_WINDOW` | No | `300` | Closed higher-timeframe bars fetched for analysis |

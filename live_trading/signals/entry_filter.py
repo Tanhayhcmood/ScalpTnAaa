@@ -7,9 +7,8 @@ entry vote.
 from dataclasses import dataclass
 from typing import Iterable, Literal
 
-MIN_CONFIRMATIONS = 1
-PA_STANDALONE_MIN_SCORE = 0.16
-PA_STANDALONE_PREVIOUS_MIN_SCORE = 0.24
+from live_trading.config import MIN_CONFIRMATIONS, PA_STANDALONE_MIN_SCORE
+
 ENTRY_STRATEGIES = ("trend", "price_action")
 ALL_STRATEGIES = ENTRY_STRATEGIES
 
@@ -98,11 +97,6 @@ def apply_entry_filter(
         and pa_direction in {"BUY", "SELL"}
         and numeric_pa_score >= effective_pa_standalone_min_score
     )
-    report_weak_pa_direction = (
-        votes["trend"] == "NEUTRAL"
-        and pa_direction in {"BUY", "SELL"}
-        and 0 < numeric_pa_score < PA_STANDALONE_PREVIOUS_MIN_SCORE
-    )
     if direction == "NEUTRAL" and pa_standalone_ok:
         direction = pa_direction
 
@@ -113,9 +107,7 @@ def apply_entry_filter(
     ):
         return EntryFilterResult(
             allowed=False,
-            direction=(
-                pa_direction if report_weak_pa_direction else "NEUTRAL"
-            ),
+            direction="NEUTRAL",
             confirmation_count=0,
             smc=False,
             trend=False,
@@ -154,11 +146,7 @@ def apply_entry_filter(
 
     return EntryFilterResult(
         allowed=allowed,
-        direction=(
-            direction
-            if allowed
-            else pa_direction if report_weak_pa_direction else "NEUTRAL"
-        ),  # type: ignore
+        direction=direction if allowed else "NEUTRAL",  # type: ignore
         confirmation_count=count,
         smc=smc_ok,
         trend=trend_ok,
