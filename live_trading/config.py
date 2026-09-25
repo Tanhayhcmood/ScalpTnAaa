@@ -251,10 +251,10 @@ RANGE_MIN_CONFIDENCE  = _float("RANGE_MIN_CONFIDENCE",  40.0, lo=0.0, hi=100.0)
 # separately pass its enabled standalone policy and score threshold.
 # RANGE has its own confirmation floor below, independent of
 # TREND_MIN_CONFIRMATIONS and the ordinary entry policy.
-MIN_CONFIRMATIONS = _entry_confirmation_floor("MIN_CONFIRMATIONS", default=2)
+MIN_CONFIRMATIONS = _entry_confirmation_floor("MIN_CONFIRMATIONS", default=1)
 # A Trend-aligned ordinary entry has its own compatibility setting.
 TREND_MIN_CONFIRMATIONS = _entry_confirmation_floor(
-    "TREND_MIN_CONFIRMATIONS", default=2
+    "TREND_MIN_CONFIRMATIONS", default=1
 )
 # Dedicated RANGE playbook. Its confirmation floor is intentionally separate
 # from both MIN_CONFIRMATIONS and TREND_MIN_CONFIRMATIONS so RANGE can use a
@@ -262,7 +262,9 @@ TREND_MIN_CONFIRMATIONS = _entry_confirmation_floor(
 RANGE_TRADING_ENABLED = os.getenv("RANGE_TRADING_ENABLED", "true").strip().lower() in {
     "1", "true", "yes", "on",
 }
-RANGE_MIN_CONFIRMATIONS = _entry_confirmation_floor("RANGE_MIN_CONFIRMATIONS")
+RANGE_MIN_CONFIRMATIONS = _entry_confirmation_floor(
+    "RANGE_MIN_CONFIRMATIONS", default=1
+)
 # Weak RANGE conditions are noisier, so the entry policy can require a
 # stronger consensus without changing the normal RANGE floor.
 RANGE_WEAK_MIN_CONFIRMATIONS = _entry_confirmation_floor(

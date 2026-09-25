@@ -69,12 +69,11 @@ services:
         value: "24"
       - key: RISK_PERCENT
         value: "1.0"
-      # Ordinary non-PA entries require two aligned engine confirmations.
-      # Price Action has its own explicit standalone path below.
+      # The base policy floor is one; standalone checks still gate single-vote entries.
       - key: MIN_CONFIRMATIONS
-        value: "2"
+        value: "1"
       - key: TREND_MIN_CONFIRMATIONS
-        value: "2"
+        value: "1"
       # Keep stops at least 3x higher-timeframe ATR and widen LOW_VOLATILITY
       # setups by another 0.5x, with the capital manager capped at 3.5x.
       - key: SL_ATR_BASE_MULTIPLIER
@@ -91,7 +90,7 @@ services:
       - key: RANGE_TRADING_ENABLED
         value: "true"
       - key: RANGE_MIN_CONFIRMATIONS
-        value: "2"
+        value: "1"
       - key: RANGE_MIN_RR
         value: "1.5"
       - key: RANGE_EDGE_ATR_DISTANCE

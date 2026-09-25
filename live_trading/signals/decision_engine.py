@@ -146,8 +146,8 @@ def _effective_min_confirmations(
     Counter-trend and choppy-market handling remain covered by the existing
     confidence, quality, regime, MTF, and risk gates.
     """
-    # RANGE keeps its existing single-vote floor. Ordinary directional entries
-    # can use both configured voters, with standalone exceptions checked later.
+    # Ordinary entries honor their configured floor; standalone authorization
+    # is checked later. RANGE retains its independent confirmation floor.
     max_confirmations = 1 if regime == "RANGE" else 2
     base_min_confirmations = min(max(1, int(base_min_confirmations)), max_confirmations)
     range_min_confirmations = min(
@@ -165,7 +165,7 @@ def _effective_min_confirmations(
                 range_weak_min_confirmations,
             )
         return max(max_confirmations, range_min_confirmations)
-    return max(max_confirmations, base_min_confirmations)
+    return base_min_confirmations
 
 
 def _allow_without_smc_for_quality(
