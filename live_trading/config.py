@@ -345,7 +345,7 @@ RANGE_ENTRY_FILTERS_ENABLED = os.getenv(
 MAX_RANGE_TRADES_PER_SESSION = _int("MAX_RANGE_TRADES_PER_SESSION", 2, lo=1, hi=20)
 # When enabled, a clear Price Action signal may authorize a standalone entry.
 PRICE_ACTION_STANDALONE = os.getenv(
-    "PRICE_ACTION_STANDALONE", "false"
+    "PRICE_ACTION_STANDALONE", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
 # Standalone PA entries still require a directional signal and this minimum
 # score; clear engulfing, breakout, and inside-bar triggers remain directional

@@ -50,10 +50,9 @@ def evaluate_active_entry(
 ) -> ActiveEntryPolicyResult:
     """Return whether ``decision`` belongs to the one live strategy.
 
-    This is deliberately stricter than the legacy multi-engine decision
-    result. Trend must agree with the direction unless the entry filter
-    approved a score-qualified standalone Price Action entry. SMC and Wyckoff
-    remain diagnostic-only and cannot authorize or veto this policy.
+    Either Trend or Price Action may authorize the direction through its own
+    standalone gate. SMC and Wyckoff remain diagnostic-only and cannot
+    authorize or veto this policy.
     """
     normalized_symbol = str(symbol or "").upper().strip()
     if normalized_symbol != ACTIVE_ENTRY_SYMBOL:
@@ -100,9 +99,13 @@ def evaluate_active_entry(
     trend_direction = _trend_direction(getattr(decision, "trend", None))
     entry_filter = getattr(decision, "entry_filter", None)
     trend_confirmed = bool(getattr(entry_filter, "trend", False))
+    pa_direction = str(
+        getattr(getattr(decision, "pa", None), "pa_signal", "")
+    ).upper()
     pa_standalone_confirmed = (
-        trend_direction == "NEUTRAL"
-        and bool(getattr(entry_filter, "price_action", False))
+        bool(getattr(entry_filter, "price_action", False))
+        and direction == pa_direction
+        and not trend_confirmed
     )
     if trend_direction != direction and not pa_standalone_confirmed:
         return ActiveEntryPolicyResult(
@@ -116,7 +119,8 @@ def evaluate_active_entry(
         return ActiveEntryPolicyResult(
             False,
             ACTIVE_ENTRY_STRATEGY,
-            f"{ACTIVE_ENTRY_STRATEGY} blocked: Trend confirmation is required",
+            f"{ACTIVE_ENTRY_STRATEGY} blocked: Trend or Price Action "
+            "confirmation is required",
         )
 
     return ActiveEntryPolicyResult(True, ACTIVE_ENTRY_STRATEGY)

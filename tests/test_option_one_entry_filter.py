@@ -1,8 +1,4 @@
-"""Regression tests for retired multi-engine live-entry options.
-
-SMC, Price Action, and Wyckoff remain diagnostic inputs, but live entries are
-authorized only by Trend.
-"""
+"""Regression tests for the independent Trend/Price Action entry policy."""
 
 from live_trading.signals.decision_engine import _allow_without_smc_for_quality
 from live_trading.signals.entry_filter import apply_entry_filter
@@ -58,23 +54,43 @@ def test_strong_trend_can_authorize_without_price_action():
     assert result.confirmation_count == 1
 
 
-def test_price_action_cannot_open_without_trend():
+def test_price_action_can_open_without_trend():
     result = apply_entry_filter(
         smc_signal="NEUTRAL",
-        ema_trend="NEUTRAL",
+        ema_trend="BEARISH",
         pa_signal="BUY",
         wyckoff_signal="NEUTRAL",
         min_confirmations=2,
         price_action_standalone=True,
+        pa_score=0.20,
     )
 
-    assert result.allowed is False
-    assert result.direction == "NEUTRAL"
-    assert result.confirmation_count == 0
-    assert result.price_action is False
+    assert result.allowed is True
+    assert result.direction == "BUY"
+    assert result.confirmation_count == 1
+    assert result.price_action is True
     assert result.smc is False
     assert result.trend is False
     assert result.wyckoff is False
+
+
+def test_conflicting_engines_do_not_veto_a_qualified_trend_entry():
+    result = apply_entry_filter(
+        smc_signal="NEUTRAL",
+        ema_trend="BULLISH",
+        pa_signal="SELL",
+        wyckoff_signal="NEUTRAL",
+        min_confirmations=2,
+        trend_score=60.0,
+        trend_standalone=True,
+        trend_standalone_min_score=55.0,
+        price_action_standalone=False,
+    )
+
+    assert result.allowed is True
+    assert result.direction == "BUY"
+    assert result.trend is True
+    assert result.price_action is False
 
 
 def test_smc_only_signal_is_not_a_live_entry_confirmation():

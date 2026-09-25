@@ -1,4 +1,4 @@
-"""Bounded position capacity for the single live strategy.
+"""Bounded position capacity for the live Trend/Price Action strategy.
 
 Positions opened before strategy-slot tagging was introduced are treated as
 occupying every slot.  That fail-closed behavior prevents a legacy position
@@ -98,10 +98,12 @@ def one_way_entry_allowed(
 def strategy_slots_for_decision(decision) -> tuple[str, ...]:
     """Return the single live strategy slot claimed by a permitted decision."""
     entry_filter = getattr(decision, "entry_filter", None)
-    # Trend is the only live entry authority. Price Action, SMC, and Wyckoff
-    # remain diagnostic-only and must not be required to attach the active
-    # strategy slot.
-    if entry_filter is None or not bool(getattr(entry_filter, "trend", False)):
+    # Trend and Price Action are both live entry authorities. SMC and Wyckoff
+    # remain diagnostic-only and must not attach the active strategy slot.
+    if entry_filter is None or not (
+        bool(getattr(entry_filter, "trend", False))
+        or bool(getattr(entry_filter, "price_action", False))
+    ):
         return ()
     return (ACTIVE_STRATEGY_SLOT,)
 

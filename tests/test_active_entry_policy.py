@@ -51,9 +51,12 @@ def test_range_entries_are_authorized_when_trend_confirms():
     assert result.strategy == ACTIVE_ENTRY_STRATEGY
 
 
-def test_standalone_price_action_without_trend_is_blocked():
+def test_standalone_price_action_without_trend_is_allowed():
     result = evaluate_active_entry(
         _decision(
+            direction="BUY",
+            trend=SimpleNamespace(trend="BEARISH"),
+            pa=SimpleNamespace(pa_signal="BUY"),
             entry_filter=SimpleNamespace(
                 trend=False,
                 price_action=True,
@@ -65,8 +68,7 @@ def test_standalone_price_action_without_trend_is_blocked():
         timeframe="5m",
     )
 
-    assert result.allowed is False
-    assert "Trend confirmation" in result.reason
+    assert result.allowed is True
 
 
 def test_smc_and_wyckoff_cannot_authorize_entries_independently():
@@ -86,7 +88,7 @@ def test_smc_and_wyckoff_cannot_authorize_entries_independently():
         )
 
         assert result.allowed is False
-        assert "Trend confirmation" in result.reason
+        assert "Trend or Price Action confirmation" in result.reason
 
 
 def test_counter_trend_entries_are_blocked():

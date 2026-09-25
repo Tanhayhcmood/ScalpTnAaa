@@ -20,6 +20,7 @@ from live_trading.signals.entry_filter import (
     ENTRY_STRATEGIES,
     apply_entry_filter,
     EntryFilterResult,
+    select_independent_direction,
 )
 from live_trading.signals.range_strategy import RangeContext, evaluate_range_entry
 from live_trading.signals.divergence_engine import analyze_divergence, DivergenceResult
@@ -192,8 +193,11 @@ def _range_confirmation_gate(
 ) -> tuple[bool, str]:
     """Apply the RANGE confirmation floor without bypassing structure checks."""
     effective_min_confirmations = min(1, max(1, int(min_confirmations)))
-    if not entry_filter.trend:
-        return False, "RANGE entry blocked: Trend confirmation is required"
+    if not (entry_filter.trend or entry_filter.price_action):
+        return (
+            False,
+            "RANGE entry blocked: Trend or Price Action confirmation is required",
+        )
     if entry_filter.confirmation_count < effective_min_confirmations:
         return (
             False,
@@ -242,25 +246,25 @@ def _candidate_direction(
     price_action_standalone: bool = False,
     enabled_strategies = None,
     pa_standalone_min_score: float = PA_STANDALONE_MIN_SCORE,
+    trend_standalone: bool = TREND_STANDALONE,
+    trend_standalone_min_score: float = TREND_STANDALONE_MIN_SCORE,
 ) -> str:
-    """Use Trend direction, or configured PA standalone when Trend is neutral."""
-    if trend.trend == "BULLISH":
-        trend_direction = "BUY"
-    elif trend.trend == "BEARISH":
-        trend_direction = "SELL"
-    else:
-        if (
-            price_action_standalone
-            and pa.pa_signal in {"BUY", "SELL"}
-            and pa.pa_score >= pa_standalone_min_score
-        ):
-            return pa.pa_signal
-        return "NEUTRAL"
-
-    pa_direction = pa.pa_signal
-    if pa_direction in {"BUY", "SELL"} and pa_direction != trend_direction:
-        return "NEUTRAL"
-    return trend_direction
+    """Select Trend or Price Action independently when both disagree."""
+    trend_direction = (
+        "BUY" if trend.trend == "BULLISH"
+        else "SELL" if trend.trend == "BEARISH"
+        else "NEUTRAL"
+    )
+    return select_independent_direction(
+        trend_direction,
+        pa.pa_signal,
+        trend_standalone=trend_standalone,
+        trend_score=trend.score,
+        trend_standalone_min_score=trend_standalone_min_score,
+        price_action_standalone=price_action_standalone,
+        pa_score=pa.pa_score,
+        pa_standalone_min_score=pa_standalone_min_score,
+    )
 
 
 def _resolve_entry_policy(
@@ -362,6 +366,8 @@ def run_decision_engine(
         price_action_standalone=price_action_standalone,
         enabled_strategies=ENABLED_STRATEGIES,
         pa_standalone_min_score=pa_standalone_min_score,
+        trend_standalone=trend_standalone,
+        trend_standalone_min_score=trend_standalone_min_score,
     )
     if candidate == "NEUTRAL":
         return _make_neutral(

@@ -1,8 +1,7 @@
-"""Entry Filter — Trend and Price Action live-entry consensus.
+"""Entry Filter — independent Trend and Price Action live-entry authorization.
 
-Trend supplies the candidate direction. Price Action can confirm or oppose it.
-SMC and Wyckoff remain diagnostic inputs only and never participate in the
-entry vote.
+Agreement is preferred, but either eligible engine can authorize a trade using
+its own standalone threshold. SMC and Wyckoff remain diagnostic inputs only.
 """
 from dataclasses import dataclass
 from typing import Iterable, Literal
@@ -27,6 +26,65 @@ class EntryFilterResult:
 def _vote(value: str) -> str:
     if value in {"BUY", "SELL"}:
         return value
+    return "NEUTRAL"
+
+
+def select_independent_direction(
+    trend_direction: str,
+    pa_direction: str,
+    *,
+    trend_standalone: bool = False,
+    trend_score: float = 0.0,
+    trend_standalone_min_score: float = 55.0,
+    price_action_standalone: bool = False,
+    pa_score: float = 0.0,
+    pa_standalone_min_score: float = PA_STANDALONE_MIN_SCORE,
+) -> str:
+    """Choose an eligible engine without requiring the other engine to agree.
+
+    Agreement still produces the strongest signal. When the engines disagree,
+    each one is evaluated against its own standalone gate; the stronger
+    standalone margin wins so a weak signal cannot veto a qualified one.
+    """
+    trend_direction = _vote(trend_direction)
+    pa_direction = _vote(pa_direction)
+
+    try:
+        numeric_trend_score = float(trend_score)
+    except (TypeError, ValueError):
+        numeric_trend_score = 0.0
+    try:
+        numeric_pa_score = float(pa_score)
+    except (TypeError, ValueError):
+        numeric_pa_score = 0.0
+
+    trend_floor = max(0.0, float(trend_standalone_min_score))
+    pa_floor = min(float(pa_standalone_min_score), PA_STANDALONE_MIN_SCORE)
+    trend_standalone_ok = (
+        trend_standalone
+        and trend_direction in {"BUY", "SELL"}
+        and (
+            numeric_trend_score >= trend_floor
+            if trend_direction == "BUY"
+            else numeric_trend_score <= -trend_floor
+        )
+    )
+    pa_standalone_ok = (
+        price_action_standalone
+        and pa_direction in {"BUY", "SELL"}
+        and numeric_pa_score >= pa_floor
+    )
+
+    if trend_direction in {"BUY", "SELL"} and trend_direction == pa_direction:
+        return trend_direction
+    if trend_standalone_ok and not pa_standalone_ok:
+        return trend_direction
+    if pa_standalone_ok and not trend_standalone_ok:
+        return pa_direction
+    if trend_standalone_ok and pa_standalone_ok:
+        trend_margin = abs(numeric_trend_score) - trend_floor
+        pa_margin = numeric_pa_score - pa_floor
+        return trend_direction if trend_margin >= pa_margin * 100.0 else pa_direction
     return "NEUTRAL"
 
 
@@ -75,7 +133,7 @@ def apply_entry_filter(
         name: value if name in enabled else "NEUTRAL"
         for name, value in raw_votes.items()
     }
-    direction = votes["trend"]
+    trend_direction = votes["trend"]
     pa_direction = votes["price_action"]
 
     try:
@@ -87,24 +145,17 @@ def apply_entry_filter(
     except (TypeError, ValueError):
         numeric_pa_score = 0.0
 
-    # Cap stale caller configuration at the current standalone floor.
-    effective_pa_standalone_min_score = min(
-        float(pa_standalone_min_score), PA_STANDALONE_MIN_SCORE
+    direction = select_independent_direction(
+        trend_direction,
+        pa_direction,
+        trend_standalone=trend_standalone,
+        trend_score=numeric_trend_score,
+        trend_standalone_min_score=trend_standalone_min_score,
+        price_action_standalone=price_action_standalone,
+        pa_score=numeric_pa_score,
+        pa_standalone_min_score=pa_standalone_min_score,
     )
-    pa_standalone_ok = (
-        price_action_standalone
-        and direction == "NEUTRAL"
-        and pa_direction in {"BUY", "SELL"}
-        and numeric_pa_score >= effective_pa_standalone_min_score
-    )
-    if direction == "NEUTRAL" and pa_standalone_ok:
-        direction = pa_direction
-
-    if direction == "NEUTRAL" or (
-        pa_direction in {"BUY", "SELL"}
-        and votes["trend"] in {"BUY", "SELL"}
-        and pa_direction != votes["trend"]
-    ):
+    if direction == "NEUTRAL":
         return EntryFilterResult(
             allowed=False,
             direction="NEUTRAL",
@@ -121,16 +172,23 @@ def apply_entry_filter(
     pa_ok = votes["price_action"] == direction
     wyc_ok = votes["wyckoff"] == direction
 
+    effective_pa_standalone_min_score = min(
+        float(pa_standalone_min_score), PA_STANDALONE_MIN_SCORE
+    )
     aligned_trend_score = (
         numeric_trend_score >= trend_standalone_min_score
-        if direction == "BUY"
+        if trend_direction == "BUY"
         else numeric_trend_score <= -trend_standalone_min_score
     )
     trend_standalone_ok = (
         trend_standalone
         and trend_ok
-        and pa_direction == "NEUTRAL"
         and aligned_trend_score
+    )
+    pa_standalone_ok = (
+        price_action_standalone
+        and pa_ok
+        and numeric_pa_score >= effective_pa_standalone_min_score
     )
 
     # A one-vote entry can only use one of the explicit standalone paths.
