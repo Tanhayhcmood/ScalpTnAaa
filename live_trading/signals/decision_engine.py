@@ -59,8 +59,8 @@ from live_trading.config import (
 # 1.3 = profitable in expectancy even at 45% win rate (1.3 × 0.45 > 0.55).
 CONF_MARGINAL_RR = 1.3
 
-# Trend selects the candidate direction; Price Action can confirm or oppose it.
-# SMC and Wyckoff remain available for diagnostics/confidence but never vote.
+# Trend and Price Action can each select the candidate direction through their
+# own standalone gate. Agreement is stronger; SMC and Wyckoff remain diagnostic.
 # RANGE keeps its separate structural safeguards.
 _CHOPPY_REGIMES = {"ACCUMULATION", "DISTRIBUTION", "HIGH_VOLATILITY"}
 

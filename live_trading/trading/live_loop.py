@@ -1823,8 +1823,8 @@ class GoldScalperLive:
             return
 
         # Final defense-in-depth check for RANGE. The structural RANGE
-        # filters may be disabled for telemetry-only operation, but Trend
-        # remains the sole live-entry confirmation.
+        # filters may be disabled for telemetry-only operation, but at least
+        # one of the two live entry engines must still confirm the direction.
         _range_confirmation_floor = max(1, RANGE_MIN_CONFIRMATIONS)
         if (
             decision.regime == "RANGE"
