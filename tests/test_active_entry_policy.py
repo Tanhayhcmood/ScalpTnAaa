@@ -1,5 +1,8 @@
 from types import SimpleNamespace
 
+import pytest
+
+from live_trading.signals.market_regime import REGIME_RULES
 from live_trading.trading.active_entry_policy import (
     ACTIVE_ENTRY_STRATEGY,
     evaluate_active_entry,
@@ -49,6 +52,25 @@ def test_range_entries_are_authorized_when_trend_confirms():
 
     assert result.allowed is True
     assert result.strategy == ACTIVE_ENTRY_STRATEGY
+
+
+@pytest.mark.parametrize("regime", sorted(REGIME_RULES))
+def test_every_regime_rule_can_reach_the_active_entry_policy(regime):
+    rules = REGIME_RULES[regime]
+    direction = "BUY" if rules.allow_long else "SELL"
+    trend = "BULLISH" if direction == "BUY" else "BEARISH"
+
+    result = evaluate_active_entry(
+        _decision(
+            regime=regime,
+            direction=direction,
+            trend=SimpleNamespace(trend=trend),
+        ),
+        symbol="XAUUSD",
+        timeframe="5m",
+    )
+
+    assert result.allowed is True, result.reason
 
 
 def test_standalone_price_action_without_trend_is_allowed():

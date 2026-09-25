@@ -6,25 +6,12 @@ module is the only policy that can authorize the live order path.
 
 from dataclasses import dataclass
 
+from live_trading.signals.market_regime import REGIME_RULES
+
 
 ACTIVE_ENTRY_STRATEGY = "XAUUSD_VOLATILITY_TREND_BREAKOUT"
 ACTIVE_ENTRY_SYMBOL = "XAUUSD"
 ACTIVE_ENTRY_TIMEFRAME = "5m"
-
-# RANGE is allowed by the active strategy alongside the directional volatility
-# and trend regimes; pullback, Wyckoff, accumulation/distribution, and
-# low-volatility paths are not separate strategy identities.
-_ACTIVE_REGIMES = frozenset(
-    {
-        "HIGH_VOLATILITY",
-        "RANGE",
-        "STRONG_TREND_BULL",
-        "STRONG_TREND_BEAR",
-        "WEAK_TREND_BULL",
-        "WEAK_TREND_BEAR",
-    }
-)
-
 
 @dataclass(frozen=True)
 class ActiveEntryPolicyResult:
@@ -80,12 +67,12 @@ def evaluate_active_entry(
         )
 
     regime = str(getattr(decision, "regime", "")).upper().strip()
-    if regime not in _ACTIVE_REGIMES:
+    if regime not in REGIME_RULES:
         return ActiveEntryPolicyResult(
             False,
             ACTIVE_ENTRY_STRATEGY,
             f"{ACTIVE_ENTRY_STRATEGY} blocked: regime {regime or 'UNKNOWN'} "
-            "is not an active volatility/trend regime",
+            "is not a supported market regime",
         )
 
     direction = str(getattr(decision, "direction", "")).upper().strip()
