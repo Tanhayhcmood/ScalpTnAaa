@@ -1,19 +1,47 @@
 services:
-  # ─── Redis — cross-service IPC (robot ↔ Telegram panel) ───────────────────
-  # Keep the shared Redis service in Singapore with the robot and panel.
-  # It was previously created in frankfurt, so its private hostname never
-  # resolved from oregon — the panel silently never saw live position/state
-  # updates from the robot even though the robot itself was healthy.
-  - type: redis
-    name: ger-redis
+  # Free-tier demo environment only. Free services can sleep, and this
+  # Key Value instance does not persist data across restarts.
+  - type: keyvalue
+    name: ger-redis-fra
     plan: free
-    region: singapore
-    ipAllowList: []   # private — Render internal routing only; no public access
+    region: frankfurt
+    ipAllowList: []
+    maxmemoryPolicy: noeviction
+    persistenceMode: off
+
+  # MT5 REST bridge. Its UserKey is a fixed trial key from users.mtapi.io.
+  - type: web
+    name: goldscalper-v4-mtapi-fra
+    region: frankfurt
+    autoDeployTrigger: commit
+    runtime: docker
+    plan: free
+    rootDir: mtapi-bridge
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /Ping
+    envVars:
+      - key: UserKey
+        sync: false
+      - key: MT5_HOST
+        value: AMarkets-Demo
+      - key: MT5_PORT
+        value: "443"
+      - key: MT5_USER
+        fromService:
+          type: web
+          name: goldscalper-v4-robot-fra
+          envVarKey: MT5_USER
+      - key: MT5_PASSWORD
+        fromService:
+          type: web
+          name: goldscalper-v4-robot-fra
+          envVarKey: MT5_PASSWORD
 
   # ─── Trading robot ─────────────────────────────────────────────────────────
   - type: web
-    name: goldscalper-v4-robot-sg
-    region: singapore
+    name: goldscalper-v4-robot-fra
+    region: frankfurt
     autoDeployTrigger: commit
     runtime: python
     plan: free
@@ -21,12 +49,9 @@ services:
     buildCommand: pip install -r live_trading/requirements.txt
     startCommand: python live_trading/server.py
     envVars:
-      # Render supplies RENDER_EXTERNAL_URL/RENDER_EXTERNAL_HOSTNAME for the
-      # current service. Do not hard-code a generated hostname here: when the
-      # service is renamed, a stale value makes the free-tier keepalive ping a
-      # different service and the robot can be suspended for inactivity.
+      # This endpoint is the Frankfurt MT5 bridge defined above.
       - key: MTAPI_URL
-        value: "https://mt5.mtapi.io"
+        value: "https://goldscalper-v4-mtapi-fra.onrender.com"
       - key: MT5_HOST
         value: "AMarkets-Demo"
       - key: MT5_PORT
@@ -200,17 +225,16 @@ services:
         value: "/tmp/robot.log"
       - key: REDIS_URL
         fromService:
-          type: redis
-          name: ger-redis
+          type: keyvalue
+          name: ger-redis-fra
           property: connectionString
-      # FIX #1: ROBOT_COMMAND_TOKEN enables HTTP command fallback from panel.
       - key: ROBOT_COMMAND_TOKEN
-        sync: false
+        generateValue: true
 
   # ─── Telegram control panel ────────────────────────────────────────────────
   - type: web
-    name: goldscalper-v4-panel-sg
-    region: singapore
+    name: goldscalper-v4-panel-fra
+    region: frankfurt
     autoDeployTrigger: commit
     runtime: python
     plan: free
@@ -223,7 +247,21 @@ services:
       - key: TELEGRAM_OWNER_ID
         sync: false
       - key: PANEL_ENCRYPTION_KEY
-        sync: false
+        generateValue: true
+      - key: MT5_HOST
+        value: AMarkets-Demo
+      - key: MT5_ACCOUNT_TYPE
+        value: demo
+      - key: MT5_USER
+        fromService:
+          type: web
+          name: goldscalper-v4-robot-fra
+          envVarKey: MT5_USER
+      - key: MT5_PASSWORD
+        fromService:
+          type: web
+          name: goldscalper-v4-robot-fra
+          envVarKey: MT5_PASSWORD
       - key: TELEGRAM_ADMIN_IDS
         value: ""
       - key: PYTHON_VERSION
@@ -236,13 +274,15 @@ services:
         value: "redis"
       - key: ROBOT_STATE_PATH
         value: "/tmp/robot_state.json"
-      # FIX #1: ROBOT_BASE_URL and ROBOT_COMMAND_TOKEN enable HTTP fallback.
       - key: ROBOT_BASE_URL
-        value: "https://goldscalper-v4-robot-sg.onrender.com"
+        value: "https://goldscalper-v4-robot-fra.onrender.com"
       - key: ROBOT_COMMAND_TOKEN
-        sync: false
+        fromService:
+          type: web
+          name: goldscalper-v4-robot-fra
+          envVarKey: ROBOT_COMMAND_TOKEN
       - key: REDIS_URL
         fromService:
-          type: redis
-          name: ger-redis
+          type: keyvalue
+          name: ger-redis-fra
           property: connectionString
