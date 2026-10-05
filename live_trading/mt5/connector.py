@@ -19,16 +19,19 @@ MTAPI endpoints used:
     GET  /OpenedOrders     – open positions
     GET  /HistoryPositions – completed positions by ticket
     GET  /OrderHistory    – account order/deal history by UTC range
-    GET  /PriceHistoryV2   – OHLCV candles (ISO datetime range)
+    GET  /PriceHistory     – OHLCV candles (ISO datetime range)
+    GET  /PriceHistoryV2   – compatibility fallback for older bridges
     GET  /GetQuote         – current bid/ask price
     GET  /SymbolList       – verify the configured instrument is available
 """
 
 import asyncio
+import json
 import math
 import time as _time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote, quote_plus
 
 import aiohttp
 
@@ -166,13 +169,24 @@ def _completed_candles(
             continue
         seen_times.add(candle_time)
         ordered.append((candle_time, candle))
-    if timeframe_minutes == 60:
-        close_cutoff = now - timedelta(seconds=2)
-        return [
-            candle for candle_time, candle in ordered
-            if candle_time + timedelta(hours=1) <= close_cutoff
-        ]
-    return [candle for _, candle in ordered[:-1]]
+    close_cutoff = now - timedelta(seconds=2)
+    return [
+        candle
+        for candle_time, candle in ordered
+        if candle_time + timedelta(minutes=timeframe_minutes) <= close_cutoff
+    ]
+
+
+def _redact_candle_diagnostic(value: object, *, limit: int = 500) -> str:
+    """Bound diagnostic text and remove credentials/session IDs before logging."""
+    text = str(value)
+    for secret in (MT5_PASSWORD, _conn_id):
+        if not secret:
+            continue
+        for encoded in {secret, quote(secret, safe=""), quote_plus(secret, safe="")}:
+            if encoded:
+                text = text.replace(encoded, "[REDACTED]")
+    return text[:limit]
 
 
 def _get_session() -> aiohttp.ClientSession:
@@ -593,13 +607,15 @@ async def fetch_candles(
                 ))
             parsed.sort(key=lambda item: item[0])
             return [candle for _, candle in parsed[:-1]][-requested_count:]
-        except Exception:
-            log.exception(
+        except Exception as exc:
+            log.error(
                 "fetch_candles legacy adapter failed "
-                "(symbol=%s timeframe=%s count=%d)",
+                "(symbol=%s timeframe=%s count=%d exception=%s: %s)",
                 symbol,
                 timeframe,
                 requested_count,
+                type(exc).__name__,
+                _redact_candle_diagnostic(exc),
             )
             return []
     for attempt in range(2):
@@ -609,10 +625,14 @@ async def fetch_candles(
                     ensure_connected(),
                     timeout=_CANDLE_FETCH_CONNECT_TIMEOUT_S,
                 )
-            except Exception:
-                log.exception(
-                    "fetch_candles connection check failed "
+            except Exception as exc:
+                log.error(
+                    "fetch_candles connection check failed endpoint=%s "
+                    "status=unavailable body='' exception=%s: %s "
                     "(symbol=%s timeframe=%s attempt=%d)",
+                    f"{_base_url.rstrip('/')}/PriceHistory",
+                    type(exc).__name__,
+                    _redact_candle_diagnostic(exc),
                     symbol,
                     timeframe,
                     attempt + 1,
@@ -620,8 +640,10 @@ async def fetch_candles(
                 return []
             if not connected:
                 log.error(
-                    "fetch_candles connection unavailable "
+                    "fetch_candles connection unavailable endpoint=%s "
+                    "status=unavailable body='' exception=NoActiveSession "
                     "(symbol=%s timeframe=%s attempt=%d)",
+                    f"{_base_url.rstrip('/')}/PriceHistory",
                     symbol,
                     timeframe,
                     attempt + 1,
@@ -635,88 +657,212 @@ async def fetch_candles(
         )
         from_str = (now - timedelta(minutes=request_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
         to_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        try:
-            async with _get_session().get(
-                f"{_base_url}/PriceHistoryV2",
-                params={
-                    "id": _conn_id,
-                    "symbol": symbol,
-                    "from": from_str,
-                    "to": to_str,
-                    "timeFrame": tf_min,
-                },
-                timeout=aiohttp.ClientTimeout(total=_CANDLE_FETCH_HTTP_TIMEOUT_S),
-            ) as resp:
-                data = await resp.json(content_type=None)
-                if not isinstance(data, list):
-                    log.error(
-                        "fetch_candles returned non-list payload "
-                        "(symbol=%s timeframe=%s attempt=%d status=%d type=%s payload=%s)",
+        request_params = {
+            "id": _conn_id,
+            "symbol": symbol,
+            "from": from_str,
+            "to": to_str,
+            "timeFrame": tf_min,
+        }
+        retry_after_connection_error = False
+        for endpoint_path in ("/PriceHistory", "/PriceHistoryV2"):
+            endpoint = f"{_base_url.rstrip('/')}{endpoint_path}"
+            status: Optional[int] = None
+            raw_body = ""
+            try:
+                async with _get_session().get(
+                    endpoint,
+                    params=request_params,
+                    timeout=aiohttp.ClientTimeout(total=_CANDLE_FETCH_HTTP_TIMEOUT_S),
+                ) as resp:
+                    status = resp.status
+                    raw_body = await resp.text()
+            except Exception as exc:
+                log.error(
+                    "fetch_candles request failed endpoint=%s status=%s body=%s "
+                    "exception=%s: %s (symbol=%s timeframe=%s attempt=%d)",
+                    endpoint,
+                    status if status is not None else "unavailable",
+                    _redact_candle_diagnostic(raw_body),
+                    type(exc).__name__,
+                    _redact_candle_diagnostic(exc),
+                    symbol,
+                    timeframe,
+                    attempt + 1,
+                )
+                if attempt == 0:
+                    _invalidate_connection()
+                    retry_after_connection_error = True
+                    break
+                return []
+
+            if status != 200:
+                if endpoint_path == "/PriceHistory" and status in {404, 405}:
+                    log.warning(
+                        "fetch_candles history endpoint unavailable; trying "
+                        "compatibility endpoint endpoint=%s status=%d body=%s "
+                        "exception=HTTP %d (symbol=%s timeframe=%s attempt=%d)",
+                        endpoint,
+                        status,
+                        _redact_candle_diagnostic(raw_body),
+                        status,
                         symbol,
                         timeframe,
                         attempt + 1,
-                        resp.status,
-                        type(data).__name__,
-                        repr(data)[:240],
                     )
-                    # A valid HTTP response containing an MTAPI error object
-                    # is a data failure, not proof that the session is stale.
-                    # Reconnecting here can block the main loop for the full
-                    # broker handshake while the original problem persists.
-                    return []
-                candles_with_times: List[Tuple[datetime, OHLCV]] = []
-                for bar in data:
-                    if not isinstance(bar, dict):
-                        log.warning(
-                            "fetch_candles skipped non-object candle "
-                            "(symbol=%s timeframe=%s type=%s)",
-                            symbol,
-                            timeframe,
-                            type(bar).__name__,
-                        )
-                        continue
-                    candle_time = _parse_candle_time(bar.get("time", ""))
-                    if candle_time is None:
-                        continue
-                    try:
-                        candle = OHLCV(
-                            time=candle_time.isoformat().replace("+00:00", "Z"),
-                            open=float(bar.get("openPrice", 0.0)),
-                            high=float(bar.get("highPrice", 0.0)),
-                            low=float(bar.get("lowPrice", 0.0)),
-                            close=float(bar.get("closePrice", 0.0)),
-                            volume=float(bar.get("tickVolume", bar.get("volume", 0))),
-                        )
-                    except (TypeError, ValueError):
-                        continue
-                    candles_with_times.append((candle_time, candle))
-                candles = _completed_candles(
-                    candles_with_times,
-                    timeframe_minutes=tf_min,
-                    now=now,
+                    continue
+                log.error(
+                    "fetch_candles HTTP failure endpoint=%s status=%d body=%s "
+                    "exception=HTTP %d "
+                    "(symbol=%s timeframe=%s attempt=%d)",
+                    endpoint,
+                    status,
+                    _redact_candle_diagnostic(raw_body),
+                    status,
+                    symbol,
+                    timeframe,
+                    attempt + 1,
                 )
-                return (
-                    candles[-requested_count:]
-                    if len(candles) > requested_count
-                    else candles
+                return []
+
+            try:
+                data = json.loads(raw_body)
+            except (TypeError, ValueError) as exc:
+                log.error(
+                    "fetch_candles invalid JSON endpoint=%s status=%d body=%s "
+                    "exception=%s: %s (symbol=%s timeframe=%s attempt=%d)",
+                    endpoint,
+                    status,
+                    _redact_candle_diagnostic(raw_body),
+                    type(exc).__name__,
+                    _redact_candle_diagnostic(exc),
+                    symbol,
+                    timeframe,
+                    attempt + 1,
                 )
-        except Exception as exc:
-            if attempt == 0:
-                log.exception(
-                    "fetch_candles error (attempt 1) — reconnecting "
-                    "(symbol=%s timeframe=%s)",
+                return []
+
+            if not isinstance(data, list):
+                log.error(
+                    "fetch_candles returned non-list payload endpoint=%s "
+                    "status=%d body=%s exception=UnexpectedPayloadType:%s "
+                    "(symbol=%s timeframe=%s attempt=%d)",
+                    endpoint,
+                    status,
+                    _redact_candle_diagnostic(raw_body),
+                    type(data).__name__,
+                    symbol,
+                    timeframe,
+                    attempt + 1,
+                )
+                return []
+
+            candles_with_times: List[Tuple[datetime, OHLCV]] = []
+            skipped_rows = 0
+            for bar in data:
+                if not isinstance(bar, dict):
+                    skipped_rows += 1
+                    continue
+                candle_time = _parse_candle_time(
+                    bar.get("time") or bar.get("brokerTime") or bar.get("timestamp")
+                )
+                if candle_time is None:
+                    skipped_rows += 1
+                    continue
+                open_raw = bar.get("openPrice")
+                high_raw = bar.get("highPrice")
+                low_raw = bar.get("lowPrice")
+                close_raw = bar.get("closePrice")
+                open_raw = bar.get("open") if open_raw is None else open_raw
+                high_raw = bar.get("high") if high_raw is None else high_raw
+                low_raw = bar.get("low") if low_raw is None else low_raw
+                close_raw = bar.get("close") if close_raw is None else close_raw
+                try:
+                    if any(
+                        value is None
+                        for value in (open_raw, high_raw, low_raw, close_raw)
+                    ):
+                        raise ValueError("missing OHLC field")
+                    open_value, high_value, low_value, close_value = (
+                        float(value)
+                        for value in (open_raw, high_raw, low_raw, close_raw)
+                    )
+                    if not all(
+                        math.isfinite(value)
+                        for value in (
+                            open_value,
+                            high_value,
+                            low_value,
+                            close_value,
+                        )
+                    ):
+                        raise ValueError("non-finite OHLC field")
+                    volume_raw = bar.get("tickVolume")
+                    if volume_raw is None:
+                        volume_raw = bar.get("volume", 0)
+                    volume_value = float(volume_raw or 0)
+                except (TypeError, ValueError, OverflowError):
+                    skipped_rows += 1
+                    continue
+                candle = OHLCV(
+                    time=candle_time.isoformat().replace("+00:00", "Z"),
+                    open=open_value,
+                    high=high_value,
+                    low=low_value,
+                    close=close_value,
+                    volume=volume_value,
+                )
+                candles_with_times.append((candle_time, candle))
+
+            if skipped_rows:
+                log.warning(
+                    "fetch_candles skipped invalid history rows endpoint=%s "
+                    "status=%d skipped=%d total=%d (symbol=%s timeframe=%s)",
+                    endpoint,
+                    status,
+                    skipped_rows,
+                    len(data),
                     symbol,
                     timeframe,
                 )
-                _invalidate_connection()
-                continue
-            log.exception(
-                "fetch_candles error after reconnect "
-                "(symbol=%s timeframe=%s)",
-                symbol,
-                timeframe,
+            if not candles_with_times:
+                log.error(
+                    "fetch_candles returned no parseable candles endpoint=%s "
+                    "status=%d body=%s exception=NoParseableCandles "
+                    "(symbol=%s timeframe=%s)",
+                    endpoint,
+                    status,
+                    _redact_candle_diagnostic(raw_body),
+                    symbol,
+                    timeframe,
+                )
+                return []
+
+            candles = _completed_candles(
+                candles_with_times,
+                timeframe_minutes=tf_min,
+                now=now,
             )
-            return []
+            if not candles:
+                log.warning(
+                    "fetch_candles returned no completed candles endpoint=%s "
+                    "status=%d body=%s (symbol=%s timeframe=%s)",
+                    endpoint,
+                    status,
+                    _redact_candle_diagnostic(raw_body),
+                    symbol,
+                    timeframe,
+                )
+                return []
+            return (
+                candles[-requested_count:]
+                if len(candles) > requested_count
+                else candles
+            )
+
+        if retry_after_connection_error:
+            continue
+        return []
     return []
 
 
