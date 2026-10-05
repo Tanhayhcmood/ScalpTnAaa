@@ -1101,9 +1101,9 @@ class GoldScalperLive:
                 if bt is None:
                     continue
                 # ── Staleness guard ──────────────────────────────────────────
-                # Right after MT5 connects, PriceHistoryV2 returns cached
-                # historical data (sometimes years old) until the terminal
-                # finishes syncing from the broker.  Processing a 2022 bar in
+                # Right after MT5 connects, MTAPI can return cached history
+                # (sometimes years old) until the terminal finishes syncing
+                # from the broker. Processing a 2022 bar in
                 # 2026 context would crash the signal pipeline or open a trade
                 # with completely wrong ATR/SL/TP values.  Skip any bar that is
                 # more than 2 hours old relative to UTC wall-clock time.
