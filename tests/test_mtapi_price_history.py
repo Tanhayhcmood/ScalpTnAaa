@@ -17,6 +17,9 @@ class _FakeResponse:
     async def text(self) -> str:
         return self._body
 
+    async def json(self, content_type=None) -> object:
+        return json.loads(self._body)
+
 
 class _FakeRequest:
     def __init__(self, response: _FakeResponse):
@@ -63,11 +66,21 @@ def _bar(at: datetime, offset: int) -> dict:
 
 def _fetch_and_get_latest(session: _FakeSession):
     async def run():
+        quote = {
+            "bid": 2300.0,
+            "ask": 2300.1,
+            "server_time_raw": _FrozenDateTime.fixed_now.isoformat().replace(
+                "+00:00", "Z"
+            ),
+        }
         with (
             patch.object(connector, "_conn_id", "session-token-do-not-log"),
             patch.object(connector, "_base_url", "https://mt5.mtapi.io"),
             patch.object(connector, "datetime", _FrozenDateTime),
             patch.object(connector, "_get_session", return_value=session),
+            patch.object(
+                connector, "get_current_quote", AsyncMock(return_value=quote)
+            ),
             patch.object(connector, "log", MagicMock()),
         ):
             candles = await connector.fetch_candles("XAUUSD", "M5", count=3)
@@ -112,8 +125,8 @@ def test_price_history_fetch_parses_closed_bars_and_advances_bar_time():
     assert params["symbol"] == "XAUUSD"
     assert params["timeFrame"] == 5
     assert type(params["timeFrame"]) is int
-    assert params["from"].endswith("Z")
-    assert params["to"] == "2026-10-05T12:12:00Z"
+    assert params["from"] == "2026-10-05T10:12:00"
+    assert params["to"] == "2026-10-05T12:12:00"
     assert all(call[0].endswith("/PriceHistory") for call in session.calls)
 
 
@@ -129,11 +142,21 @@ def test_price_history_falls_back_for_old_bridge_and_redacts_session_id():
     test_logger = MagicMock()
 
     async def run():
+        quote = {
+            "bid": 2300.0,
+            "ask": 2300.1,
+            "server_time_raw": _FrozenDateTime.fixed_now.isoformat().replace(
+                "+00:00", "Z"
+            ),
+        }
         with (
             patch.object(connector, "_conn_id", session_id),
             patch.object(connector, "_base_url", "https://old-bridge.invalid"),
             patch.object(connector, "datetime", _FrozenDateTime),
             patch.object(connector, "_get_session", return_value=session),
+            patch.object(
+                connector, "get_current_quote", AsyncMock(return_value=quote)
+            ),
             patch.object(connector, "log", test_logger),
         ):
             return await connector.fetch_candles("XAUUSD", "M5", count=1)
@@ -155,6 +178,123 @@ def test_price_history_falls_back_for_old_bridge_and_redacts_session_id():
     assert "no route" in logged
     assert "[REDACTED]" in logged
     assert session_id not in logged
+
+
+def test_empty_price_history_falls_back_to_today_then_month_and_parses_aliases():
+    now = _FrozenDateTime.fixed_now
+    body = [
+        {
+            "Time": "2026-10-05T11:55:00Z",
+            "Open": 1.0,
+            "High": 2.0,
+            "Low": 0.5,
+            "Close": 1.5,
+            "Volume": 7,
+        },
+        {
+            "openTime": "2026-10-05T12:00:00Z",
+            "o": 2.0,
+            "h": 3.0,
+            "l": 1.5,
+            "c": 2.5,
+            "tickVolume": 9,
+        },
+        {
+            "time": "2026-10-05T12:10:00Z",
+            "openPrice": 3.0,
+            "highPrice": 4.0,
+            "lowPrice": 2.5,
+            "closePrice": 3.5,
+        },
+    ]
+    session_id = "session-token-do-not-log"
+    session = _FakeSession([
+        _FakeResponse(200, []),
+        _FakeResponse(200, []),
+        _FakeResponse(200, body),
+    ])
+    test_logger = MagicMock()
+    quote = {
+        "bid": 2300.0,
+        "ask": 2300.1,
+        "server_time_raw": now.isoformat().replace("+00:00", "Z"),
+    }
+
+    async def run():
+        with (
+            patch.object(connector, "_conn_id", session_id),
+            patch.object(connector, "_base_url", "https://mt5.mtapi.io"),
+            patch.object(connector, "datetime", _FrozenDateTime),
+            patch.object(connector, "_get_session", return_value=session),
+            patch.object(
+                connector, "get_current_quote", AsyncMock(return_value=quote)
+            ),
+            patch.object(connector, "log", test_logger),
+        ):
+            return await connector.fetch_candles("XAUUSD", "M5", count=1)
+
+    candles = asyncio.run(run())
+
+    assert len(candles) == 1
+    assert candles[0].time == "2026-10-05T12:00:00Z"
+    assert (candles[0].open, candles[0].high, candles[0].low, candles[0].close) == (
+        2.0,
+        3.0,
+        1.5,
+        2.5,
+    )
+    assert [call[0].rsplit("/", 1)[-1] for call in session.calls] == [
+        "PriceHistory",
+        "PriceHistoryToday",
+        "PriceHistoryMonth",
+    ]
+    primary_params = session.calls[0][1]
+    assert primary_params["from"] == "2026-10-05T10:12:00"
+    assert primary_params["to"] == "2026-10-05T12:12:00"
+    assert type(primary_params["timeFrame"]) is int
+    month_params = session.calls[2][1]
+    assert (month_params["year"], month_params["month"], month_params["day"]) == (
+        2026,
+        10,
+        5,
+    )
+    assert "from" not in month_params and "to" not in month_params
+    logged = " ".join(
+        str(arg)
+        for calls in (
+            test_logger.info.call_args_list,
+            test_logger.warning.call_args_list,
+            test_logger.error.call_args_list,
+        )
+        for call in calls
+        for arg in call.args
+    )
+    assert session_id not in logged
+    assert "history succeeded" in logged
+    assert "PriceHistoryMonth" in logged
+
+
+def test_calibration_and_polling_use_bounded_history_ranges():
+    assert connector._candle_history_minutes(5, 500) == 5 * 24 * 60
+    assert connector._candle_history_minutes(5, 3) == 2 * 60
+
+
+def test_resolve_symbol_name_uses_symbols_map_and_unique_suffix():
+    session = _FakeSession([
+        _FakeResponse(200, {"XAUUSD.a": {}, "EURUSD": {}}),
+    ])
+
+    async def run():
+        with (
+            patch.object(connector, "_conn_id", "session-token-do-not-log"),
+            patch.object(connector, "_base_url", "https://mt5.mtapi.io"),
+            patch.object(connector, "_get_session", return_value=session),
+            patch.object(connector, "log", MagicMock()),
+        ):
+            return await connector.resolve_symbol_name("XAUUSD")
+
+    assert asyncio.run(run()) == "XAUUSD.a"
+    assert session.calls[0][0] == "https://mt5.mtapi.io/Symbols"
 
 
 def test_live_loop_emits_one_new_bar_when_latest_closed_time_advances():
