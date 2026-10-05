@@ -90,7 +90,7 @@ from live_trading.mt5.connector import (
     connect, disconnect, ensure_connected,
     connect_with_retry, start_connection_watchdog,
     fetch_candles, get_account_balance, get_account_info,
-    check_symbol_available,
+    resolve_symbol_name,
     get_open_positions, get_last_completed_bar_time,
     get_current_quote, get_closed_position_history, get_deals_by_time_range,
     get_symbol_params,
@@ -654,6 +654,7 @@ class GoldScalperLive:
     # ── Entry point ───────────────────────────────────────────────────────────
 
     async def start(self) -> bool:
+        global SYMBOL
         log.info("=" * 60)
         log.info("  GoldScalperPro v4 — LIVE TRADING ENGINE (MTAPI)")
         log.info(f"  Symbol: {SYMBOL}  |  Trade TFs: {chr(44).join(TRADE_TIMEFRAMES)} (highest first)")
@@ -697,12 +698,44 @@ class GoldScalperLive:
             return False  # non-False return signals failure to main.py for sys.exit(1)
 
         # ── Read-only broker checks — no order is placed here ──────────────────
-        if not await check_symbol_available(SYMBOL):
+        broker_symbol = await resolve_symbol_name(SYMBOL)
+        if broker_symbol is None:
             self._write_state(
                 "DISCONNECTED",
                 extra={"error": f"{SYMBOL} is not available through MTAPI"},
             )
             return False
+        if broker_symbol != SYMBOL:
+            log.info(
+                "Using broker's exact symbol name configured=%s broker=%s",
+                SYMBOL,
+                broker_symbol,
+            )
+            SYMBOL = broker_symbol
+
+        symbol_params = await get_symbol_params(SYMBOL)
+        if symbol_params:
+            symbol_from_params = symbol_params.get("symbol")
+            if isinstance(symbol_from_params, str) and symbol_from_params.strip():
+                SYMBOL = symbol_from_params.strip()
+            symbol_info = symbol_params.get("symbolInfo")
+            if not isinstance(symbol_info, dict):
+                symbol_info = {}
+            log.info(
+                "MTAPI symbol parameters confirmed symbol=%s digits=%s "
+                "points=%s tickSize=%s contractSize=%s",
+                SYMBOL,
+                symbol_info.get("digits"),
+                symbol_info.get("points"),
+                symbol_info.get("tickSize"),
+                symbol_info.get("contractSize"),
+            )
+        else:
+            log.warning(
+                "MTAPI returned no SymbolParams for resolved symbol=%s; "
+                "order-time broker validation will still be required",
+                SYMBOL,
+            )
 
         quote = await get_current_quote(SYMBOL)
         if quote:
