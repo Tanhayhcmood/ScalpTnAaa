@@ -216,6 +216,7 @@ _PANEL_COMMAND_MAP: dict = {
     "SAFE_SHUTDOWN":  "stop",
     "CLOSE_ALL":      "close_all",
     "RESET_GUARDIAN": "reset_guardian",
+    "RESET_COOLDOWN": "reset_cooldown",
     "START":          "start",
     "RESTART_ENGINE": "restart_engine",
     "RESTART_MT5":    "restart_mt5",

@@ -42,6 +42,61 @@ from live_trading.logger import get_logger
 log = get_logger()
 
 
+def account_is_demo(
+    account_info: Optional[dict],
+    allow_env_override: bool = False,
+) -> bool:
+    """Conservatively identify demo accounts from broker metadata or server name."""
+    info = account_info if isinstance(account_info, dict) else {}
+
+    explicit_demo: Optional[bool] = None
+    for key in ("is_demo", "isDemo", "demo"):
+        value = info.get(key)
+        if isinstance(value, bool):
+            explicit_demo = value
+            break
+        if isinstance(value, (int, float)) and value in {0, 1}:
+            explicit_demo = bool(value)
+            break
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            if normalized in {"true", "1", "yes", "demo"}:
+                explicit_demo = True
+                break
+            if normalized in {"false", "0", "no", "real"}:
+                explicit_demo = False
+                break
+
+    trade_mode_demo: Optional[bool] = None
+    for key in ("trade_mode", "tradeMode", "account_type", "accountType"):
+        value = info.get(key)
+        if value is None:
+            continue
+        normalized = str(value).strip().casefold()
+        if normalized in {"0", "demo", "account_trade_mode_demo"}:
+            trade_mode_demo = True
+            break
+        if normalized in {
+            "1", "contest", "account_trade_mode_contest",
+            "2", "real", "account_trade_mode_real",
+        }:
+            trade_mode_demo = False
+            break
+
+    identity = " ".join(
+        str(info.get(key) or "")
+        for key in ("server", "broker", "company", "name")
+    ).casefold()
+    if "real" in identity:
+        return False
+    if explicit_demo is False or trade_mode_demo is False:
+        return False
+    if explicit_demo is True or trade_mode_demo is True or "demo" in identity:
+        return True
+
+    return bool(allow_env_override)
+
+
 # ── Data class returned by every .check() call ────────────────────────────────
 
 @dataclass
@@ -186,29 +241,48 @@ class RiskGuardian:
         )
 
     def reset_halt(self, *, reset_daily_baseline: bool = False,
-                   current_balance: float | None = None) -> bool:
+                   current_balance: float | None = None,
+                   reset_equity_peak: bool = False,
+                   current_equity: float | None = None) -> bool:
         """
         Manually clear a halt.
         Exposed to Telegram panel via /reset_guardian command.
         Use with caution — understand WHY the halt triggered first.
 
-        When ``reset_daily_baseline`` is requested, ``current_balance`` must
-        be a positive live account balance.  This intentionally resets only
-        the UTC-day loss window; the session equity high-water mark is kept so
-        the max-drawdown circuit breaker remains effective.
+        When ``reset_daily_baseline`` or ``reset_equity_peak`` is requested,
+        the corresponding live balance/equity must be positive. The new
+        equity-peak option is used only by the guarded DEMO cooldown-reset flow;
+        existing callers retain their prior behavior.
         """
+        if reset_daily_baseline and (
+            current_balance is None or current_balance <= 0
+        ):
+            log.warning(
+                "🛡️  Daily baseline reset rejected — "
+                "live balance is unavailable or invalid"
+            )
+            return False
+        if reset_equity_peak and (
+            current_equity is None or current_equity <= 0
+        ):
+            log.warning(
+                "🛡️  Equity peak reset rejected — "
+                "live equity is unavailable or invalid"
+            )
+            return False
+
         if reset_daily_baseline:
-            if current_balance is None or current_balance <= 0:
-                log.warning(
-                    "🛡️  Daily baseline reset rejected — "
-                    "live balance is unavailable or invalid"
-                )
-                return False
             self._day_open_balance = float(current_balance)
             self._last_day = datetime.now(timezone.utc).date()
             log.warning(
                 "🛡️  Daily loss baseline RESET to current balance "
                 f"{self._day_open_balance:.2f}"
+            )
+        if reset_equity_peak:
+            self._equity_peak = float(current_equity)
+            log.warning(
+                "🛡️  Equity drawdown baseline RESET to current equity "
+                f"{self._equity_peak:.2f}"
             )
 
         log.warning(

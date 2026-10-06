@@ -181,6 +181,7 @@ class BotApplication:
             BotCommand("dashboard", "Dashboard"),
             BotCommand("menu", "Main menu"),
             BotCommand("status", "Robot status"),
+            BotCommand("reset_cooldown", "Reset robot cooldowns (admin only)"),
             BotCommand("help", "Help"),
         ])
 

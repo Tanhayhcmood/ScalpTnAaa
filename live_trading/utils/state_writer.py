@@ -42,6 +42,7 @@ _PANEL_COMMAND_MAP: dict = {
     "SAFE_SHUTDOWN":    "stop",
     "CLOSE_ALL":        "close_all",
     "RESET_GUARDIAN":   "reset_guardian",
+    "RESET_COOLDOWN":   "reset_cooldown",
     # Commands below were missing from the file-based fallback path;
     # they are now mirrored from live_trading/redis_ipc.py.
     "START":            "start",
@@ -434,7 +435,8 @@ def read_commands() -> dict:
         cmd_name   = str(item.get("command", "")).strip().upper()
         engine_key = _PANEL_COMMAND_MAP.get(cmd_name)
         if engine_key:
-            result[engine_key] = True
+            payload = item.get("payload")
+            result[engine_key] = payload if isinstance(payload, dict) and payload else True
 
     return result
 

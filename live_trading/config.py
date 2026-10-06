@@ -71,6 +71,23 @@ def _float(name: str, default: float, lo: float | None = None, hi: float | None 
     return val
 
 
+def _bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    print(
+        f"ERROR: {name}={raw!r} is not a valid boolean. "
+        "Use true/false. Fix it in the Render dashboard and redeploy.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def _locked_float(
     name: str,
     expected: float,
@@ -440,6 +457,16 @@ OPTION_TWO_MIN_TIMEFRAMES = _int("OPTION_TWO_MIN_TIMEFRAMES", 2, lo=2, hi=10)
 #
 # The live entry service currently watches only the 5m bar stream.
 TRADE_TIMEFRAMES  = _trade_timeframes("TRADE_TIMEFRAMES", "5m")
+
+# Cooldown after a broker-confirmed stop-out. The existing same-direction
+# RANGE re-entry gate retains its two-bar duration unless cooldown is disabled.
+COOLDOWN_AFTER_STOP_MINUTES = _int(
+    "COOLDOWN_AFTER_STOP_MINUTES", 10, lo=0, hi=1440
+)
+COOLDOWN_ENABLED = _bool("COOLDOWN_ENABLED", True)
+# Explicit fallback for brokers that do not expose account trade mode/server
+# metadata. A reported REAL account always overrides this opt-in.
+ALLOW_RISK_RESET_ON_DEMO = _bool("ALLOW_RISK_RESET_ON_DEMO", False)
 
 
 

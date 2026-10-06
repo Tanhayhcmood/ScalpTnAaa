@@ -149,6 +149,14 @@ The Telegram panel (`telegram_panel/`) reads these files and exposes controls.
 | `{"stop": true}` | Graceful shutdown |
 | `{"close_all": true}` | Close all open positions immediately |
 | `{"reset_guardian": true}` | ⭐ Clear a Guardian halt and resume trading |
+| `{"reset_cooldown": {"requested_by": "admin"}}` | Clear cooldowns; Guardian lock resets only on DEMO |
+
+`COOLDOWN_AFTER_STOP_MINUTES` (default `10`) controls the broker-confirmed
+stop-loss cooldown. The existing two-bar same-direction RANGE cooldown remains
+unchanged; `COOLDOWN_ENABLED=false` disables both gates. Cooldown state is published inside
+`robot_state.json` and mirrored to Redis (`goldscalper:state`) so it survives
+restarts. RiskGuardian state is persisted separately to `GUARDIAN_STATE_FILE`
+and Redis (`goldscalper:guardian`).
 
 ### Risk Guardian — robot_state.json fields
 After every bar, `robot_state.json` includes a `guardian` block:

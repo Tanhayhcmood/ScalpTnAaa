@@ -1103,6 +1103,45 @@ async def get_account_info() -> dict:
             ) as resp:
                 data = await resp.json(content_type=None)
                 if isinstance(data, dict) and "balance" in data:
+                    trade_mode = _field_value(
+                        data, "tradeMode", "accountTradeMode", "accountType"
+                    )
+                    raw_demo = _field_value(data, "isDemo", "demo", "is_demo")
+                    server = str(data.get("server") or MT5_HOST)
+                    broker = str(
+                        data.get("broker") or data.get("company") or MT5_HOST
+                    )
+                    demo_text = " ".join(
+                        (server, broker, str(data.get("name") or ""))
+                    ).casefold()
+                    if isinstance(raw_demo, bool):
+                        is_demo = raw_demo
+                    elif raw_demo is not None:
+                        normalized_demo = str(raw_demo).strip().casefold()
+                        if normalized_demo in {"true", "1", "yes", "demo"}:
+                            is_demo = True
+                        elif normalized_demo in {"false", "0", "no", "real"}:
+                            is_demo = False
+                        else:
+                            is_demo = None
+                    elif trade_mode is not None:
+                        mode = str(trade_mode).strip().casefold()
+                        if mode in {"0", "demo", "account_trade_mode_demo"}:
+                            is_demo = True
+                        elif mode in {
+                            "1", "contest", "account_trade_mode_contest",
+                            "2", "real", "account_trade_mode_real",
+                        }:
+                            is_demo = False
+                        else:
+                            is_demo = None
+                    else:
+                        if "demo" in demo_text:
+                            is_demo = True
+                        elif "real" in demo_text:
+                            is_demo = False
+                        else:
+                            is_demo = None
                     return {
                         "balance": float(data.get("balance", 0.0)),
                         "equity": float(data.get("equity", 0.0)),
@@ -1111,11 +1150,13 @@ async def get_account_info() -> dict:
                         "marginLevel": float(data.get("marginLevel", 0.0)),
                         "currency": data.get("currency", "USD"),
                         "leverage": int(data.get("leverage") or 0),
-                        "broker": str(data.get("broker") or data.get("company") or MT5_HOST),
-                        "server": str(data.get("server") or MT5_HOST),
+                        "broker": broker,
+                        "server": server,
                         "login": str(data.get("login") or data.get("account") or MT5_USER),
                         "synced": bool(data.get("synced", True)),
                         "name": str(data.get("name") or ""),
+                        "trade_mode": trade_mode,
+                        "is_demo": is_demo,
                     }
                 if attempt == 0:
                     _invalidate_connection()

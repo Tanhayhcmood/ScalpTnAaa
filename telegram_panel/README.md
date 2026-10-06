@@ -269,6 +269,13 @@ The panel appends command objects to this file. Your robot polls it on each tick
 After processing, clear the file. Supported commands:
 `START`, `PAUSE`, `RESUME`, `EMERGENCY_STOP`, `RESTART_ENGINE`, `RESTART_MT5`, `SAFE_SHUTDOWN`, `UPDATE_RISK`, `UPDATE_STRATEGY`
 
+`/reset_cooldown` and the **Reset Cooldown** dashboard/control button are
+restricted to the existing configured Telegram owner/admin permissions. They
+clear cooldown state and request a robot resume; daily-loss and drawdown locks
+are reset only when current broker/account metadata identifies DEMO (or the
+explicit `ALLOW_RISK_RESET_ON_DEMO=true` fallback is configured). Real or
+unconfirmed accounts retain Guardian locks.
+
 ---
 
 ## Production Checklist

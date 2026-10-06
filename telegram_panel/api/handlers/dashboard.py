@@ -75,6 +75,17 @@ def _account_from_robot_state(robot_state: dict) -> Optional[Account]:
 logger = logging.getLogger(__name__)
 
 
+def _cooldown_reset_admin_allowed(user) -> bool:
+    """Restrict cooldown reset to an authenticated owner/admin with robot access."""
+    role = getattr(user, "role", None)
+    role_value = getattr(role, "value", role)
+    permissions = getattr(user, "permissions", None)
+    return (
+        role_value in {"owner", "admin"}
+        and bool(getattr(permissions, "can_control_robot", False))
+    )
+
+
 class DashboardHandler(BaseHandler):
     def __init__(
         self,
@@ -166,6 +177,9 @@ class DashboardHandler(BaseHandler):
         ok, user = await self._auth.check_permission(update, "can_control_robot")
         if not ok:
             return
+        if action == "reset_cooldown":
+            await self.reset_cooldown(update, context)
+            return
 
         # Keyboard buttons send "stop_confirm", "emergency_confirm" etc.
         # Normalise to base action so confirm_needed lookup works and
@@ -225,3 +239,62 @@ class DashboardHandler(BaseHandler):
             await self.answer_callback(
                 update, f"⚠️ Command may not have reached the robot.", show_alert=True
             )
+
+    async def reset_cooldown(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Queue the guarded reset request from Telegram command or button."""
+        ok, user = await self._auth.check_permission(update, "can_control_robot")
+        if not ok:
+            return
+        if not _cooldown_reset_admin_allowed(user):
+            await self._auth.record_action(
+                user,
+                "ROBOT_RESET_COOLDOWN",
+                "Rejected cooldown reset from non-admin role",
+                success=False,
+                error="Admin role required",
+            )
+            if update.message:
+                await update.message.reply_text(
+                    "⛔ Only configured Telegram admins can reset cooldowns."
+                )
+            elif update.callback_query:
+                await self.answer_callback(
+                    update, "⛔ Admin access required.", show_alert=True
+                )
+            return
+
+        tg_user = update.effective_user
+        requester = f"telegram_id={tg_user.id}" if tg_user else "authorized admin"
+        if tg_user and tg_user.username:
+            requester += f" @{tg_user.username}"
+        sent = await self._robot.send_command(
+            "RESET_COOLDOWN", {"requested_by": requester}
+        )
+        await self._auth.record_action(
+            user,
+            "ROBOT_RESET_COOLDOWN",
+            "Requested reset of stop/range cooldowns and consecutive-loss state",
+            success=sent,
+        )
+
+        if sent:
+            response = (
+                "✅ <b>Cooldown reset request sent</b>\n\n"
+                "The robot will clear active cooldown timers, consecutive-loss "
+                "count, direction/level re-entry blocks, and the legacy "
+                "same-direction cooldown anchor.\n\n"
+                "Daily-loss and drawdown locks are reset only for a DEMO account "
+                "(broker metadata or the explicit demo-reset environment setting). "
+                "If a RiskGuardian lock is active on a real or unconfirmed account, "
+                "it stays in place and the robot remains PAUSED."
+            )
+        else:
+            response = (
+                "⚠️ The reset request could not be delivered to the robot. "
+                "No cooldown or risk state was changed."
+            )
+        await self.edit_or_reply(
+            update, context, response, Keyboards.dashboard()
+        )

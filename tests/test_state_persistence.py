@@ -88,6 +88,25 @@ class TestReadCommands:
             result = state_writer.read_commands()
         assert result == {}
 
+    def test_reset_cooldown_payload_survives_file_command_translation(
+        self, tmp_path
+    ):
+        from datetime import datetime, timezone
+
+        cmd_file = str(tmp_path / "robot_commands.json")
+        payload = {"requested_by": "telegram_id=77"}
+        with open(cmd_file, "w") as f:
+            json.dump([{
+                "command": "RESET_COOLDOWN",
+                "payload": payload,
+                "issued_at": datetime.now(timezone.utc).isoformat(),
+            }], f)
+        with patch("live_trading.utils.state_writer.COMMANDS_FILE", cmd_file):
+            from live_trading.utils import state_writer
+            result = state_writer.read_commands()
+
+        assert result["reset_cooldown"] == payload
+
 
 class TestStateFileSerialization:
     """Test that state dict serializes and deserializes without data loss."""

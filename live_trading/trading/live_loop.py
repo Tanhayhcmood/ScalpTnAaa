@@ -50,6 +50,8 @@ from live_trading.config import (
     RANGE_ENTRY_FILTERS_ENABLED,
     MAX_RANGE_TRADES_PER_SESSION,
     DAILY_LOSS_LIMIT_PCT, MAX_DRAWDOWN_PCT, SLIPPAGE_POINTS,
+    COOLDOWN_AFTER_STOP_MINUTES, COOLDOWN_ENABLED,
+    ALLOW_RISK_RESET_ON_DEMO,
     STATE_FILE, GUARDIAN_STATE_FILE,
     HISTORY_LOOKBACK_DAYS, HISTORY_SYNC_INTERVAL,
     TRAIL_ENABLED, TRAIL_ATR_PERIOD, TRAIL_NORMAL_MULTIPLIER,
@@ -66,7 +68,9 @@ from live_trading.config import (
     ALLOW_HEDGED_POSITIONS,
 )
 from live_trading.logger import get_logger
-from live_trading.risk.guardian import RiskGuardian, GuardianStatus
+from live_trading.risk.guardian import (
+    RiskGuardian, GuardianStatus, account_is_demo,
+)
 from live_trading.risk.adaptive_trailing_stop import (
     AdaptiveTrailingConfig, atr, compute_adaptive_trail, should_apply,
 )
@@ -623,6 +627,10 @@ class GoldScalperLive:
         # so the post-SL cooldown gate can detect same-direction re-entry.
         self._last_entry_bar_time: Optional[datetime] = None
         self._last_entry_direction: str = ""
+        self._cooldown_reset_at: Optional[str] = None
+        self._cooldown_untils_by_direction: dict[str, str] = {}
+        self._cooldown_untils_by_level: dict[str, str] = {}
+        self._consecutive_loss_count: int = 0
         self.trade_history: List[dict] = []
         self._last_open_positions: list[dict] = []
         self.last_decision: Optional[DecisionResult] = None
@@ -736,12 +744,17 @@ class GoldScalperLive:
         log.info(f"  Daily loss limit: {DAILY_LOSS_LIMIT_PCT}%  |  "
                  f"Max drawdown: {MAX_DRAWDOWN_PCT}%  |  "
                  f"Slippage: ≤{SLIPPAGE_POINTS}pts")
+        log.info(
+            "  Stop cooldown: %s (%d minutes)",
+            "enabled" if COOLDOWN_ENABLED else "disabled",
+            COOLDOWN_AFTER_STOP_MINUTES,
+        )
         log.info("=" * 60)
-
-        self._write_state("STARTING")
 
         # Restore trade history from previous session (survives restarts)
         self.trade_history = self._load_trade_history()
+        self._refresh_cooldown_controls()
+        self._write_state("STARTING")
         # Restore per-ticket entry/initial-SL baselines before the first broker
         # sync.  These are persisted separately from trade history because the
         # live SL changes while the original R baseline must never change.
@@ -2158,12 +2171,46 @@ class GoldScalperLive:
         else:
             self._last_candle_telemetry.setdefault("mtf", {})["gate"] = "DISABLED"
 
-        # 7c. Gate: post-SL cooldown in choppy/range regimes
+        # 7c. Gate: persisted cooldown after an actual stop-out.
+        if COOLDOWN_ENABLED:
+            now_utc = datetime.now(timezone.utc)
+            direction_until = self._parse_control_time(
+                self._cooldown_untils_by_direction.get(decision.direction)
+            )
+            level_untils = [
+                self._parse_control_time(
+                    self._cooldown_untils_by_level.get(str(slot))
+                )
+                for slot in candidate_strategy_slots
+            ]
+            active_untils = [
+                until for until in [direction_until, *level_untils]
+                if until is not None and until > now_utc
+            ]
+            if active_untils:
+                cooldown_until = max(active_untils)
+                remaining = max(
+                    0.0, (cooldown_until - now_utc).total_seconds()
+                )
+                self._set_trade_permission(
+                    False,
+                    "STOP_LOSS_COOLDOWN",
+                    [f"Post-stop cooldown active for {decision.direction}"],
+                    cooldown_remaining_seconds=remaining,
+                )
+                self._write_state(
+                    "WAITING", acc_info, decision, pos,
+                    extra=self._guardian_extra(gs),
+                )
+                return
+
+        # 7d. Gate: post-entry cooldown in choppy/range regimes
         # If the last trade was in the same direction and closed (or will close)
         # within 2 bars, the market setup has NOT changed — skip re-entry.
         # Uses only the existing _last_entry state; fails-open on any parse error.
         _RANGE_COOLDOWN_REGIMES = {"RANGE", "ACCUMULATION", "DISTRIBUTION", "HIGH_VOLATILITY"}
-        if (self._last_entry_bar_time is not None
+        if (COOLDOWN_ENABLED
+                and self._last_entry_bar_time is not None
                 and self._last_entry_direction == decision.direction
                 and decision.regime in _RANGE_COOLDOWN_REGIMES):
             _TF_MIN_MAP = {
@@ -2173,19 +2220,24 @@ class GoldScalperLive:
             }
             _tf_min = _TF_MIN_MAP.get(tf, 15)
             _elapsed_min = (bar_time - self._last_entry_bar_time).total_seconds() / 60.0
-            if _elapsed_min < 2 * _tf_min:
+            _range_cooldown_min = 2 * _tf_min
+            if _elapsed_min < _range_cooldown_min:
                 self._set_trade_permission(
                     False,
                     "RANGE_COOLDOWN",
                     [
                         f"Same-direction range cooldown active "
-                        f"({2 * _tf_min:.0f} minutes)"
+                        f"({_range_cooldown_min:.0f} minutes)"
                     ],
+                    cooldown_remaining_seconds=max(
+                        0.0,
+                        (_range_cooldown_min - _elapsed_min) * 60.0,
+                    ),
                 )
                 log.info(
                     f"⏸ Post-SL cooldown [{tf}]: {decision.direction} last entered "
                     f"{_elapsed_min:.0f}min ago in {decision.regime} regime — "
-                    f"cooldown {2*_tf_min}min, skipping bar"
+                    f"cooldown {_range_cooldown_min}min, skipping bar"
                 )
                 self._write_state("WAITING", acc_info, decision, pos,
                                   extra=self._guardian_extra(gs))
@@ -2995,6 +3047,7 @@ class GoldScalperLive:
                 )
             )
             self.trade_history[:] = self.trade_history[-50:]
+            self._refresh_cooldown_controls()
             self._history_sync_status = {
                 **self._history_sync_status,
                 "status": "SYNCED",
@@ -3074,6 +3127,7 @@ class GoldScalperLive:
             f"price={close_price:.5f} profit={entry['profit']:+.2f} "
             f"time={close_time}"
         )
+        self._refresh_cooldown_controls()
         return True
 
     # ── Telegram command processing ───────────────────────────────────────────
@@ -3090,6 +3144,9 @@ class GoldScalperLive:
             if not self.paused:
                 self.paused = True
                 log.info("⏸  Robot PAUSED by Telegram command")
+                self._set_trade_permission(
+                    False, "MANUAL_PAUSE", ["Robot paused by Telegram command"]
+                )
                 self._write_state("PAUSED")
             clear_command("pause")
             pause_applied = True
@@ -3126,24 +3183,50 @@ class GoldScalperLive:
                 isinstance(reset_payload, dict)
                 and bool(reset_payload.get("reset_daily_baseline"))
             )
-            current_balance = None
-            if reset_daily_baseline:
-                if self._last_acc_info:
-                    current_balance = self._last_acc_info.get("balance")
-                if current_balance is None:
-                    try:
-                        fresh_account = await get_account_info()
-                        current_balance = fresh_account.get("balance") if fresh_account else None
-                        if fresh_account:
-                            self._last_acc_info = fresh_account
-                    except Exception as exc:
-                        log.warning(
-                            f"Could not fetch live balance for daily reset: {exc}"
-                        )
+            current_account = {}
+            try:
+                fresh_account = await get_account_info()
+                if (
+                    fresh_account
+                    and float(fresh_account.get("balance", 0.0)) > 0
+                    and float(fresh_account.get("equity", 0.0)) > 0
+                ):
+                    current_account = fresh_account
+                    self._last_acc_info = fresh_account
+            except Exception as exc:
+                log.warning("Could not fetch live account for Guardian reset: %s", exc)
 
+            is_demo = account_is_demo(
+                current_account, ALLOW_RISK_RESET_ON_DEMO
+            )
+            if not self.guardian.is_initialized:
+                log.warning(
+                    "🛡️  Guardian reset refused — live risk baselines are not initialized"
+                )
+                self.paused = True
+                self._write_state("PAUSED", self._last_acc_info)
+                clear_command("reset_guardian")
+                return
+            if not is_demo and (
+                self.guardian.is_halted or reset_daily_baseline
+            ):
+                log.warning(
+                    "🛡️  Guardian reset refused — active risk locks and daily "
+                    "baseline resets are permitted only on a confirmed DEMO account"
+                )
+                self.paused = self.guardian.is_halted or self.paused
+                if self.paused:
+                    self._write_state("PAUSED", self._last_acc_info)
+                clear_command("reset_guardian")
+                return
+
+            try:
+                current_balance = float(current_account.get("balance", 0.0))
+            except (TypeError, ValueError):
+                current_balance = 0.0
             reset_ok = self.guardian.reset_halt(
                 reset_daily_baseline=reset_daily_baseline,
-                current_balance=float(current_balance) if current_balance is not None else None,
+                current_balance=current_balance if current_balance > 0 else None,
             )
             if reset_ok and self.paused:
                 self.paused = False
@@ -3155,6 +3238,28 @@ class GoldScalperLive:
                     "the daily baseline could not be reset"
                 )
             clear_command("reset_guardian")
+
+        if cmds.get("reset_cooldown"):
+            payload = cmds.get("reset_cooldown")
+            if not isinstance(payload, dict):
+                payload = {}
+            requester = str(payload.get("requested_by") or "authorized Telegram admin")
+            current_account = {}
+            try:
+                fresh_account = await get_account_info()
+                if (
+                    fresh_account
+                    and float(fresh_account.get("balance", 0.0)) > 0
+                    and float(fresh_account.get("equity", 0.0)) > 0
+                ):
+                    current_account = fresh_account
+                    self._last_acc_info = fresh_account
+            except Exception as exc:
+                log.warning(
+                    "Could not refresh account metadata for cooldown reset: %s", exc
+                )
+            self._reset_cooldowns_and_resume(requester, current_account)
+            clear_command("reset_cooldown")
 
         # "start" — sent by Telegram panel Start button.
         # If paused, treat as resume. If already running, log and ignore.
@@ -3752,18 +3857,20 @@ class GoldScalperLive:
         unavailable — no behavior change from before in that case.
         """
         history: List[dict] = []
+        file_state = None
         _file_n = 0
         try:
             if os.path.exists(STATE_FILE):
                 with open(STATE_FILE, "r", encoding="utf-8") as f:
-                    state = json.load(f)
-                history = list(state.get("recent_trades", []))
+                    file_state = json.load(f)
+                history = list(file_state.get("recent_trades", []))
                 _file_n = len(history)
         except Exception as exc:
             log.warning(f"Could not restore trade history from file: {exc}")
 
         _redis_n = 0
         _redis_status = "unavailable"
+        redis_state = None
         try:
             from live_trading.redis_ipc import redis_read_state
             redis_state = redis_read_state()
@@ -3790,6 +3897,25 @@ class GoldScalperLive:
             _redis_status = f"error: {exc}"
             log.debug(f"Could not restore trade history from Redis: {exc}")
 
+        control_candidates = [
+            state for state in (file_state, redis_state)
+            if isinstance(state, dict) and "entry_cooldown" in state
+        ]
+        if control_candidates:
+            restore_state = max(
+                control_candidates,
+                key=lambda state: (
+                    self._parse_control_time(
+                        state.get("last_heartbeat")
+                        or state.get("last_update")
+                        or state.get("written_at")
+                    )
+                    or datetime.min.replace(tzinfo=timezone.utc)
+                ),
+            )
+        else:
+            restore_state = file_state if isinstance(file_state, dict) else redis_state
+        self._restore_cooldown_state(restore_state)
         log.info(
             f"📂 Trade history restore: file={_file_n} record(s), "
             f"redis={_redis_status} → merged total={len(history)}"
@@ -3829,6 +3955,7 @@ class GoldScalperLive:
         allowed: bool,
         stage: str,
         reasons: list[str],
+        cooldown_remaining_seconds: Optional[float] = None,
     ) -> None:
         """Record final entry permission separately from signal state."""
         self._last_trade_permission = {
@@ -3836,6 +3963,256 @@ class GoldScalperLive:
             "stage": stage,
             "reasons": [str(reason) for reason in reasons if str(reason).strip()],
         }
+        if not allowed and stage != "NOT_EVALUATED":
+            remaining = (
+                max(0, int(cooldown_remaining_seconds))
+                if cooldown_remaining_seconds is not None
+                else self._current_cooldown_remaining_seconds()
+            )
+            reason = " | ".join(
+                str(item).replace("\n", " ").strip()
+                for item in reasons if str(item).strip()
+            ) or "unspecified"
+            log.warning(
+                "ENTRY_BLOCKED stage=%s reason=%s cooldown_remaining_seconds=%d",
+                stage,
+                reason,
+                remaining,
+            )
+
+    @staticmethod
+    def _parse_control_time(value: object) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            if isinstance(value, datetime):
+                parsed = value
+            elif isinstance(value, (int, float)):
+                timestamp = float(value)
+                if abs(timestamp) > 100_000_000_000:
+                    timestamp /= 1000.0
+                parsed = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            else:
+                parsed = datetime.fromisoformat(
+                    str(value).replace("Z", "+00:00")
+                )
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            return None
+
+    def _current_cooldown_remaining_seconds(self) -> int:
+        if not COOLDOWN_ENABLED:
+            return 0
+        now = datetime.now(timezone.utc)
+        active = [
+            parsed for value in (
+                list(self._cooldown_untils_by_direction.values())
+                + list(self._cooldown_untils_by_level.values())
+            )
+            if (parsed := self._parse_control_time(value)) is not None
+            and parsed > now
+        ]
+        return max(
+            (int((until - now).total_seconds()) for until in active),
+            default=0,
+        )
+
+    def _refresh_cooldown_controls(self) -> None:
+        """Rebuild stop-loss cooldowns and loss streak from durable trade history."""
+        reset_at = self._parse_control_time(self._cooldown_reset_at)
+        now = datetime.now(timezone.utc)
+        restored_directions = self._cooldown_untils_by_direction
+        restored_levels = self._cooldown_untils_by_level
+        self._cooldown_untils_by_direction = {}
+        self._cooldown_untils_by_level = {}
+        if COOLDOWN_ENABLED and COOLDOWN_AFTER_STOP_MINUTES > 0:
+            for direction, value in restored_directions.items():
+                until = self._parse_control_time(value)
+                if until is not None and until > now:
+                    self._cooldown_untils_by_direction[str(direction).upper()] = (
+                        until.isoformat()
+                    )
+            for level, value in restored_levels.items():
+                until = self._parse_control_time(value)
+                if until is not None and until > now:
+                    self._cooldown_untils_by_level[str(level)] = until.isoformat()
+        qualifying = []
+        for trade in self.trade_history:
+            if not isinstance(trade, dict) or trade.get("status") != "CLOSED":
+                continue
+            closed_at = self._parse_control_time(
+                trade.get("close_time") or trade.get("logged_at")
+            )
+            if closed_at is None or (reset_at and closed_at <= reset_at):
+                continue
+            try:
+                profit = float(trade.get("profit", 0.0))
+            except (TypeError, ValueError):
+                profit = 0.0
+            qualifying.append((closed_at, trade, profit))
+
+        qualifying.sort(key=lambda item: item[0])
+        if qualifying:
+            consecutive_losses = 0
+            for _, _, profit in reversed(qualifying):
+                if profit < 0:
+                    consecutive_losses += 1
+                else:
+                    break
+            self._consecutive_loss_count = consecutive_losses
+        elif reset_at is not None:
+            self._consecutive_loss_count = 0
+
+        if not COOLDOWN_ENABLED or COOLDOWN_AFTER_STOP_MINUTES <= 0:
+            return
+        for closed_at, trade, _profit in qualifying:
+            reason = str(trade.get("close_reason") or "").strip().upper()
+            if reason not in {"SL", "STOPLOSS", "STOP_LOSS", "STOP LOSS"}:
+                continue
+            until = closed_at + timedelta(minutes=COOLDOWN_AFTER_STOP_MINUTES)
+            if until <= now:
+                continue
+            direction = str(
+                trade.get("direction") or trade.get("type") or ""
+            ).upper()
+            if direction in {"BUY", "SELL"}:
+                old_until = self._parse_control_time(
+                    self._cooldown_untils_by_direction.get(direction)
+                )
+                if old_until is None or until > old_until:
+                    self._cooldown_untils_by_direction[direction] = until.isoformat()
+            slots = trade.get("strategy_slots") or []
+            if isinstance(slots, str):
+                slots = [slots]
+            if isinstance(slots, (list, tuple, set)):
+                for slot in slots:
+                    slot_key = str(slot)
+                    old_until = self._parse_control_time(
+                        self._cooldown_untils_by_level.get(slot_key)
+                    )
+                    if old_until is None or until > old_until:
+                        self._cooldown_untils_by_level[slot_key] = until.isoformat()
+
+    def _cooldown_state(self) -> dict:
+        return {
+            "reset_at": self._cooldown_reset_at,
+            "consecutive_loss_count": self._consecutive_loss_count,
+            "by_direction": dict(self._cooldown_untils_by_direction),
+            "by_level": dict(self._cooldown_untils_by_level),
+            "enabled": COOLDOWN_ENABLED,
+            "after_stop_minutes": COOLDOWN_AFTER_STOP_MINUTES,
+        }
+
+    def _restore_cooldown_state(self, state: object) -> None:
+        controls = state.get("entry_cooldown", {}) if isinstance(state, dict) else {}
+        if not isinstance(controls, dict):
+            return
+        reset_at = controls.get("reset_at")
+        if self._parse_control_time(reset_at):
+            self._cooldown_reset_at = str(reset_at)
+        directions = controls.get("by_direction", {})
+        levels = controls.get("by_level", {})
+        if isinstance(directions, dict):
+            self._cooldown_untils_by_direction = {
+                str(key).upper(): str(value)
+                for key, value in directions.items()
+                if self._parse_control_time(value)
+            }
+        if isinstance(levels, dict):
+            self._cooldown_untils_by_level = {
+                str(key): str(value)
+                for key, value in levels.items()
+                if self._parse_control_time(value)
+            }
+        try:
+            self._consecutive_loss_count = max(
+                0, int(controls.get("consecutive_loss_count", 0))
+            )
+        except (TypeError, ValueError):
+            self._consecutive_loss_count = 0
+
+    def _reset_cooldowns_and_resume(
+        self, requester: str, account_info: Optional[dict] = None
+    ) -> None:
+        """Clear normal cooldown state; only demo accounts may reset risk locks."""
+        self._cooldown_reset_at = datetime.now(timezone.utc).isoformat()
+        self._cooldown_untils_by_direction.clear()
+        self._cooldown_untils_by_level.clear()
+        self._consecutive_loss_count = 0
+        self._last_entry_bar_time = None
+        self._last_entry_direction = ""
+
+        account = account_info if isinstance(account_info, dict) else {}
+        is_demo = account_is_demo(account, ALLOW_RISK_RESET_ON_DEMO)
+        guardian_was_halted = self.guardian.is_halted
+        guardian_was_uninitialized = not self.guardian.is_initialized
+        risk_reset = False
+        if is_demo:
+            try:
+                balance = float(account.get("balance", 0.0))
+                equity = float(account.get("equity", 0.0))
+            except (TypeError, ValueError):
+                balance, equity = 0.0, 0.0
+            if balance > 0 and equity > 0 and not guardian_was_uninitialized:
+                risk_reset = self.guardian.reset_halt(
+                    reset_daily_baseline=True,
+                    current_balance=balance,
+                    reset_equity_peak=True,
+                    current_equity=equity,
+                )
+            else:
+                log.warning(
+                    "cooldown reset by admin requester=%s: normal cooldowns cleared; "
+                    "demo risk lock reset refused because live balance/equity is unavailable",
+                    requester,
+                )
+        elif guardian_was_halted:
+            log.warning(
+                "cooldown reset by admin requester=%s: normal cooldowns cleared; "
+                "RiskGuardian lock retained because account is not confirmed DEMO",
+                requester,
+            )
+
+        risk_lock_remains = (
+            self.guardian.is_halted or not self.guardian.is_initialized
+        )
+        if not risk_lock_remains and (
+            not is_demo or risk_reset or not guardian_was_halted
+        ):
+            self.paused = False
+            self._last_trade_permission = {
+                "allowed": False,
+                "stage": "AWAITING_EVALUATION",
+                "reasons": ["Cooldown reset completed; awaiting next entry evaluation"],
+            }
+            status = "RUNNING"
+        else:
+            self.paused = True
+            self._set_trade_permission(
+                False,
+                "RISK_GUARDIAN_LOCK_RETAINED",
+                [
+                    self.guardian._halt_reason
+                    or (
+                        "Guardian not initialized — trading remains blocked"
+                        if guardian_was_uninitialized
+                        else "RiskGuardian lock retained"
+                    )
+                ],
+            )
+            status = "PAUSED"
+
+        log.warning(
+            "cooldown reset by admin requester=%s cleared=[timers, consecutive_loss_count, "
+            "direction_reentry_blocks, level_reentry_blocks, legacy_same_direction_anchor] "
+            "risk_lock_reset=%s status=%s",
+            requester,
+            str(risk_reset).lower(),
+            status,
+        )
+        self._write_state(status, self._last_acc_info)
 
     def _write_state(
         self,
@@ -3851,6 +4228,7 @@ class GoldScalperLive:
             merged_extra.update(
                 self._guardian_extra(self._last_guardian_status)
             )
+        merged_extra["entry_cooldown"] = self._cooldown_state()
         if self._trail_baselines or self._last_trailing_statuses:
             merged_extra["trailing_stop"] = {
                 "enabled": self.trailing_enabled,

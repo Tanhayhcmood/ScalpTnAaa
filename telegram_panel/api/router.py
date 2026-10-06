@@ -74,6 +74,9 @@ class Router:
         app.add_handler(CommandHandler("status", self._cmd_dashboard))
         app.add_handler(CommandHandler("help", self._cmd_help))
         app.add_handler(CommandHandler("history", self._cmd_history))
+        app.add_handler(
+            CommandHandler("reset_cooldown", self._cmd_reset_cooldown)
+        )
 
         # Add account conversation
         add_account_conv = ConversationHandler(
@@ -137,6 +140,13 @@ class Router:
             return
         await self._trading.show_trade_history(update, context)
 
+    async def _cmd_reset_cooldown(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not await self._rate_check(update):
+            return
+        await self._dashboard.reset_cooldown(update, context)
+
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._rate_check(update):
             return
@@ -151,6 +161,7 @@ class Router:
             "/menu — Main menu\n"
             "/status — Quick status\n"
             "/history — Recent closed trades\n"
+            "/reset_cooldown — Clear cooldowns (admin only)\n"
             "/help — This message\n\n"
             f"Your role: <b>{user.role_icon} {user.role.value}</b>"
         )
