@@ -180,6 +180,54 @@ def test_price_history_falls_back_for_old_bridge_and_redacts_session_id():
     assert session_id not in logged
 
 
+def test_naive_broker_wall_time_uses_inferred_offset_for_bounds_and_candles():
+    now = _FrozenDateTime.fixed_now
+    bars = []
+    for wall_time in (
+        datetime(2026, 10, 5, 15, 5, tzinfo=timezone.utc),
+        datetime(2026, 10, 5, 15, 10, tzinfo=timezone.utc),
+        datetime(2026, 10, 5, 15, 15, tzinfo=timezone.utc),
+    ):
+        bar = _bar(wall_time, len(bars))
+        bar["time"] = bar["time"].removesuffix("Z")
+        bars.append(bar)
+    session = _FakeSession([_FakeResponse(200, bars)])
+    quote = {
+        "bid": 2300.0,
+        "ask": 2300.1,
+        # The bridge's naive quote timestamp is broker wall time, UTC+3 here.
+        "server_time_raw": "2026-10-05T15:12:00",
+    }
+
+    async def run():
+        with (
+            patch.object(connector, "_conn_id", "session-token-do-not-log"),
+            patch.object(connector, "_base_url", "https://mt5.mtapi.io"),
+            patch.object(connector, "_broker_utc_offset_minutes", None),
+            patch.object(connector, "datetime", _FrozenDateTime),
+            patch.object(connector, "_get_session", return_value=session),
+            patch.object(
+                connector, "get_current_quote", AsyncMock(return_value=quote)
+            ),
+            patch.object(connector, "log", MagicMock()),
+        ):
+            candles = await connector.fetch_candles("XAUUSD", "M5", count=3)
+            return candles
+
+    candles = asyncio.run(run())
+
+    assert [c.time for c in candles] == ["2026-10-05T12:05:00Z"]
+    _, params, _ = session.calls[0]
+    assert params["from"] == "2026-10-05T13:12:00"
+    assert params["to"] == "2026-10-05T15:12:00"
+
+
+def test_explicit_utc_candle_timestamp_ignores_broker_wall_offset():
+    assert connector._parse_candle_time(
+        "2026-10-05T12:05:00Z", broker_utc_offset_minutes=180
+    ) == datetime(2026, 10, 5, 12, 5, tzinfo=timezone.utc)
+
+
 def test_empty_price_history_falls_back_to_today_then_month_and_parses_aliases():
     now = _FrozenDateTime.fixed_now
     body = [
@@ -297,6 +345,47 @@ def test_resolve_symbol_name_uses_symbols_map_and_unique_suffix():
     assert session.calls[0][0] == "https://mt5.mtapi.io/Symbols"
 
 
+def test_live_loop_retries_observed_bar_until_scan_cursor_advances():
+    current_bucket = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    current_bucket = current_bucket.replace(
+        minute=(current_bucket.minute // 5) * 5
+    )
+    previous_bar = current_bucket - timedelta(minutes=5)
+    loop = object.__new__(live_loop.GoldScalperLive)
+    loop._last_bar_times = {"5m": None}
+    loop._last_scanned_bar_times = {"5m": None}
+    loop._latest_completed_bar_times = {}
+    get_bar_time = AsyncMock(
+        side_effect=[
+            previous_bar,
+            previous_bar,
+            previous_bar,
+            current_bucket,
+        ]
+    )
+
+    async def run():
+        with (
+            patch.object(live_loop, "TRADE_TIMEFRAMES", ["5m"]),
+            patch.object(live_loop, "MTF_ENABLED", False),
+            patch.object(live_loop, "SL_ATR_TIMEFRAME", "5m"),
+            patch.object(live_loop, "get_last_completed_bar_time", get_bar_time),
+        ):
+            first = await loop._check_new_bars()
+            retry_before_scan = await loop._check_new_bars()
+            loop._last_scanned_bar_times["5m"] = previous_bar.replace(tzinfo=None)
+            unchanged = await loop._check_new_bars()
+            advanced = await loop._check_new_bars()
+            return first, retry_before_scan, unchanged, advanced
+
+    first, retry_before_scan, unchanged, advanced = asyncio.run(run())
+
+    assert first == [("5m", previous_bar.replace(tzinfo=None))]
+    assert retry_before_scan == first
+    assert unchanged == []
+    assert advanced == [("5m", current_bucket.replace(tzinfo=None))]
+
+
 def test_live_loop_emits_one_new_bar_when_latest_closed_time_advances():
     current_bucket = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     current_bucket = current_bucket.replace(
@@ -305,6 +394,7 @@ def test_live_loop_emits_one_new_bar_when_latest_closed_time_advances():
     previous_bar = current_bucket - timedelta(minutes=5)
     loop = object.__new__(live_loop.GoldScalperLive)
     loop._last_bar_times = {"5m": None}
+    loop._last_scanned_bar_times = {"5m": None}
     loop._latest_completed_bar_times = {}
     get_bar_time = AsyncMock(
         side_effect=[previous_bar, previous_bar, current_bucket]
@@ -318,6 +408,9 @@ def test_live_loop_emits_one_new_bar_when_latest_closed_time_advances():
             patch.object(live_loop, "get_last_completed_bar_time", get_bar_time),
         ):
             first = await loop._check_new_bars()
+            loop._last_scanned_bar_times["5m"] = previous_bar.replace(
+                tzinfo=None
+            )
             unchanged = await loop._check_new_bars()
             advanced = await loop._check_new_bars()
             return first, unchanged, advanced

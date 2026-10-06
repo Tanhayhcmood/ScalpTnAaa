@@ -56,6 +56,7 @@ _last_connect_time: float = 0.0   # monotonic timestamp of last successful conne
 _connection = None
 _account = None
 _consecutive_health_failures = 0
+_broker_utc_offset_minutes: Optional[int] = None
 _health_lock = asyncio.Lock()
 # Deprecated compatibility names intentionally remain empty. They are not read
 # by the direct MTAPI implementation and do not enable MetaAPI.
@@ -111,8 +112,11 @@ _TF_MAP = {
     "H1": 60, "H4": 240, "D1": 1440,
 }
 
-def _parse_candle_time(value: object) -> Optional[datetime]:
-    """Parse an MTAPI candle timestamp into an aware UTC datetime."""
+def _parse_candle_time(
+    value: object,
+    broker_utc_offset_minutes: Optional[int] = None,
+) -> Optional[datetime]:
+    """Parse an MTAPI timestamp into UTC, adjusting naive broker-wall times."""
     raw = str(value).strip()
     if not raw:
         return None
@@ -129,15 +133,25 @@ def _parse_candle_time(value: object) -> Optional[datetime]:
     except (TypeError, ValueError):
         return None
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
+        offset_minutes = (
+            _broker_utc_offset_minutes
+            if broker_utc_offset_minutes is None
+            else broker_utc_offset_minutes
+        ) or 0
+        return (parsed - timedelta(minutes=offset_minutes)).replace(
+            tzinfo=timezone.utc
+        )
     return parsed.astimezone(timezone.utc)
 
 
-def _parse_time(value: object) -> Optional[datetime]:
+def _parse_time(
+    value: object,
+    broker_utc_offset_minutes: Optional[int] = None,
+) -> Optional[datetime]:
     """Backward-compatible name for the connector timestamp normalizer."""
     if value is None:
         return None
-    return _parse_candle_time(value)
+    return _parse_candle_time(value, broker_utc_offset_minutes)
 
 
 def _field_value(data: object, *names: str) -> object:
@@ -178,6 +192,51 @@ def _parse_broker_server_time(
     return parsed.astimezone(timezone.utc), parsed.replace(tzinfo=None)
 
 
+def _rounded_broker_utc_offset_minutes(
+    server_wall_time: datetime,
+    utc_now: datetime,
+) -> Optional[int]:
+    """Infer a plausible broker UTC offset from a server clock observation."""
+    server_wall = server_wall_time.replace(tzinfo=None)
+    utc_wall = (
+        utc_now.astimezone(timezone.utc).replace(tzinfo=None)
+        if utc_now.tzinfo is not None
+        else utc_now
+    )
+    difference_minutes = (server_wall - utc_wall).total_seconds() / 60.0
+    rounded_minutes = int(round(difference_minutes / 30.0)) * 30
+    # Broker offsets are timezone offsets, not arbitrary clock drift. Reject
+    # stale/malformed observations instead of learning a bogus offset.
+    if abs(rounded_minutes) > 14 * 60:
+        return None
+    if abs(difference_minutes - rounded_minutes) > 20:
+        return None
+    return rounded_minutes
+
+
+def _observe_broker_utc_offset(
+    server_wall_time: datetime,
+    utc_now: Optional[datetime] = None,
+) -> Optional[int]:
+    """Cache and log the broker's inferred server-wall offset from UTC."""
+    global _broker_utc_offset_minutes
+    observed_now = utc_now or datetime.now(timezone.utc)
+    detected = _rounded_broker_utc_offset_minutes(server_wall_time, observed_now)
+    if detected is None:
+        return _broker_utc_offset_minutes
+    if detected != _broker_utc_offset_minutes:
+        _broker_utc_offset_minutes = detected
+        sign = "+" if detected >= 0 else "-"
+        absolute = abs(detected)
+        log.info(
+            "Detected broker server timezone offset UTC%s%02d:%02d",
+            sign,
+            absolute // 60,
+            absolute % 60,
+        )
+    return _broker_utc_offset_minutes
+
+
 def _account_field(info: object, key: str, default: object = None) -> object:
     """Read a field from either a dict or a simple adapter object."""
     if isinstance(info, dict):
@@ -192,14 +251,17 @@ def _h1_request_minutes(count: int) -> int:
 
 def _candle_history_minutes(timeframe_minutes: int, count: int) -> int:
     """Size history ranges for calibration, bar polling, and indicator windows."""
-    if count >= 500:
-        return 5 * 24 * 60
     if count <= 3:
         # get_last_completed_bar_time polls this small window every loop tick.
         return 2 * 60
     if timeframe_minutes == 60:
         return _h1_request_minutes(count)
-    return timeframe_minutes * (count + 5)
+    requested_history = timeframe_minutes * (count + 5)
+    if count >= 500:
+        # Calibration needs a multi-day live sample; longer timeframes still
+        # receive enough history to satisfy the requested bar count.
+        return max(5 * 24 * 60, requested_history)
+    return requested_history
 
 
 def _completed_candles(
@@ -644,6 +706,7 @@ async def fetch_candles(
                 timeframe,
             )
             now = datetime.now(timezone.utc)
+            broker_offset_minutes = _broker_utc_offset_minutes or 0
             # Preserve the historical adapter's larger warm-up request; the
             # bounded windows below apply to the hosted MTAPI REST contract.
             legacy_count = max(200, requested_count)
@@ -666,7 +729,8 @@ async def fetch_candles(
                 if not isinstance(row, dict):
                     continue
                 candle_time = _parse_time(
-                    _field_value(row, "time", "openTime", "brokerTime", "timestamp")
+                    _field_value(row, "time", "openTime", "brokerTime", "timestamp"),
+                    broker_offset_minutes,
                 )
                 if candle_time is None:
                     continue
@@ -728,18 +792,35 @@ async def fetch_candles(
                 )
                 return []
         tf_min = _TF_MAP.get(timeframe, 5)
+        utc_now = datetime.now(timezone.utc)
         quote = await get_current_quote(symbol)
         server_time, server_wall_time = _parse_broker_server_time(
             quote.get("server_time_raw", quote.get("server_time"))
         )
-        if server_time is None or server_wall_time is None:
+        if server_wall_time is not None:
+            observed_offset = _observe_broker_utc_offset(
+                server_wall_time,
+                utc_now,
+            )
+            broker_offset_minutes = observed_offset or 0
+            server_time = (
+                server_wall_time - timedelta(minutes=broker_offset_minutes)
+            ).replace(tzinfo=timezone.utc)
+        else:
             # Keep operating if an otherwise healthy quote omits its timestamp,
-            # but make the clock source visible for diagnosis.
-            server_time = datetime.now(timezone.utc)
-            server_wall_time = server_time.replace(tzinfo=None)
+            # but make the clock source visible for diagnosis. If a previous
+            # quote established the broker offset, keep using that same offset.
+            broker_offset_minutes = _broker_utc_offset_minutes or 0
+            server_time = utc_now
+            server_wall_time = (
+                utc_now.replace(tzinfo=None)
+                + timedelta(minutes=broker_offset_minutes)
+            )
             log.warning(
                 "fetch_candles could not read broker server time; "
-                "using local UTC clock (symbol=%s timeframe=%s)",
+                "using local UTC clock with cached broker offset UTC%+d minutes "
+                "(symbol=%s timeframe=%s)",
+                broker_offset_minutes,
                 symbol,
                 timeframe,
             )
@@ -891,7 +972,8 @@ async def fetch_candles(
                 candle_time = _parse_candle_time(
                     _field_value(
                         bar, "time", "openTime", "brokerTime", "timestamp"
-                    )
+                    ),
+                    broker_offset_minutes,
                 )
                 if candle_time is None:
                     skipped_rows += 1
@@ -1385,7 +1467,18 @@ async def get_current_quote(symbol: str) -> dict:
                         server_time_raw = _field_value(
                             data, "time", "serverTime", "timeCurrent", "brokerTime"
                         )
-                        server_time, _ = _parse_broker_server_time(server_time_raw)
+                        server_time, server_wall_time = _parse_broker_server_time(
+                            server_time_raw
+                        )
+                        if server_wall_time is not None:
+                            broker_offset_minutes = _observe_broker_utc_offset(
+                                server_wall_time
+                            )
+                            if broker_offset_minutes is not None:
+                                server_time = (
+                                    server_wall_time
+                                    - timedelta(minutes=broker_offset_minutes)
+                                ).replace(tzinfo=timezone.utc)
                         return {
                             "bid": float(bid),
                             "ask": float(ask),

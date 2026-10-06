@@ -489,11 +489,24 @@ MAX_DRAWDOWN_PCT     = _float("MAX_DRAWDOWN_PCT",      8.0,  lo=0.1, hi=50.0)
 SLIPPAGE_POINTS      = _int("SLIPPAGE_POINTS",         30,   lo=1,   hi=500)
 
 # ── Adaptive ATR Trailing Stop ─────────────────────────────────────────────────
-# The live stop waits for 1R, moves to breakeven, then uses a Chandelier stop
-# anchored to the best price seen since entry. Legacy normal/tight settings are
-# retained for config compatibility and telemetry.
+# Lock a small part of the original risk once the trade reaches the selected
+# fraction of R. At 1R the Chandelier stage becomes eligible. Legacy normal/tight
+# settings are retained for config compatibility and telemetry.
 TRAIL_ENABLED        = os.getenv("TRAIL_ENABLED", "true").lower() == "true"
 TRAIL_ATR_PERIOD = _int("TRAIL_ATR_PERIOD", 14, lo=1, hi=100)
+TRAIL_PROFIT_LOCK_TRIGGER_R = _float(
+    "TRAIL_PROFIT_LOCK_TRIGGER_R", 0.5, lo=0.05, hi=2.0
+)
+TRAIL_PROFIT_LOCK_R = _float(
+    "TRAIL_PROFIT_LOCK_R", 0.1, lo=0.0, hi=1.99
+)
+if TRAIL_PROFIT_LOCK_R >= TRAIL_PROFIT_LOCK_TRIGGER_R:
+    print(
+        "ERROR: TRAIL_PROFIT_LOCK_R must be smaller than "
+        "TRAIL_PROFIT_LOCK_TRIGGER_R.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 TRAIL_CHANDELIER_ATR_MULTIPLIER = _float(
     "TRAIL_CHANDELIER_ATR_MULTIPLIER", 2.5, lo=2.0, hi=3.0
 )

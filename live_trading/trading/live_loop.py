@@ -58,6 +58,7 @@ from live_trading.config import (
     TRAIL_VOLUME_SHRINK_RATIO, TRAIL_MIN_PROFIT_ATR,
     TRAIL_MIN_DISTANCE_ATR, TRAIL_MIN_STEP_PRICE,
     TRAIL_CHANDELIER_ATR_MULTIPLIER,
+    TRAIL_PROFIT_LOCK_TRIGGER_R, TRAIL_PROFIT_LOCK_R,
     RANGE_WEAK_MIN_CONFIRMATIONS,
     MTF_ENABLED, MTF_TIMEFRAME, MTF_CANDLE_WINDOW,
     MTF_OPPOSITION_THRESHOLD, MTF_REQUIRE_ALIGNMENT, MTF_DRY_RUN,
@@ -138,6 +139,60 @@ def _log_candle_window(timeframe: str, candles, source: str) -> None:
         len(candles),
         _candle_time_text(first),
         _candle_time_text(last),
+    )
+
+
+def _log_scan_result(timeframe: str, context: dict, permission: dict) -> None:
+    """Emit one compact, auditable result for every closed-bar scan attempt."""
+    candles = context.get("candles") or []
+    candle = candles[-1] if candles else None
+    bar_time = context.get("bar_time") or (
+        getattr(candle, "time", None) if candle is not None else None
+    )
+    if isinstance(bar_time, datetime):
+        bar_time_text = bar_time.isoformat()
+    else:
+        bar_time_text = str(bar_time or "-")
+
+    if candle is None:
+        ohlc_text = "unavailable"
+    else:
+        ohlc_text = (
+            f"O={candle.open:.5f} H={candle.high:.5f} "
+            f"L={candle.low:.5f} C={candle.close:.5f}"
+        )
+
+    decision = context.get("decision")
+    if decision is None:
+        outcome = "NO_SIGNAL"
+        reason = context.get("reason") or "decision engine not reached"
+    elif decision.allowed:
+        outcome = f"SIGNAL:{decision.direction or 'UNKNOWN'}"
+        reason = "decision engine approved candidate"
+    else:
+        outcome = "NO_SIGNAL"
+        reason = " | ".join(decision.blocked_reasons or ["decision engine rejected"])
+
+    stage = permission.get("stage")
+    gate_reasons = permission.get("reasons") or []
+    if (
+        stage not in {None, "EVALUATING", "NOT_EVALUATED"}
+        and not permission.get("allowed", False)
+        and gate_reasons
+    ):
+        if decision is not None and decision.allowed:
+            reason = f"{stage}: {' | '.join(map(str, gate_reasons))}"
+        elif decision is None:
+            reason = " | ".join(map(str, gate_reasons))
+
+    reason = str(reason).replace("\n", " ").replace("\r", " ")
+    log.info(
+        "BAR_SCAN timeframe=%s bar_time=%s OHLC=%s decision=%s reason=%s",
+        timeframe,
+        bar_time_text,
+        ohlc_text,
+        outcome,
+        reason,
     )
 
 
@@ -533,9 +588,12 @@ class GoldScalperLive:
         self.running: bool = True
         self.paused:  bool = False
         self.loop_count: int = 0
-        # Multi-TF bar tracking: one last-seen bar-time per trade timeframe.
-        # Initialised to None so the first bar on every TF is always processed.
+        # The observed cursor supports status telemetry; the scanned cursor
+        # alone decides whether a closed candle still needs signal evaluation.
         self._last_bar_times: dict[str, Optional[datetime]] = {
+            tf: None for tf in TRADE_TIMEFRAMES
+        }
+        self._last_scanned_bar_times: dict[str, Optional[datetime]] = {
             tf: None for tf in TRADE_TIMEFRAMES
         }
         # Latest completed bar time observed for non-trade context timeframes
@@ -619,6 +677,8 @@ class GoldScalperLive:
             enabled=TRAIL_ENABLED,
             atr_period=TRAIL_ATR_PERIOD,
             chandelier_atr_multiplier=TRAIL_CHANDELIER_ATR_MULTIPLIER,
+            profit_lock_trigger_r=TRAIL_PROFIT_LOCK_TRIGGER_R,
+            profit_lock_r=TRAIL_PROFIT_LOCK_R,
             normal_multiplier=TRAIL_NORMAL_MULTIPLIER,
             tight_multiplier=TRAIL_TIGHT_MULTIPLIER,
             exhaustion_confirm_count=TRAIL_EXHAUSTION_CONFIRM_COUNT,
@@ -914,7 +974,9 @@ class GoldScalperLive:
 
     async def _calibrate_wyckoff(self) -> None:
         log.info("Calibrating Wyckoff config from live data …")
-        candles = await fetch_candles(SYMBOL, TIMEFRAME, 500)
+        # A full five-day M5 sample gives calibration real market structure,
+        # rather than falling back to defaults after a short warm-up window.
+        candles = await fetch_candles(SYMBOL, TIMEFRAME, 5 * 24 * 60 // 5)
         if candles:
             cfg = calibrate_wyckoff(candles)
             set_calibrated_config(cfg)
@@ -1171,10 +1233,17 @@ class GoldScalperLive:
                 if tf not in trade_timeframes:
                     self._latest_completed_bar_times[tf] = _bt_naive
                     continue
-                prev = self._last_bar_times.get(tf)
-                if prev is None or _bt_naive > prev:
-                    self._last_bar_times[tf] = _bt_naive
-                    results.append((tf, _bt_naive))
+                observed = self._last_bar_times.get(tf)
+                if observed is None or _bt_naive > observed:
+                    observed = _bt_naive
+                    self._last_bar_times[tf] = observed
+                scanned = getattr(self, "_last_scanned_bar_times", {}).get(tf)
+                # The observation cursor is status telemetry only. If polling
+                # saw a bar but its scan has not yet been attempted, keep
+                # returning that newest observed bar rather than losing it
+                # because the observation cursor already advanced.
+                if observed is not None and (scanned is None or observed > scanned):
+                    results.append((tf, observed))
             except Exception as _bar_err:
                 log.warning(f"[{tf}] Bar time check failed: {_bar_err}")
         return results
@@ -1315,6 +1384,43 @@ class GoldScalperLive:
             return 0.0, reason
 
     async def _on_new_bar(self, bar_time: datetime, tf: str = TIMEFRAME) -> None:
+        """Scan a closed bar, then log it and advance the scanned-bar cursor."""
+        scan_context = {
+            "bar_time": _normalize_bar_time(bar_time),
+            "candles": [],
+            "decision": None,
+            "reason": "decision engine not reached",
+        }
+        try:
+            await self._scan_new_bar(bar_time, tf, scan_context)
+        finally:
+            try:
+                _log_scan_result(
+                    tf,
+                    scan_context,
+                    getattr(self, "_last_trade_permission", {}),
+                )
+            except Exception:
+                log.exception("[%s] Could not write BAR_SCAN log", tf)
+            scanned_time = (
+                scan_context.get("last_scanned_bar_time")
+                or _normalize_bar_time(bar_time)
+            )
+            if scanned_time is not None:
+                scanned = getattr(self, "_last_scanned_bar_times", None)
+                if scanned is None:
+                    scanned = {}
+                    self._last_scanned_bar_times = scanned
+                previous = scanned.get(tf)
+                if previous is None or scanned_time > previous:
+                    scanned[tf] = scanned_time
+
+    async def _scan_new_bar(
+        self,
+        bar_time: datetime,
+        tf: str,
+        scan_context: dict,
+    ) -> None:
         self._set_trade_permission(
             False,
             "EVALUATING",
@@ -1324,7 +1430,7 @@ class GoldScalperLive:
         # remains mandatory; this only removes avoidable wait time between
         # independent bridge calls.
         candles_task = asyncio.create_task(
-            fetch_candles(SYMBOL, tf, CANDLE_WINDOW)
+            fetch_candles(SYMBOL, tf, max(CANDLE_WINDOW, 1000))
         )
         account_task = asyncio.create_task(get_account_info())
         mtf_task = (
@@ -1344,6 +1450,7 @@ class GoldScalperLive:
             tasks.append(sl_atr_task)
         results = await asyncio.gather(*tasks)
         candles, acc_info = results[0], results[1]
+        scan_context["candles"] = candles or []
         result_index = 2
         if mtf_task is not None:
             htf_bias, htf_data_reason = results[result_index]
@@ -1362,6 +1469,9 @@ class GoldScalperLive:
         _log_candle_window(tf, candles, "entry")
         # 1. Fetch the latest completed candles for this timeframe.
         if len(candles) < 50:
+            scan_context["reason"] = (
+                f"insufficient closed candles: {len(candles)} returned; need 50"
+            )
             log.warning(f"Only {len(candles)} candles returned — skipping bar")
             return
         if sl_atr <= 0.0:
@@ -1391,6 +1501,7 @@ class GoldScalperLive:
         _trigger_time = _normalize_bar_time(bar_time)
         _signal_time = _normalize_bar_time(candles[-1].time)
         if _trigger_time is None or _signal_time is None:
+            scan_context["reason"] = "invalid closed-candle timestamp"
             self._set_trade_permission(
                 False,
                 "INVALID_CANDLE_TIME",
@@ -1405,6 +1516,7 @@ class GoldScalperLive:
                 f"Latest closed candle {_signal_time.isoformat()} is stale; "
                 "waiting for broker history synchronization"
             )
+            scan_context["reason"] = reason
             self._set_trade_permission(False, "STALE_CANDLE_DATA", [reason])
             log.warning(f"[{tf}] {reason}")
             self._write_state(
@@ -1423,6 +1535,7 @@ class GoldScalperLive:
                 f"Fetched candle {_signal_time.isoformat()} is older than "
                 f"trigger {_trigger_time.isoformat()}"
             )
+            scan_context["reason"] = reason
             self._set_trade_permission(False, "STALE_CANDLE_DATA", [reason])
             log.warning(f"[{tf}] {reason} — refusing to trade on stale history")
             self._write_state(
@@ -1446,6 +1559,8 @@ class GoldScalperLive:
                 f"{_trigger_time.isoformat()} → {_signal_time.isoformat()}"
             )
         bar_time = _signal_time
+        scan_context["bar_time"] = _signal_time
+        scan_context["last_scanned_bar_time"] = _signal_time
         self._last_bar_times[tf] = _signal_time
 
         if htf_bias is not None:
@@ -1625,6 +1740,7 @@ class GoldScalperLive:
             symbol=SYMBOL,
         )
         self.last_decision = decision
+        scan_context["decision"] = decision
 
         # 6. Write MT5 snapshot for Telegram panel
         last_c = candles[-1]
@@ -2182,6 +2298,7 @@ class GoldScalperLive:
                 "timeframe":     tf,
                 "highest_price_since_entry": tp_params.entry_price,
                 "lowest_price_since_entry": tp_params.entry_price,
+                "profit_lock_armed": False,
                 "breakeven_armed": False,
             }
             # Build a synthetic position so the Telegram panel reflects the
@@ -2267,10 +2384,11 @@ class GoldScalperLive:
                         "entry":         float(entry["entry"]),
                         "risk_distance": risk,
                         "initial_sl":    float(entry["sl"]),
-                    "timeframe":     entry.get("timeframe") or TIMEFRAME,
-                    "highest_price_since_entry": float(entry["entry"]),
-                    "lowest_price_since_entry": float(entry["entry"]),
-                    "breakeven_armed": False,
+                        "timeframe":     entry.get("timeframe") or TIMEFRAME,
+                        "highest_price_since_entry": float(entry["entry"]),
+                        "lowest_price_since_entry": float(entry["entry"]),
+                        "profit_lock_armed": False,
+                        "breakeven_armed": False,
                     }
                 break
         # Fallback: derive from the position's live snapshot.
@@ -2289,6 +2407,7 @@ class GoldScalperLive:
                 "timeframe":     pos.get("timeframe") or TIMEFRAME,
                 "highest_price_since_entry": float(pos.get("open_price", 0.0)),
                 "lowest_price_since_entry": float(pos.get("open_price", 0.0)),
+                "profit_lock_armed": False,
                 "breakeven_armed": False,
             }
         return None
@@ -2405,6 +2524,7 @@ class GoldScalperLive:
                     "lowest_price_since_entry"
                 ),
                 breakeven_armed=baseline.get("breakeven_armed", False),
+                profit_lock_armed=baseline.get("profit_lock_armed", False),
             )
             baseline.update(
                 {
@@ -2414,6 +2534,7 @@ class GoldScalperLive:
                     "lowest_price_since_entry": (
                         decision.lowest_price_since_entry
                     ),
+                    "profit_lock_armed": decision.profit_lock_armed,
                     "breakeven_armed": decision.breakeven_armed,
                 }
             )
@@ -2421,7 +2542,7 @@ class GoldScalperLive:
             previous_status = self._last_trailing_statuses.get(pos_id, {})
             apply_step = (
                 0.0
-                if decision.stage == "BREAKEVEN"
+                if decision.stage == "PROFIT_LOCK"
                 else self._trailing_cfg.min_step_price
             )
             applicable = should_apply(
@@ -2432,19 +2553,40 @@ class GoldScalperLive:
             )
             action = "MODIFY" if applicable else "HOLD"
             if candidate_sl is None:
-                reason_text = (
-                    "waiting for 1R (current %.3fR, risk_distance=%.5f)"
-                    % (
-                        decision.floating_profit_r_multiple,
-                        decision.risk_distance,
+                if decision.stage == "WAITING_FOR_PROFIT_LOCK":
+                    reason_text = (
+                        "waiting for +%.2fR profit lock "
+                        "(current %.3fR, risk_distance=%.5f)"
+                        % (
+                            self._trailing_cfg.profit_lock_trigger_r,
+                            decision.floating_profit_r_multiple,
+                            decision.risk_distance,
+                        )
                     )
-                )
+                elif decision.stage == "PROFIT_LOCKED":
+                    reason_text = (
+                        "profit protected at +%.2fR; waiting for 1R chandelier"
+                        % self._trailing_cfg.profit_lock_r
+                    )
+                else:
+                    reason_text = (
+                        "waiting for 1R chandelier (current %.3fR, "
+                        "risk_distance=%.5f)"
+                        % (
+                            decision.floating_profit_r_multiple,
+                            decision.risk_distance,
+                        )
+                    )
                 if decision.stage == "CHANDELIER":
                     reason_text = "insufficient ATR/candle data for chandelier"
             else:
                 reason_text = (
-                    "move SL to exact breakeven at 1R"
-                    if decision.stage == "BREAKEVEN"
+                    "lock +%.2fR after +%.2fR"
+                    % (
+                        self._trailing_cfg.profit_lock_r,
+                        self._trailing_cfg.profit_lock_trigger_r,
+                    )
+                    if decision.stage == "PROFIT_LOCK"
                     else (
                         "chandelier from favourable extreme "
                         f"(multiplier={self._trailing_cfg.chandelier_atr_multiplier:.2f})"
@@ -2466,6 +2608,7 @@ class GoldScalperLive:
                 "risk_distance": decision.risk_distance,
                 "highest_price_since_entry": decision.highest_price_since_entry,
                 "lowest_price_since_entry": decision.lowest_price_since_entry,
+                "profit_lock_armed": decision.profit_lock_armed,
                 "breakeven_armed": decision.breakeven_armed,
                 "current_sl": pos["sl"],
                 "candidate_sl": candidate_sl,
@@ -2475,19 +2618,21 @@ class GoldScalperLive:
             }
             if (
                 previous_status.get("stage") != decision.stage
-                and decision.stage == "BREAKEVEN"
+                and decision.stage == "PROFIT_LOCK"
             ):
                 log.info(
-                    "Adaptive trailing stage: ticket=%s stage=BREAKEVEN "
+                    "Adaptive trailing stage: ticket=%s stage=PROFIT_LOCK "
                     "timeframe=%s risk_distance=%.5f "
                     "floating_profit=%.2f floating_profit_price=%.5f "
-                    "profit_r=%.3f",
+                    "profit_r=%.3f lock_r=%.3f trigger_r=%.3f",
                     pos_id,
                     timeframe,
                     decision.risk_distance,
                     pos.get("profit", 0.0),
                     decision.floating_profit_price,
                     decision.floating_profit_r_multiple,
+                    self._trailing_cfg.profit_lock_r,
+                    self._trailing_cfg.profit_lock_trigger_r,
                 )
             elif (
                 previous_status.get("stage") != decision.stage
@@ -3571,6 +3716,9 @@ class GoldScalperLive:
                     ),
                     "lowest_price_since_entry": float(
                         baseline.get("lowest_price_since_entry", entry)
+                    ),
+                    "profit_lock_armed": bool(
+                        baseline.get("profit_lock_armed", False)
                     ),
                     "breakeven_armed": bool(
                         baseline.get("breakeven_armed", False)

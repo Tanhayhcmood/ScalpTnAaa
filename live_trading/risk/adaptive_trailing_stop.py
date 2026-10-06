@@ -25,6 +25,8 @@ class AdaptiveTrailingConfig:
     enabled: bool = True
     atr_period: int = 14
     chandelier_atr_multiplier: float = 2.5
+    profit_lock_trigger_r: float = 0.5
+    profit_lock_r: float = 0.1
     normal_multiplier: float = 2.0
     tight_multiplier: float = 0.9
     exhaustion_confirm_count: int = 2
@@ -66,6 +68,7 @@ class AdaptiveTrailDecision:
     risk_distance: float
     highest_price_since_entry: Optional[float]
     lowest_price_since_entry: Optional[float]
+    profit_lock_armed: bool
     breakeven_armed: bool
     tightening_eligible: bool
 
@@ -237,14 +240,14 @@ def compute_adaptive_trail(
     highest_price_since_entry: Optional[float] = None,
     lowest_price_since_entry: Optional[float] = None,
     breakeven_armed: bool = False,
+    profit_lock_armed: bool = False,
 ) -> AdaptiveTrailDecision:
-    """Compute the three-stage trailing decision for one open position.
+    """Compute the staged protective stop for one open position.
 
-    Stage 1 deliberately returns no candidate until favourable price movement
-    reaches one initial risk unit (1R).  Stage 2 returns the entry price as
-    the exact breakeven candidate.  Once the live SL is already at/beyond
-    breakeven, stage 3 uses a Chandelier stop anchored to the best price seen
-    since entry rather than to the current quote.
+    The stop stays at its original level until the configured profit-lock
+    threshold is reached. It then locks the configured fraction of initial R.
+    At 1R, the Chandelier stage becomes eligible and remains anchored to the
+    best price seen since entry rather than to the current quote.
 
     ``highest_price_since_entry`` and ``lowest_price_since_entry`` are supplied
     by the live loop so the extreme survives between ticks and restarts.
@@ -311,34 +314,49 @@ def compute_adaptive_trail(
             high_since_entry = normalized_entry
             low_since_entry = normalized_entry
 
-    # Once the threshold has been observed, retain that fact even if price
-    # retraces before the next poll.  The live loop persists this flag.
+    # Keep both milestones sticky if price retraces before the next poll. The
+    # live loop persists them so a restart cannot forget earned protection.
+    profit_lock_armed = bool(
+        profit_lock_armed
+        or (
+            normalized_risk > 0.0
+            and floating_profit_r_multiple
+            >= max(0.0, float(cfg.profit_lock_trigger_r))
+        )
+    )
     breakeven_armed = bool(
         breakeven_armed
         or (normalized_risk > 0.0 and floating_profit_price >= normalized_risk)
     )
 
-    stage = "WAITING_FOR_1R"
+    stage = "WAITING_FOR_PROFIT_LOCK"
     candidate = None
     multiplier = 0.0
     distance = 0.0
-    if breakeven_armed and normalized_entry is not None:
-        sl_at_or_beyond_breakeven = False
+    if profit_lock_armed and normalized_entry is not None:
+        lock_distance = normalized_risk * max(0.0, float(cfg.profit_lock_r))
+        lock_level = round(
+            normalized_entry + lock_distance
+            if is_buy
+            else normalized_entry - lock_distance,
+            8,
+        )
+        sl_at_or_beyond_profit_lock = False
         if current_sl is not None:
             try:
                 live_sl = float(current_sl)
-                sl_at_or_beyond_breakeven = (
-                    live_sl >= normalized_entry if is_buy
-                    else live_sl <= normalized_entry
+                sl_at_or_beyond_profit_lock = (
+                    live_sl >= lock_level if is_buy
+                    else live_sl <= lock_level
                 )
             except (TypeError, ValueError):
-                sl_at_or_beyond_breakeven = False
+                sl_at_or_beyond_profit_lock = False
 
-        if not sl_at_or_beyond_breakeven:
-            stage = "BREAKEVEN"
-            candidate = round(normalized_entry, 8)
-            distance = round(abs(float(current_price) - normalized_entry), 8)
-        elif current_atr > 0.0:
+        if not sl_at_or_beyond_profit_lock:
+            stage = "PROFIT_LOCK"
+            candidate = lock_level
+            distance = round(abs(float(current_price) - lock_level), 8)
+        elif breakeven_armed and current_atr > 0.0:
             stage = "CHANDELIER"
             multiplier = float(cfg.chandelier_atr_multiplier)
             if is_buy and high_since_entry is not None:
@@ -347,6 +365,8 @@ def compute_adaptive_trail(
             elif not is_buy and low_since_entry is not None:
                 candidate = round(low_since_entry + (multiplier * current_atr), 8)
                 distance = round(candidate - low_since_entry, 8)
+        else:
+            stage = "PROFIT_LOCKED"
 
     # ``mode`` remains in the decision contract for panel compatibility.
     # Exhaustion indicators are retained as telemetry but no longer authorize
@@ -371,6 +391,7 @@ def compute_adaptive_trail(
         lowest_price_since_entry=(
             round(low_since_entry, 8) if low_since_entry is not None else None
         ),
+        profit_lock_armed=profit_lock_armed,
         breakeven_armed=breakeven_armed,
         tightening_eligible=tightening_eligible,
     )
