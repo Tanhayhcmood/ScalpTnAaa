@@ -639,6 +639,8 @@ class GoldScalperLive:
         # record per scan, so Render logs can be analysed without parsing
         # human-readable messages.
         self._last_candle_telemetry: dict = {}
+        # Per-scan context for decision-neutral trade forensics. Never include credentials.
+        self._forensic_context: dict = {}
         # This is deliberately independent from DecisionResult.allowed.
         # The decision engine reports signal eligibility; this state records
         # the result of every live entry gate before an order is sent.
@@ -1434,6 +1436,20 @@ class GoldScalperLive:
         tf: str,
         scan_context: dict,
     ) -> None:
+        _forensic_bar_time = _normalize_bar_time(bar_time)
+        self._forensic_context = {
+            "bar_time_utc": _forensic_bar_time.isoformat() if _forensic_bar_time else None,
+            "timeframe": tf,
+            "decision": None,
+            "session": None,
+            "atr_m5": None,
+            "atr_m15": None,
+            "balance": None,
+            "guardian_status": None,
+            "quote": None,
+            "positions": None,
+            "positions_known": False,
+        }
         self._set_trade_permission(
             False,
             "EVALUATING",
@@ -1505,6 +1521,12 @@ class GoldScalperLive:
         self._last_candles_by_timeframe[tf] = list(candles)
         self._last_atr_by_timeframe[tf] = atr(candles, TRAIL_ATR_PERIOD)
         signal_atr = calc_atr(candles, ENTRY_SIGNAL_ATR_PERIOD)
+        self._forensic_context["atr_m5"] = self._forensic_atr_value(
+            "M5", tf, signal_atr, sl_atr
+        )
+        self._forensic_context["atr_m15"] = self._forensic_atr_value(
+            "M15", tf, signal_atr, sl_atr
+        )
 
         # The bar detector and the signal fetch are separate broker requests.
         # A reconnect can make the detector see a fresh timestamp while the
@@ -1627,6 +1649,7 @@ class GoldScalperLive:
 
         self._last_acc_info = acc_info  # update cache so WAITING writes show real balance
         balance  = float(acc_info["balance"])
+        self._forensic_context["balance"] = balance
         equity   = float(acc_info["equity"])
 
         # 3. ── RISK GUARDIAN CHECK ────────────────────────────────────────────
@@ -1648,6 +1671,7 @@ class GoldScalperLive:
 
         gs = self.guardian.check(balance, equity)
         self._last_guardian_status = gs
+        self._forensic_context["guardian_status"] = gs
 
         if gs.halted:
             self._set_trade_permission(
@@ -1695,6 +1719,8 @@ class GoldScalperLive:
             return
         pos_dicts = [mt5_pos_to_dict(p) for p in raw_positions]
         self._last_open_positions = list(pos_dicts)
+        self._forensic_context["positions"] = list(pos_dicts)
+        self._forensic_context["positions_known"] = True
         pos       = pos_dicts[0] if pos_dicts else None
 
         # DEFENSE IN DEPTH: an unrecognised corrupted row was dropped this
@@ -1753,6 +1779,10 @@ class GoldScalperLive:
             symbol=SYMBOL,
         )
         self.last_decision = decision
+        self._forensic_context["decision"] = decision
+        self._forensic_context["session"] = getattr(
+            getattr(decision, "quality_filter", None), "session_quality", None
+        )
         scan_context["decision"] = decision
 
         # 6. Write MT5 snapshot for Telegram panel
@@ -2309,6 +2339,23 @@ class GoldScalperLive:
             self._trade_opened_this_tick = True
             self._last_entry_bar_time   = bar_time
             self._last_entry_direction  = decision.direction
+            self._emit_trade_forensics(
+                "ENTRY",
+                ticket=result.position_id,
+                decision=decision,
+                params=tp_params,
+                positions=_confirm_pos_dicts,
+                candidate={
+                    "ticket": result.position_id,
+                    "type": decision.direction,
+                    "volume": tp_params.lot_size,
+                    "open_price": tp_params.entry_price,
+                    "sl": tp_params.stop_loss,
+                    "tp": tp_params.take_profit,
+                },
+                timeframe=tf,
+                bar_time=bar_time,
+            )
             strategy = describe_strategy(decision)
             entry_log = {
                 "position_id": result.position_id,
@@ -3524,6 +3571,8 @@ class GoldScalperLive:
             confirm_dicts = [
                 mt5_pos_to_dict(position) for position in confirm_positions
             ]
+            self._forensic_context["positions"] = list(confirm_dicts)
+            self._forensic_context["positions_known"] = True
             if dropped_unknown:
                 return (
                     None,
@@ -3602,6 +3651,12 @@ class GoldScalperLive:
                     "QUOTE_UNAVAILABLE",
                     f"Could not refresh {SYMBOL} quote before order",
                 )
+            _forensic_bid = self._forensic_number(quote.get("bid"))
+            _forensic_ask = self._forensic_number(quote.get("ask"))
+            if _forensic_bid is not None or _forensic_ask is not None:
+                self._forensic_context["quote"] = {
+                    "bid": _forensic_bid, "ask": _forensic_ask
+                }
             try:
                 execution_price = float(
                     quote["ask"] if decision.direction == "BUY" else quote["bid"]
@@ -3963,7 +4018,7 @@ class GoldScalperLive:
             "stage": stage,
             "reasons": [str(reason) for reason in reasons if str(reason).strip()],
         }
-        if not allowed and stage != "NOT_EVALUATED":
+        if not allowed and stage not in {"NOT_EVALUATED", "EVALUATING"}:
             remaining = (
                 max(0, int(cooldown_remaining_seconds))
                 if cooldown_remaining_seconds is not None
@@ -3979,6 +4034,184 @@ class GoldScalperLive:
                 reason,
                 remaining,
             )
+            if stage not in {"MANUAL_PAUSE", "RISK_GUARDIAN_LOCK_RETAINED"}:
+                self._emit_trade_forensics(
+                    "ENTRY_BLOCKED", stage=stage, reason=reason
+                )
+
+    @staticmethod
+    def _forensic_number(value: object) -> Optional[float]:
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def _forensic_atr_value(
+        self, timeframe: str, current_timeframe: str,
+        current_signal_atr: float, sl_atr: float,
+    ) -> Optional[float]:
+        target = str(timeframe or "").upper()
+        current = str(current_timeframe or "").upper()
+        aliases = {"5M": "M5", "15M": "M15"}
+        target = aliases.get(target, target)
+        current = aliases.get(current, current)
+        if current == target:
+            value = self._forensic_number(current_signal_atr)
+            if value is not None and value > 0:
+                return value
+        if target == "M15" and str(SL_ATR_TIMEFRAME).upper() in {"M15", "15M"}:
+            value = self._forensic_number(sl_atr)
+            if value is not None and value > 0:
+                return value
+        candles = self._last_candles_by_timeframe.get(target, [])
+        if not candles:
+            return None
+        try:
+            value = self._forensic_number(
+                calc_atr(candles, ENTRY_SIGNAL_ATR_PERIOD)
+            )
+            return value if value is not None and value > 0 else None
+        except Exception:
+            return None
+
+    def _emit_trade_forensics(
+        self, event: str, *, ticket: object = None,
+        decision: Optional[DecisionResult] = None,
+        params: Optional[CapitalOutput] = None,
+        positions: Optional[list[dict]] = None,
+        candidate: Optional[dict] = None,
+        timeframe: Optional[str] = None,
+        bar_time: Optional[datetime] = None,
+        stage: Optional[str] = None, reason: Optional[str] = None,
+    ) -> None:
+        """Emit one credential-free JSON record; never participates in gating."""
+        try:
+            context = self._forensic_context if isinstance(self._forensic_context, dict) else {}
+            if decision is None:
+                decision = context.get("decision")
+            if params is None and decision is not None:
+                params = getattr(decision, "trade_params", None)
+            if positions is None:
+                positions = context.get("positions")
+                positions_known = bool(context.get("positions_known", False))
+            else:
+                positions_known = True
+            rows = list(positions or []) if positions_known else []
+            if candidate is not None and positions_known:
+                rows.append(candidate)
+            side = getattr(decision, "direction", None)
+            entry_filter = getattr(decision, "entry_filter", None) if decision is not None else None
+            confirmations = None
+            if entry_filter is not None:
+                confirmations = []
+                if bool(getattr(entry_filter, "trend", False)):
+                    confirmations.append("EMA_TREND")
+                if bool(getattr(entry_filter, "price_action", False)):
+                    confirmations.append("PRICE_ACTION")
+            quality = getattr(decision, "quality_filter", None) if decision is not None else None
+            session = (
+                getattr(quality, "session_quality", None)
+                if quality is not None else context.get("session")
+            )
+            balance = self._forensic_number(context.get("balance"))
+            if balance is None:
+                balance = self._forensic_number(
+                    (getattr(self, "_last_acc_info", None) or {}).get("balance")
+                    if isinstance(getattr(self, "_last_acc_info", None), dict) else None
+                )
+            same_direction_count = None
+            risk_pct = None
+            risk_complete = None
+            if positions_known:
+                same_direction_count = (
+                    sum(
+                        1 for row in rows
+                        if str(row.get("type", row.get("direction", ""))).upper()
+                        == str(side).upper()
+                    )
+                    if side in {"BUY", "SELL"} else None
+                )
+                if balance is not None and balance > 0:
+                    risk_amount = 0.0
+                    risk_complete = True
+                    for row in rows:
+                        volume = self._forensic_number(row.get("volume", row.get("lot")))
+                        opened = self._forensic_number(
+                            row.get("open_price", row.get("entry"))
+                        )
+                        stop = self._forensic_number(row.get("sl", row.get("stop_loss")))
+                        if volume is None or opened is None or stop is None or stop <= 0:
+                            risk_complete = False
+                            break
+                        risk_amount += abs(opened - stop) * volume * LOT_DOLLAR_PER_UNIT
+                    if risk_complete:
+                        risk_pct = round(risk_amount / balance * 100.0, 4)
+                else:
+                    risk_complete = False
+            quote = context.get("quote")
+            if not isinstance(quote, dict):
+                quote = {}
+            if bar_time is not None:
+                normalized_time = _normalize_bar_time(bar_time)
+                event_time = normalized_time.isoformat() if normalized_time else None
+            else:
+                event_time = context.get("bar_time_utc")
+            guardian = context.get("guardian_status")
+            daily_pnl_pct = self._forensic_number(
+                getattr(guardian, "daily_pnl_pct", None)
+            )
+            daily_limit = self._forensic_number(
+                getattr(guardian, "daily_loss_limit_pct", None)
+            )
+            daily_used_pct = (
+                round(max(0.0, -daily_pnl_pct) / daily_limit * 100.0, 2)
+                if daily_pnl_pct is not None and daily_limit is not None and daily_limit > 0
+                else None
+            )
+            raw_reason = str(reason) if reason is not None else None
+            if raw_reason is not None:
+                for pattern in (
+                    r"(?i)\b(?:password|passwd|token|secret|api[-_ ]?key|session[-_ ]?id|conn(?:ection)?[-_ ]?id)\b\s*[:=]\s*[^,;\s]+",
+                    r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+",
+                ):
+                    raw_reason = re.sub(pattern, "[REDACTED]", raw_reason)
+            record = {
+                "event": event,
+                "event_time_utc": event_time,
+                "timeframe": timeframe or context.get("timeframe"),
+                "symbol": SYMBOL,
+                "ticket": str(ticket) if ticket is not None else None,
+                "side": side,
+                "lots": self._forensic_number(getattr(params, "lot_size", None)),
+                "entry": self._forensic_number(getattr(params, "entry_price", None)),
+                "entry_price_source": "submitted_reference" if event == "ENTRY" else "decision_reference",
+                "sl": self._forensic_number(getattr(params, "stop_loss", None)),
+                "tp": self._forensic_number(getattr(params, "take_profit", None)),
+                "regime": getattr(decision, "regime", None) if decision is not None else None,
+                "grade": getattr(decision, "grade", None) if decision is not None else None,
+                "confidence": self._forensic_number(getattr(decision, "confidence", None)) if decision is not None else None,
+                "confirmations": confirmations,
+                "session": session,
+                "atr_m5": self._forensic_number(context.get("atr_m5")),
+                "atr_m15": self._forensic_number(context.get("atr_m15")),
+                "bid": self._forensic_number(quote.get("bid")),
+                "ask": self._forensic_number(quote.get("ask")),
+                "open_same_direction_count": same_direction_count,
+                "total_open_risk_pct": risk_pct,
+                "open_risk_complete": risk_complete,
+                "daily_risk_used_pct": daily_used_pct,
+                "daily_loss_pct_of_balance": daily_pnl_pct,
+                "daily_risk_basis": "realized_balance_change_as_pct_of_configured_daily_limit",
+                "reason_code": stage,
+                "reason": raw_reason,
+                "order_result": "accepted" if event == "ENTRY" else None,
+            }
+            log_method = log.warning if event == "ENTRY_BLOCKED" else log.info
+            log_method("TRADE_FORENSICS %s", json.dumps(record, sort_keys=True, separators=(",", ":"), default=str))
+        except Exception:
+            # Telemetry must never alter an entry, order, or risk decision.
+            log.debug("Trade forensics record skipped; context unavailable")
 
     @staticmethod
     def _parse_control_time(value: object) -> Optional[datetime]:
