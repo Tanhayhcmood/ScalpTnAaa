@@ -534,7 +534,8 @@ class GoldScalperLive:
         self.paused:  bool = False
         self.loop_count: int = 0
         # Multi-TF bar tracking: one last-seen bar-time per trade timeframe.
-        # Initialised to None so the first bar on every TF is always processed.
+        # A None cursor is bootstrapped from the latest completed candle on the
+        # first poll; replaying that candle after a restart can duplicate entry.
         self._last_bar_times: dict[str, Optional[datetime]] = {
             tf: None for tf in TRADE_TIMEFRAMES
         }
@@ -1172,7 +1173,19 @@ class GoldScalperLive:
                     self._latest_completed_bar_times[tf] = _bt_naive
                     continue
                 prev = self._last_bar_times.get(tf)
-                if prev is None or _bt_naive > prev:
+                if prev is None:
+                    # The latest completed candle may already have produced an
+                    # order before this process restarted. Establish a cursor
+                    # without replaying it; the next genuinely closed candle
+                    # will be processed normally.
+                    self._last_bar_times[tf] = _bt_naive
+                    log.info(
+                        "[%s] Startup bar baseline set to %s; skipping replay",
+                        tf,
+                        _bt_naive.isoformat(),
+                    )
+                    continue
+                if _bt_naive > prev:
                     self._last_bar_times[tf] = _bt_naive
                     results.append((tf, _bt_naive))
             except Exception as _bar_err:
