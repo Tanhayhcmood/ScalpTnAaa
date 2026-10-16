@@ -126,3 +126,25 @@ class TestStateFileSerialization:
             loaded = json.load(f)
         assert loaded["position"] is None
         assert loaded["error"] is None
+
+
+def test_reset_guardian_file_command_preserves_request_payload(tmp_path):
+    import json
+    from datetime import datetime, timezone
+    from unittest.mock import patch
+    from live_trading.utils import state_writer
+
+    commands_file = tmp_path / "robot_commands.json"
+    request_id = "reset-request-1"
+    commands_file.write_text(json.dumps([
+        {
+            "command": "RESET_GUARDIAN",
+            "payload": {"request_id": request_id},
+            "issued_at": datetime.now(timezone.utc).isoformat(),
+        }
+    ]))
+    with patch.object(state_writer, "COMMANDS_FILE", str(commands_file)):
+        with patch("live_trading.redis_ipc.redis_available", return_value=False):
+            commands = state_writer.read_commands()
+
+    assert commands["reset_guardian"] == {"request_id": request_id}

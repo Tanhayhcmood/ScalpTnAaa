@@ -23,6 +23,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional, Any
+from uuid import uuid4
 from ..config.constants import RobotStatus, ConnectionStatus
 
 logger = logging.getLogger(__name__)
@@ -257,9 +258,12 @@ class RobotService:
     async def resume(self) -> bool:
         return await self._send_command("RESUME")
 
-    async def reset_guardian(self) -> bool:
-        """Clear a Guardian halt and resume without rebasing the daily loss limits."""
-        return await self._send_command("RESET_GUARDIAN")
+    async def reset_guardian(self, request_id: Optional[str] = None) -> bool:
+        """Request an idempotent Guardian reset and correlate its robot receipt."""
+        request_id = str(request_id or uuid4().hex)
+        return await self._send_command(
+            "RESET_GUARDIAN", payload={"request_id": request_id}
+        )
 
     async def emergency_stop(self) -> bool:
         return await self._send_command("EMERGENCY_STOP")

@@ -617,6 +617,7 @@ class GoldScalperLive:
             max_drawdown_pct=MAX_DRAWDOWN_PCT,
         )
         self._last_guardian_status: Optional[GuardianStatus] = None
+        self._last_guardian_reset_receipt: Optional[dict] = None
         self._last_acc_info: Optional[dict] = None  # cache for WAITING state writes
         self._last_acc_refresh_ts: float = 0.0        # monotonic time of last between-bar refresh
 
@@ -3010,42 +3011,130 @@ class GoldScalperLive:
             await self._close_all_positions()
             clear_command("close_all")
 
-        # New: manual Guardian reset from Telegram panel
+        # Manual Guardian reset from Telegram. It is a no-op unless the
+        # Guardian is halted, and it requires a fresh live account snapshot so
+        # the reset baseline cannot be fabricated from stale panel data.
         if cmds.get("reset_guardian"):
-            log.warning("🛡️  Guardian reset requested from Telegram")
             reset_payload = cmds.get("reset_guardian")
-            reset_daily_baseline = (
-                isinstance(reset_payload, dict)
-                and bool(reset_payload.get("reset_daily_baseline"))
+            request_id = (
+                str(reset_payload.get("request_id") or "")
+                if isinstance(reset_payload, dict) else ""
             )
-            current_balance = None
-            if reset_daily_baseline:
-                if self._last_acc_info:
-                    current_balance = self._last_acc_info.get("balance")
-                if current_balance is None:
-                    try:
-                        fresh_account = await get_account_info()
-                        current_balance = fresh_account.get("balance") if fresh_account else None
-                        if fresh_account:
-                            self._last_acc_info = fresh_account
-                    except Exception as exc:
-                        log.warning(
-                            f"Could not fetch live balance for daily reset: {exc}"
-                        )
+            log.warning("🛡️  Guardian reset requested from Telegram")
+            previous_receipt = self._last_guardian_reset_receipt or {}
 
-            reset_ok = self.guardian.reset_halt(
-                reset_daily_baseline=reset_daily_baseline,
-                current_balance=float(current_balance) if current_balance is not None else None,
-            )
-            if reset_ok and self.paused:
-                self.paused = False
-                log.info("▶  Robot RESUMED after Guardian reset")
-                self._write_state("RUNNING")
-            elif not reset_ok:
-                log.warning(
-                    "🛡️  Guardian reset did not resume robot because "
-                    "the daily baseline could not be reset"
+            if request_id and request_id == previous_receipt.get("request_id"):
+                # The command may still be present if Redis/file cleanup raced
+                # a restart. Re-publish the original receipt, never rebase twice.
+                log.info(
+                    "🛡️  Duplicate reset command ignored — "
+                    f"request_id={request_id} was already handled"
                 )
+                self._write_state(
+                    "PAUSED" if self.paused else "RUNNING", self._last_acc_info
+                )
+            elif not self.guardian.is_halted:
+                baseline = self.guardian.manual_reset_baseline or {}
+                if request_id and request_id == baseline.get("request_id"):
+                    # A replay after a process restart is acknowledged from the
+                    # durable baseline without applying the reset a second time.
+                    limits = self._last_guardian_status
+                    self._last_guardian_reset_receipt = {
+                        "request_id": request_id,
+                        "status": "applied",
+                        "baseline": baseline,
+                        "currency": str((self._last_acc_info or {}).get("currency") or "USD"),
+                        "daily_loss_limit_pct": (
+                            limits.daily_loss_limit_pct if limits else None
+                        ),
+                        "max_drawdown_pct": (
+                            limits.max_drawdown_pct if limits else None
+                        ),
+                    }
+                    log.info(
+                        "🛡️  Previously applied Guardian reset acknowledged "
+                        f"from persisted baseline; request_id={request_id}"
+                    )
+                else:
+                    log.info("🛡️  Guardian reset is a no-op — Guardian is not halted")
+                    self._last_guardian_reset_receipt = {
+                        "request_id": request_id,
+                        "status": "ignored",
+                        "reason": "Guardian was not halted; no state was changed.",
+                    }
+                self._write_state(
+                    "PAUSED" if self.paused else "RUNNING", self._last_acc_info
+                )
+            elif not self.guardian.is_initialized:
+                reason = "Guardian is not initialized; reset was not applied."
+                log.warning("🛡️  " + reason)
+                self._last_guardian_reset_receipt = {
+                    "request_id": request_id, "status": "failed", "reason": reason,
+                }
+                self._write_state("PAUSED", self._last_acc_info)
+            else:
+                fresh_account = None
+                try:
+                    fresh_account = await get_account_info()
+                except Exception as exc:
+                    log.warning(f"Could not fetch live account for Guardian reset: {exc}")
+
+                if fresh_account:
+                    self._last_acc_info = fresh_account
+                try:
+                    current_balance = float((fresh_account or {}).get("balance", 0.0))
+                    current_equity = float((fresh_account or {}).get("equity", 0.0))
+                except (TypeError, ValueError):
+                    current_balance = current_equity = 0.0
+
+                if not fresh_account or current_balance <= 0 or current_equity <= 0:
+                    reason = (
+                        "Live account balance/equity is unavailable or invalid; "
+                        "Guardian remains halted."
+                    )
+                    log.warning("🛡️  " + reason)
+                    self._last_guardian_reset_receipt = {
+                        "request_id": request_id, "status": "failed", "reason": reason,
+                    }
+                    self._write_state("PAUSED", self._last_acc_info)
+                else:
+                    reset_ok = self.guardian.reset_halt(
+                        current_balance=current_balance,
+                        current_equity=current_equity,
+                        request_id=request_id,
+                    )
+                    if reset_ok:
+                        self.paused = False
+                        gs = self.guardian.check(current_balance, current_equity)
+                        self._last_guardian_status = gs
+                        if gs.halted:
+                            self.paused = True
+                        baseline = self.guardian.manual_reset_baseline or {}
+                        currency = str(fresh_account.get("currency") or "USD")
+                        self._last_guardian_reset_receipt = {
+                            "request_id": request_id,
+                            "status": "applied",
+                            "baseline": baseline,
+                            "currency": currency,
+                            "daily_loss_limit_pct": gs.daily_loss_limit_pct,
+                            "max_drawdown_pct": gs.max_drawdown_pct,
+                        }
+                        log.info(
+                            "▶  Robot RESUMED after Guardian reset; "
+                            "daily loss and drawdown limits now count from reset point"
+                        )
+                        self._write_state(
+                            "PAUSED" if gs.halted else "RUNNING",
+                            fresh_account,
+                            extra=self._guardian_extra(gs, "MANUAL_RESET"),
+                        )
+                    else:
+                        reason = "Guardian reset was not applied; current halt was left intact."
+                        log.warning("🛡️  " + reason)
+                        self._last_guardian_reset_receipt = {
+                            "request_id": request_id, "status": "failed", "reason": reason,
+                        }
+                        self._write_state("PAUSED", fresh_account)
             clear_command("reset_guardian")
 
         # "start" — sent by Telegram panel Start button.
@@ -3807,8 +3896,8 @@ class GoldScalperLive:
 
     # ── Guardian state helper ─────────────────────────────────────────────────
 
-    @staticmethod
     def _guardian_extra(
+        self,
         gs: GuardianStatus,
         event: str = "",
     ) -> dict:
@@ -3825,6 +3914,7 @@ class GoldScalperLive:
                 "daily_loss_limit_pct": gs.daily_loss_limit_pct,
                 "max_drawdown_pct":     gs.max_drawdown_pct,
                 "triggered_at":         gs.triggered_at,
+                "manual_reset_baseline": self.guardian.manual_reset_baseline,
             }
         }
         if event:
@@ -3871,6 +3961,10 @@ class GoldScalperLive:
             }
         if extra:
             merged_extra.update(extra)
+        if self._last_guardian_reset_receipt is not None:
+            merged_extra["guardian_reset_receipt"] = dict(
+                self._last_guardian_reset_receipt
+            )
         if self._last_candle_telemetry:
             merged_extra["candle_telemetry"] = dict(self._last_candle_telemetry)
         merged_extra["trade_history_sync"] = dict(self._history_sync_status)
