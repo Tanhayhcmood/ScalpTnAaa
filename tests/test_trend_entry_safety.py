@@ -30,6 +30,7 @@ def test_sell_stop_does_not_use_a_tight_structural_level_below_atr_floor():
             order_block_top=101.0,
             swing_high=103.0,
             resistance_level=102.0,
+            sl_min_atr_multiplier=3.0,
         )
     )
 
@@ -48,6 +49,7 @@ def test_buy_stop_does_not_use_a_tight_structural_level_below_atr_floor():
             order_block_bottom=99.0,
             swing_low=97.0,
             support_level=98.0,
+            sl_min_atr_multiplier=3.0,
         )
     )
 

@@ -313,8 +313,13 @@ def _detect_breakout_pullback(
 
     look = min(10, n - 1)
     prior = candles[n - 1 - look].close
-    trend_up   = cp > prior * 1.002
-    trend_down = cp < prior * 0.998
+    # A fixed 0.2% move changes meaning with the instrument's quoted price
+    # and ignores volatility. Require a meaningful 2-ATR move over the same
+    # lookback, with the configured level tolerance as a minimum floor.
+    trend_move = cp - prior
+    trend_move_threshold = max(cfg.level_tolerance, atr * 2.0)
+    trend_up = trend_move >= trend_move_threshold
+    trend_down = trend_move <= -trend_move_threshold
     # A fixed percentage of XAUUSD's price creates a multi-dollar retest zone
     # even when ATR is compressed. Use a bounded ATR-scaled distance instead.
     pull_zone = max(cfg.level_tolerance, min(1.5, atr * 0.25))
