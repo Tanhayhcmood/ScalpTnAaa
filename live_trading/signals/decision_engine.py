@@ -93,7 +93,11 @@ def _entry_location_block_reason(candidate: str, pa) -> Optional[str]:
     if (
         candidate == "BUY"
         and pa.near_resistance
-        and not (pa.valid_bull_breakout or pa.bullish_pullback)
+        and not (
+            pa.valid_bull_breakout
+            or pa.bullish_inside_breakout
+            or pa.bullish_pullback
+        )
     ):
         return (
             "BUY blocked: price is near resistance without a confirmed "
@@ -102,7 +106,11 @@ def _entry_location_block_reason(candidate: str, pa) -> Optional[str]:
     if (
         candidate == "SELL"
         and pa.near_support
-        and not (pa.valid_bear_breakout or pa.bearish_pullback)
+        and not (
+            pa.valid_bear_breakout
+            or pa.bearish_inside_breakout
+            or pa.bearish_pullback
+        )
     ):
         return (
             "SELL blocked: price is near support without a confirmed "
@@ -332,10 +340,10 @@ def _candidate_direction(
         trend_direction,
         pa.pa_signal,
         trend_standalone=trend_standalone,
-        trend_score=trend.score,
+        trend_score=getattr(trend, "score", 0.0),
         trend_standalone_min_score=trend_standalone_min_score,
         price_action_standalone=price_action_standalone,
-        pa_score=pa.pa_score,
+        pa_score=getattr(pa, "pa_score", 0.0),
         pa_standalone_min_score=pa_standalone_min_score,
     )
 

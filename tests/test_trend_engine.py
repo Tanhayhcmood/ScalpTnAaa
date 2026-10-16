@@ -53,3 +53,41 @@ def test_insufficient_history_is_neutral_and_safe():
 
     assert result.trend == "NEUTRAL"
     assert result.strength == "WEAK"
+
+
+def test_non_finite_candle_data_is_neutral_with_finite_scores():
+    candles = _candles([2400.0 + index * 0.5 for index in range(260)])
+    last = candles[-1]
+    candles[-1] = OHLCV(
+        last.time,
+        float("nan"),
+        last.high,
+        last.low,
+        float("nan"),
+        last.volume,
+    )
+
+    result = analyze_trend(candles)
+
+    assert result.trend == "NEUTRAL"
+    assert result.score == 0.0
+    assert result.quality == 0.0
+    assert result.ema50 == 0.0
+
+
+def test_invalid_ohlc_bounds_are_neutral():
+    candles = _candles([2400.0 + index * 0.5 for index in range(260)])
+    last = candles[-1]
+    candles[-1] = OHLCV(
+        last.time,
+        last.open,
+        last.low,
+        last.high,
+        last.close,
+        last.volume,
+    )
+
+    result = analyze_trend(candles)
+
+    assert result.trend == "NEUTRAL"
+    assert result.score == 0.0

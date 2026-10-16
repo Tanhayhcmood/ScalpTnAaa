@@ -1,9 +1,17 @@
 """Regression tests for the live Price Action signal gate."""
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from live_trading.signals.gold_engine import OHLCV
-from live_trading.signals.price_action_engine import analyze_price_action
+from live_trading.signals.price_action_engine import (
+    CFG_M5,
+    _detect_breakout_pullback,
+    _detect_inside_bar_breakout,
+    _detect_sr_levels,
+    _detect_supply_demand,
+    analyze_price_action,
+)
 
 
 def _base_candles(count: int = 60, price: float = 2500.0) -> list[OHLCV]:
@@ -135,3 +143,172 @@ def test_extended_inside_bar_breakout_is_marked_for_retest_instead_of_chasing():
     assert result.breakout_level == 2500.40
     assert result.breakout_extension_atr > 0.75
     assert result.breakout_overextended is True
+
+
+def test_tiny_engulfing_body_is_not_a_directional_signal():
+    candles = _base_candles()
+    candles[-2] = OHLCV(
+        candles[-2].time, 2500.00, 2500.10, 2499.90, 2499.98, 100.0
+    )
+    candles[-1] = OHLCV(
+        candles[-1].time, 2499.98, 2500.10, 2499.90, 2500.01, 100.0
+    )
+
+    result = analyze_price_action(candles)
+
+    assert not result.bullish_engulf
+    assert result.pa_signal != "BUY"
+
+
+def test_price_action_fails_closed_on_invalid_volume():
+    candles = _base_candles()
+    candles[-2] = OHLCV(
+        candles[-2].time, 2499.90, 2500.05, 2499.65, 2499.75, 100.0
+    )
+    candles[-1] = OHLCV(
+        candles[-1].time, 2499.74, 2500.15, 2499.35, 2500.05, -1.0
+    )
+
+    result = analyze_price_action(candles)
+
+    assert result.pa_signal == "NEUTRAL"
+    assert result.pa_score == 0.0
+
+
+def test_equal_range_bar_is_not_treated_as_an_inside_bar():
+    bars = [
+        SimpleNamespace(open=100.0, high=101.0, low=99.0, close=100.5),
+        SimpleNamespace(open=100.0, high=101.0, low=99.0, close=100.5),
+        SimpleNamespace(open=100.5, high=101.8, low=100.4, close=101.6),
+    ]
+
+    detected, depth, bullish, bearish, level, strength = (
+        _detect_inside_bar_breakout(bars, CFG_M5, atr=1.0)
+    )
+
+    assert (detected, depth, bullish, bearish, level, strength) == (
+        False, 0, False, False, None, 0.0
+    )
+
+
+def test_small_close_through_level_is_rejected_relative_to_atr():
+    def bar(open_, high, low, close):
+        return SimpleNamespace(open=open_, high=high, low=low, close=close)
+
+    bars = [bar(99.8, 100.0, 99.7, 99.9), bar(99.98, 100.32, 99.95, 100.28)]
+    small = _detect_breakout_pullback(
+        bars, [], [100.0], [], [], CFG_M5, atr=3.0
+    )
+    bars[-1] = bar(100.0, 100.9, 99.95, 100.8)
+    large = _detect_breakout_pullback(
+        bars, [], [100.0], [], [], CFG_M5, atr=3.0
+    )
+
+    assert small[0] is False
+    assert large[0] is True
+
+
+def test_bullish_pullback_needs_a_close_reclaim_above_support():
+    bars = [
+        SimpleNamespace(open=98.8, high=99.0, low=98.6, close=98.8)
+        for _ in range(10)
+    ]
+    bars.extend(
+        [
+            SimpleNamespace(open=99.8, high=100.1, low=99.7, close=99.9),
+            SimpleNamespace(open=99.6, high=99.9, low=99.5, close=99.8),
+        ]
+    )
+
+    result = _detect_breakout_pullback(
+        bars, [100.0], [], [], [], CFG_M5, atr=1.0
+    )
+
+    assert result[4] is False
+
+
+def test_bullish_pullback_is_valid_after_a_close_reclaims_support():
+    bars = [
+        SimpleNamespace(open=98.8, high=99.0, low=98.6, close=98.8)
+        for _ in range(10)
+    ]
+    bars.extend(
+        [
+            SimpleNamespace(open=99.8, high=100.1, low=99.7, close=99.9),
+            SimpleNamespace(open=99.9, high=100.5, low=99.85, close=100.3),
+        ]
+    )
+
+    result = _detect_breakout_pullback(
+        bars, [100.0], [], [], [], CFG_M5, atr=1.0
+    )
+
+    assert result[4] is True
+
+
+def test_bearish_pullback_needs_a_close_reclaim_below_resistance():
+    bars = [
+        SimpleNamespace(open=101.2, high=101.4, low=101.0, close=101.2)
+        for _ in range(10)
+    ]
+    bars.extend(
+        [
+            SimpleNamespace(open=100.2, high=100.3, low=99.9, close=100.1),
+            SimpleNamespace(open=100.4, high=100.5, low=100.1, close=100.2),
+        ]
+    )
+
+    result = _detect_breakout_pullback(
+        bars, [], [100.0], [], [], CFG_M5, atr=1.0
+    )
+
+    assert result[5] is False
+
+
+def test_sr_touch_clustering_groups_multiple_pivots_across_the_tolerance_band():
+    bars = [
+        SimpleNamespace(open=97.0, high=99.0, low=95.0, close=97.0)
+        for _ in range(30)
+    ]
+    for index, high in ((5, 100.0), (12, 100.4), (19, 100.8)):
+        bars[index] = SimpleNamespace(
+            open=97.0, high=high, low=95.0, close=97.0
+        )
+
+    support, resistance = _detect_sr_levels(
+        bars, CFG_M5, tolerance=0.5
+    )
+
+    assert support == []
+    assert len(resistance) == 1
+    assert abs(resistance[0] - 100.4) < 1e-9
+
+
+def test_demand_zone_is_removed_after_a_closed_candle_invalidates_it():
+    bars = [
+        OHLCV(f"t{index}", 100.0, 100.2, 99.8, 100.0, 100.0)
+        for index in range(30)
+    ]
+    for index in (10, 11, 12):
+        bars[index] = OHLCV(f"t{index}", 100.0, 100.5, 99.5, 100.0, 100.0)
+    bars[13] = OHLCV("t13", 100.5, 102.0, 100.4, 101.8, 120.0)
+    bars[20] = OHLCV("t20", 99.4, 99.8, 98.8, 99.0, 120.0)
+
+    demand, _ = _detect_supply_demand(bars, CFG_M5, atr=1.0)
+
+    assert demand == []
+
+
+def test_fresh_bullish_impulse_creates_a_demand_zone():
+    bars = [
+        OHLCV(f"t{index}", 100.0, 100.2, 99.8, 100.0, 100.0)
+        for index in range(30)
+    ]
+    for index in (10, 11, 12):
+        bars[index] = OHLCV(f"t{index}", 100.0, 100.5, 99.5, 100.0, 100.0)
+    bars[13] = OHLCV("t13", 100.5, 102.0, 100.4, 101.8, 120.0)
+
+    demand, _ = _detect_supply_demand(bars, CFG_M5, atr=1.0)
+
+    assert demand
+    assert demand[-1] == {"top": 100.5, "bottom": 99.5}
