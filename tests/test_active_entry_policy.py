@@ -73,18 +73,115 @@ def test_every_regime_rule_can_reach_the_active_entry_policy(regime):
     assert result.allowed is True, result.reason
 
 
-def test_standalone_price_action_without_trend_is_allowed():
+def test_structural_price_action_reversal_is_allowed_against_trend():
     result = evaluate_active_entry(
         _decision(
             direction="BUY",
             trend=SimpleNamespace(trend="BEARISH"),
-            pa=SimpleNamespace(pa_signal="BUY"),
+            pa=SimpleNamespace(
+                pa_signal="BUY",
+                valid_bull_breakout=True,
+            ),
             entry_filter=SimpleNamespace(
                 trend=False,
                 price_action=True,
                 smc=False,
                 wyckoff=False,
             )
+        ),
+        symbol="XAUUSD",
+        timeframe="5m",
+    )
+
+    assert result.allowed is True
+
+
+def test_countertrend_buy_from_candle_pattern_requires_structural_confirmation():
+    result = evaluate_active_entry(
+        _decision(
+            direction="BUY",
+            trend=SimpleNamespace(trend="BEARISH"),
+            pa=SimpleNamespace(
+                pa_signal="BUY",
+                valid_bull_breakout=False,
+                bullish_inside_breakout=False,
+                bullish_pullback=False,
+            ),
+            entry_filter=SimpleNamespace(
+                trend=False,
+                price_action=True,
+                smc=False,
+                wyckoff=False,
+            ),
+        ),
+        symbol="XAUUSD",
+        timeframe="5m",
+    )
+
+    assert result.allowed is False
+    assert "structural Price Action confirmation is required" in result.reason
+
+
+def test_countertrend_sell_from_candle_pattern_requires_structural_confirmation():
+    result = evaluate_active_entry(
+        _decision(
+            direction="SELL",
+            trend=SimpleNamespace(trend="BULLISH"),
+            pa=SimpleNamespace(
+                pa_signal="SELL",
+                valid_bear_breakout=False,
+                bearish_inside_breakout=False,
+                bearish_pullback=False,
+            ),
+            entry_filter=SimpleNamespace(
+                trend=False,
+                price_action=True,
+                smc=False,
+                wyckoff=False,
+            ),
+        ),
+        symbol="XAUUSD",
+        timeframe="5m",
+    )
+
+    assert result.allowed is False
+    assert "structural Price Action confirmation is required" in result.reason
+
+
+@pytest.mark.parametrize(
+    ("direction", "trend", "signal", "breakout_flag"),
+    [
+        ("BUY", "BEARISH", "BUY", "valid_bull_breakout"),
+        ("SELL", "BULLISH", "SELL", "valid_bear_breakout"),
+    ],
+)
+def test_closed_price_action_breakout_can_authorize_a_countertrend_reversal(
+    direction,
+    trend,
+    signal,
+    breakout_flag,
+):
+    pa_values = {
+        "pa_signal": signal,
+        "valid_bull_breakout": False,
+        "valid_bear_breakout": False,
+        "bullish_inside_breakout": False,
+        "bearish_inside_breakout": False,
+        "bullish_pullback": False,
+        "bearish_pullback": False,
+    }
+    pa_values[breakout_flag] = True
+    result = evaluate_active_entry(
+        _decision(
+            direction=direction,
+            trend=SimpleNamespace(trend=trend),
+            pa=SimpleNamespace(**pa_values),
+            entry_filter=SimpleNamespace(
+                trend=False,
+                price_action=True,
+                smc=False,
+                wyckoff=False,
+            ),
         ),
         symbol="XAUUSD",
         timeframe="5m",
