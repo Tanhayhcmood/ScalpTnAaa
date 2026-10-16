@@ -90,6 +90,16 @@ def _upper_wick(c: OHLCV) -> float: return c.high - max(c.open, c.close)
 def _lower_wick(c: OHLCV) -> float: return min(c.open, c.close) - c.low
 
 
+def _candle_touches_band(
+    candle: OHLCV,
+    lower: float,
+    upper: float,
+    tolerance: float,
+) -> bool:
+    """Return whether the candle's traded range intersects a tolerant band."""
+    return candle.low <= upper + tolerance and candle.high >= lower - tolerance
+
+
 def _detect_patterns(candles: List[OHLCV], cfg: PaConfig, atr: float):
     n  = len(candles)
     c0 = candles[n - 1]
@@ -511,12 +521,29 @@ def analyze_price_action(candles: List[OHLCV], timeframe: str = "M5") -> PriceAc
     )
     demand_zones, supply_zones    = _detect_supply_demand(candles, cfg, atr)
 
-    cp  = candles[-1].close
+    current = candles[-1]
+    cp = current.close
     tol = adaptive_tolerance
-    near_sup  = any(abs(cp - l) <= tol for l in support_lvls)
-    near_res  = any(abs(cp - l) <= tol for l in resistance_lvls)
-    near_dem  = any(z["bottom"] - tol <= cp <= z["top"] + tol for z in demand_zones)
-    near_supl = any(z["bottom"] - tol <= cp <= z["top"] + tol for z in supply_zones)
+    # Use the full closed candle range, not just its close. A rejection wick
+    # can touch a level and close well away from it; treating that bar as
+    # unrelated to the level can let an unconfirmed counter-break pass entry
+    # location checks and can hide a valid pin-bar rejection.
+    near_sup = any(
+        _candle_touches_band(current, level, level, tol)
+        for level in support_lvls
+    )
+    near_res = any(
+        _candle_touches_band(current, level, level, tol)
+        for level in resistance_lvls
+    )
+    near_dem = any(
+        _candle_touches_band(current, zone["bottom"], zone["top"], tol)
+        for zone in demand_zones
+    )
+    near_supl = any(
+        _candle_touches_band(current, zone["bottom"], zone["top"], tol)
+        for zone in supply_zones
+    )
 
     (
         vbull, vbear, fbull, fbear, bull_pb, bear_pb,
