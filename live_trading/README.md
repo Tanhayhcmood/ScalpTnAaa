@@ -42,6 +42,7 @@ export METAAPI_ACCOUNT_ID="your-account-id-here"
 # Optional overrides
 export SYMBOL=XAUUSD
 export RISK_PERCENT=1.0
+export MAX_TOTAL_RISK_PERCENT=2.0  # maximum combined open stop risk
 export MIN_CONFIRMATIONS=1
 
 # Risk Guardian — circuit breakers (strongly recommended for live accounts)
@@ -129,10 +130,19 @@ candles (300 M5 bars)
 |---|---|---|
 | Confidence hard minimum | 30% | config.py |
 | Risk per trade | 1% of balance | config.py |
+| Maximum combined XAUUSD open risk, including the proposed order | 2% of balance | config.py (`MAX_TOTAL_RISK_PERCENT`) |
 | Take profit | 2R (range regime has its own target rule) | capital_manager.py |
 | Minimum confirmations | 1 configured; a single vote must pass its standalone gate | config.py / entry_filter.py |
 | SMC swing lookback | 5 bars | smcEngine.ts |
 | ATR period | 14 (Wilder) | goldEngine.ts |
+
+Order size at the final broker gate is recalculated from the executable entry,
+the exact SL sent with the order, and the broker's tick size/value (or a
+same-account-currency contract-size fallback). Open tickets are counted once;
+an open position without a valid SL, missing account currency, or unusable
+contract metadata blocks new orders. The final volume is rounded down to the
+broker's volume step. `MAX_OPEN_TRADES` remains the independent position-count
+limit.
 
 ---
 

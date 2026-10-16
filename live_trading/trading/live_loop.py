@@ -32,6 +32,7 @@ from typing import List, Optional
 
 from live_trading.config import (
     SYMBOL, TIMEFRAME, CANDLE_WINDOW, RISK_PERCENT,
+    MAX_TOTAL_RISK_PERCENT,
     SL_ATR_TIMEFRAME, SL_ATR_PERIOD, SL_ATR_BASE_MULTIPLIER,
     ENTRY_SIGNAL_ATR_PERIOD, STALENESS_LIMIT_STRONG_TREND,
     STALENESS_LIMIT_WEAK_TREND, STALENESS_LIMIT_RANGE,
@@ -70,7 +71,14 @@ from live_trading.risk.adaptive_trailing_stop import (
     AdaptiveTrailingConfig, atr, compute_adaptive_trail, should_apply,
 )
 from live_trading.risk.capital_manager import (
-    LOT_DOLLAR_PER_UNIT, CapitalOutput,
+    CapitalOutput,
+)
+from live_trading.risk.aggregate_risk import (
+    AggregateRiskLimitError,
+    OpenPositionRiskError,
+    RiskCalculationError,
+    build_symbol_risk_spec,
+    size_order_for_aggregate_risk,
 )
 from live_trading.signals.decision_engine import (
     run_decision_engine,
@@ -2123,6 +2131,8 @@ class GoldScalperLive:
                 tf,
                 bar_time,
                 signal_atr,
+                account_balance=balance,
+                account_currency=str(acc_info.get("currency") or "").strip(),
             )
         )
         if result is None:
@@ -3232,6 +3242,8 @@ class GoldScalperLive:
         timeframe: str,
         bar_time: datetime,
         signal_atr: float,
+        account_balance: Optional[float] = None,
+        account_currency: str = "USD",
     ) -> tuple[Optional[TradeResult], list[dict], str, str]:
         """Re-check capacity and submit one entry atomically.
 
@@ -3373,6 +3385,17 @@ class GoldScalperLive:
                     "MISSING_TRADE_PARAMETERS",
                     "Allowed decision did not include SL/TP parameters",
                 )
+            if account_balance is None:
+                # Compatibility for direct callers/tests. The live candle
+                # handler always passes the latest broker balance explicitly.
+                try:
+                    account_balance = (
+                        float(tp_params.risk_budget)
+                        * 100.0
+                        / float(tp_params.risk_percent)
+                    )
+                except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+                    account_balance = None
             original_entry_price = tp_params.entry_price
 
             # The decision engine's entry price can be several network calls
@@ -3387,6 +3410,18 @@ class GoldScalperLive:
                     confirm_dicts,
                     "SYMBOL_CONSTRAINTS_UNAVAILABLE",
                     f"Could not read broker SL/TP constraints for {SYMBOL}",
+                )
+            try:
+                risk_spec = build_symbol_risk_spec(
+                    symbol_params,
+                    account_currency,
+                )
+            except RiskCalculationError as exc:
+                return (
+                    None,
+                    confirm_dicts,
+                    "SYMBOL_RISK_METADATA_UNAVAILABLE",
+                    str(exc),
                 )
             quote = await get_current_quote(SYMBOL)
             if not quote:
@@ -3484,38 +3519,56 @@ class GoldScalperLive:
                     "FINAL_RR_BELOW_REGIME_MINIMUM",
                     reason,
                 )
-            tp_params.risk_amount = round(
-                tp_params.lot_size
-                * rebased["sl_distance"]
-                * LOT_DOLLAR_PER_UNIT,
-                2,
-            )
-            tp_params.min_lot_risk_exceeded = (
-                tp_params.risk_amount > tp_params.risk_budget + 0.01
-            )
-            risk_cap_applied = (
-                "minimum_lot_exceeds_percentage_budget"
-                if tp_params.min_lot_risk_exceeded
-                else "risk_percent_budget"
-            )
-            log.info(
-                f"RISK_SIZING [{timeframe}] {decision.direction} {SYMBOL} "
-                f"lot={tp_params.lot_size:.4f} "
-                f"risk=${tp_params.risk_amount:.2f} "
-                f"cap=RISK_PERCENT {tp_params.risk_percent:.2f}% "
-                f"of balance (${tp_params.risk_budget:.2f}) "
-                f"cap_applied={risk_cap_applied}"
-            )
-            if tp_params.min_lot_risk_exceeded:
+            try:
+                risk_sizing = size_order_for_aggregate_risk(
+                    positions=confirm_dicts,
+                    direction=decision.direction,
+                    # Use the executable entry and the exact stop sent to MTAPI,
+                    # not the signal price or the bid/ask stop reference.
+                    entry_price=tp_params.entry_price,
+                    stop_loss=tp_params.stop_loss,
+                    account_balance=account_balance,
+                    per_trade_risk_percent=tp_params.risk_percent,
+                    aggregate_risk_percent=MAX_TOTAL_RISK_PERCENT,
+                    spec=risk_spec,
+                )
+            except OpenPositionRiskError as exc:
                 return (
                     None,
                     confirm_dicts,
-                    "BROKER_STOP_DISTANCE_RISK",
-                    f"Rebased stop with lot {tp_params.lot_size:.4f} would risk "
-                    f"${tp_params.risk_amount:.2f}, above the "
-                    f"{tp_params.risk_percent:.2f}% balance risk cap "
-                    f"(${tp_params.risk_budget:.2f})",
+                    "OPEN_POSITION_RISK_UNVERIFIABLE",
+                    str(exc),
                 )
+            except AggregateRiskLimitError as exc:
+                return (
+                    None,
+                    confirm_dicts,
+                    "AGGREGATE_RISK_LIMIT",
+                    str(exc),
+                )
+            except RiskCalculationError as exc:
+                return (
+                    None,
+                    confirm_dicts,
+                    "RISK_DATA_UNAVAILABLE",
+                    str(exc),
+                )
+            tp_params.lot_size = risk_sizing.lot_size
+            tp_params.risk_amount = round(risk_sizing.new_risk, 2)
+            tp_params.risk_budget = round(risk_sizing.risk_budget, 2)
+            tp_params.min_lot_risk_exceeded = False
+            log.info(
+                f"RISK_SIZING [{timeframe}] {decision.direction} {SYMBOL} "
+                f"lot={tp_params.lot_size:.4f} "
+                f"risk={tp_params.risk_amount:.2f} {risk_spec.account_currency} "
+                f"open={risk_sizing.existing_risk:.2f} "
+                f"combined={risk_sizing.aggregate_risk:.2f}/"
+                f"{risk_sizing.aggregate_limit:.2f} "
+                f"trade_cap={tp_params.risk_percent:.2f}% "
+                f"tick={risk_spec.tick_size:g}/"
+                f"{risk_spec.tick_value_per_lot:g} "
+                f"tick_source={risk_spec.tick_value_source}"
+            )
             direction_sign = 1 if decision.direction == "BUY" else -1
             tp_params.break_even_at = round(
                 tp_params.entry_price
@@ -3615,6 +3668,9 @@ class GoldScalperLive:
                 comment=order_comment,
                 deviation=SLIPPAGE_POINTS,
                 price_digits=stop_constraints["digits"],
+                volume_min=risk_spec.volume_min,
+                volume_step=risk_spec.volume_step,
+                volume_max=risk_spec.volume_max,
             )
             if shared_claim_required and redis_ipc is not None:
                 try:

@@ -39,9 +39,13 @@ def _normalise_lot(lot: float,
         raise ValueError("lot size must be a finite positive number")
     if vol_step <= 0 or vol_min <= 0 or vol_max < vol_min:
         raise ValueError("invalid broker volume constraints")
-    steps  = round((lot - vol_min) / vol_step)
+    if lot + 1e-9 < vol_min:
+        raise ValueError("lot size is below the broker minimum")
+    # Never round up: doing so can turn a risk-bounded size into an
+    # over-budget order by one broker volume step.
+    steps  = math.floor((lot - vol_min) / vol_step + 1e-9)
     result = vol_min + steps * vol_step
-    return max(vol_min, min(vol_max, round(result, 4)))
+    return max(vol_min, min(vol_max, round(result, 8)))
 
 
 def _is_error(data: dict) -> bool:
@@ -60,6 +64,9 @@ async def place_market_order(
     comment:   str = "GSPv4",
     deviation: int = 30,
     price_digits: int = 2,
+    volume_min: float = 0.01,
+    volume_step: float = 0.01,
+    volume_max: float = 50.0,
 ) -> TradeResult:
     base    = get_connection()
     conn_id = get_conn_id()
@@ -70,7 +77,12 @@ async def place_market_order(
     if normalized_direction not in {"BUY", "SELL"}:
         return TradeResult(False, None, f"Invalid trade direction: {direction!r}")
     try:
-        lot = _normalise_lot(float(lot_size))
+        lot = _normalise_lot(
+            float(lot_size),
+            vol_min=float(volume_min),
+            vol_step=float(volume_step),
+            vol_max=float(volume_max),
+        )
     except (TypeError, ValueError) as exc:
         return TradeResult(False, None, f"Invalid lot size: {exc}")
     if not all(math.isfinite(float(value)) and float(value) > 0 for value in (sl, tp)):

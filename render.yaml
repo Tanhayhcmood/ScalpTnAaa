@@ -74,6 +74,10 @@ services:
         value: "24"
       - key: RISK_PERCENT
         value: "1.0"
+      # Combined loss-to-SL exposure across all open positions, including the
+      # proposed order. Separate from the per-trade RISK_PERCENT sizing target.
+      - key: MAX_TOTAL_RISK_PERCENT
+        value: "2.0"
       # The base policy floor is one; standalone checks still gate single-vote entries.
       - key: MIN_CONFIRMATIONS
         value: "1"
