@@ -3,6 +3,8 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import live_trading.signals.price_action_engine as price_action_engine
+from live_trading.signals.decision_engine import _entry_location_block_reason
 from live_trading.signals.gold_engine import OHLCV
 from live_trading.signals.price_action_engine import (
     CFG_M5,
@@ -31,6 +33,49 @@ def _base_candles(count: int = 60, price: float = 2500.0) -> list[OHLCV]:
         )
         price = close
     return candles
+
+
+def _analyze_with_levels(
+    monkeypatch,
+    candle: OHLCV,
+    *,
+    support_levels=None,
+    resistance_levels=None,
+    demand_zones=None,
+    supply_zones=None,
+):
+    candles = _base_candles()
+    candles[-1] = candle
+    monkeypatch.setattr(
+        price_action_engine,
+        "_detect_patterns",
+        lambda *_args: (False, False, False, False, False, False),
+    )
+    monkeypatch.setattr(
+        price_action_engine,
+        "_detect_sr_levels",
+        lambda *_args, **_kwargs: (
+            support_levels or [],
+            resistance_levels or [],
+        ),
+    )
+    monkeypatch.setattr(
+        price_action_engine,
+        "_detect_supply_demand",
+        lambda *_args: (
+            demand_zones or [],
+            supply_zones or [],
+        ),
+    )
+    monkeypatch.setattr(
+        price_action_engine,
+        "_detect_breakout_pullback",
+        lambda *_args: (
+            False, False, False, False, False, False,
+            False, False, False, 0, None, 0.0,
+        ),
+    )
+    return analyze_price_action(candles)
 
 
 def test_standalone_bullish_engulfing_is_not_hidden_by_old_score_denominator():
@@ -312,3 +357,86 @@ def test_fresh_bullish_impulse_creates_a_demand_zone():
 
     assert demand
     assert demand[-1] == {"top": 100.5, "bottom": 99.5}
+
+
+def test_resistance_wick_touch_blocks_unconfirmed_buy_even_when_close_is_far(
+    monkeypatch,
+):
+    candle = OHLCV(
+        "2026-09-02T00:00:00+00:00",
+        2499.65,
+        2500.05,
+        2499.30,
+        2499.50,
+        100.0,
+    )
+
+    result = _analyze_with_levels(
+        monkeypatch,
+        candle,
+        resistance_levels=[2500.0],
+    )
+
+    assert abs(candle.close - 2500.0) > 0.35
+    assert result.near_resistance is True
+    assert _entry_location_block_reason("BUY", result) is not None
+
+
+def test_support_wick_touch_blocks_unconfirmed_sell_even_when_close_is_far(
+    monkeypatch,
+):
+    candle = OHLCV(
+        "2026-09-02T00:00:00+00:00",
+        2500.35,
+        2500.70,
+        2499.95,
+        2500.50,
+        100.0,
+    )
+
+    result = _analyze_with_levels(
+        monkeypatch,
+        candle,
+        support_levels=[2500.0],
+    )
+
+    assert abs(candle.close - 2500.0) > 0.35
+    assert result.near_support is True
+    assert _entry_location_block_reason("SELL", result) is not None
+
+
+def test_wick_touches_supply_and_demand_zones_even_when_close_is_outside(
+    monkeypatch,
+):
+    demand_candle = OHLCV(
+        "2026-09-02T00:00:00+00:00",
+        2499.65,
+        2500.05,
+        2499.30,
+        2499.50,
+        100.0,
+    )
+    demand_result = _analyze_with_levels(
+        monkeypatch,
+        demand_candle,
+        demand_zones=[{"top": 2500.10, "bottom": 2500.0}],
+    )
+
+    supply_candle = OHLCV(
+        "2026-09-02T00:00:00+00:00",
+        2500.35,
+        2500.70,
+        2499.95,
+        2500.50,
+        100.0,
+    )
+    supply_result = _analyze_with_levels(
+        monkeypatch,
+        supply_candle,
+        supply_zones=[{"top": 2500.0, "bottom": 2499.90}],
+    )
+
+    assert abs(demand_candle.close - 2500.0) > 0.35
+    assert demand_result.near_demand_zone is True
+    assert abs(supply_candle.close - 2500.0) > 0.35
+    assert supply_result.near_supply_zone is True
