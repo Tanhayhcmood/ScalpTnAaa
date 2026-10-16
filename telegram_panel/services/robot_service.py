@@ -257,6 +257,10 @@ class RobotService:
     async def resume(self) -> bool:
         return await self._send_command("RESUME")
 
+    async def reset_guardian(self) -> bool:
+        """Clear a Guardian halt and resume without rebasing the daily loss limits."""
+        return await self._send_command("RESET_GUARDIAN")
+
     async def emergency_stop(self) -> bool:
         return await self._send_command("EMERGENCY_STOP")
 

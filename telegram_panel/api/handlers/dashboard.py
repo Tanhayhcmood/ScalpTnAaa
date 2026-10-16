@@ -178,6 +178,7 @@ class DashboardHandler(BaseHandler):
         confirm_needed = {
             "stop": ("stop_confirmed", "Stop Robot"),
             "emergency": ("emergency_confirmed", "EMERGENCY STOP"),
+            "reset_guardian": ("reset_guardian_confirmed", "Reset Cooldown"),
             "restart_engine": ("restart_engine_confirmed", "Restart Engine"),
             "restart_mt5": ("restart_mt5_confirmed", "Restart MT5"),
             "restart_telegram": ("restart_telegram_confirmed", "Restart Telegram Bot"),
@@ -186,10 +187,23 @@ class DashboardHandler(BaseHandler):
 
         if action in confirm_needed:
             confirmed_action, label = confirm_needed[action]
+            if action == "reset_guardian":
+                confirmation_text = (
+                    "⚠️ <b>Reset Cooldown?</b>\n\n"
+                    "This clears the RiskGuardian halt and resumes the robot. "
+                    "It does not reset the daily-loss baseline or bypass the separate "
+                    "post-SL entry cooldown. If the risk limit is still exceeded, "
+                    "the Guardian may halt the robot again on its next check.\n\n"
+                    "Continue?"
+                )
+            else:
+                confirmation_text = (
+                    f"⚠️ <b>Confirm Action</b>\n\nAre you sure you want to: <b>{label}</b>?\n\n"
+                    f"This action will take effect immediately."
+                )
             await self.edit_or_reply(
                 update, context,
-                f"⚠️ <b>Confirm Action</b>\n\nAre you sure you want to: <b>{label}</b>?\n\n"
-                f"This action will take effect immediately.",
+                confirmation_text,
                 Keyboards.confirm_action(action, label),
             )
             return
@@ -200,6 +214,7 @@ class DashboardHandler(BaseHandler):
             "start": self._robot.start,
             "pause": self._robot.pause,
             "resume": self._robot.resume,
+            "reset_guardian_confirmed": self._robot.reset_guardian,
             "stop_confirmed": self._robot.emergency_stop,
             "emergency_confirmed": self._robot.emergency_stop,
             "restart_engine_confirmed": self._robot.restart_engine,
