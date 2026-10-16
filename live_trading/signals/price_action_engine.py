@@ -262,12 +262,17 @@ def _detect_breakout_pullback(
 ):
     n = len(candles)
     curr = candles[n - 1]
+    previous = candles[n - 2]
     cp   = curr.close
+    previous_close = previous.close
 
     vbull = vbear = fbull = fbear = bull_pb = bear_pb = False
 
     for level in resistance_lvls:
-        if (cp > level and _body(curr) >= cfg.breakout_min_body and
+        # A breakout is a transition through the level on this closed candle,
+        # not merely a candle that remains above a stale resistance.
+        if (previous_close <= level < cp and
+                _body(curr) >= cfg.breakout_min_body and
                 _body_ratio(curr) >= cfg.breakout_body_ratio and _is_bull(curr)):
             vbull = True
         recent = candles[n - cfg.fake_retrace_bars - 1: n - 1]
@@ -275,7 +280,10 @@ def _detect_breakout_pullback(
             if rc.close > level and cp < level: fbull = True
 
     for level in support_lvls:
-        if (cp < level and _body(curr) >= cfg.breakout_min_body and
+        # Symmetrically, require a fresh close through support before calling
+        # a move a breakdown; stale levels must not authorize a SELL at support.
+        if (previous_close >= level > cp and
+                _body(curr) >= cfg.breakout_min_body and
                 _body_ratio(curr) >= cfg.breakout_body_ratio and _is_bear(curr)):
             vbear = True
         recent = candles[n - cfg.fake_retrace_bars - 1: n - 1]
@@ -287,7 +295,6 @@ def _detect_breakout_pullback(
     trend_up   = cp > prior * 1.002
     trend_down = cp < prior * 0.998
     pull_zone  = cp * cfg.pullback_zone_pct
-    previous = candles[n - 2]
 
     def touched_support(candle):
         return (
