@@ -286,6 +286,12 @@ TARGET_ROOM_BUFFER_ATR = _float(
     "TARGET_ROOM_BUFFER_ATR", 0.15, lo=0.0, hi=1.0
 )
 RISK_PERCENT      = _float("RISK_PERCENT",      1.0,  lo=0.01, hi=10.0)
+# Hard ceiling for the combined loss-to-stop risk of all open positions on the
+# configured symbol, including a proposed new order. This is separate from
+# RISK_PERCENT, which remains the per-trade sizing target.
+MAX_TOTAL_RISK_PERCENT = _float(
+    "MAX_TOTAL_RISK_PERCENT", 2.0, lo=0.01, hi=100.0
+)
 #
 # Confidence policy:
 # - NORMAL_MIN_CONFIDENCE applies to every non-RANGE market regime.

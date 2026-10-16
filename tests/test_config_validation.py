@@ -51,6 +51,11 @@ class TestConfigDefaults:
         assert cfg.RISK_PERCENT == 1.0
         assert isinstance(cfg.RISK_PERCENT, float)
 
+    def test_aggregate_risk_percent_default(self):
+        cfg = _reload_config({})
+        assert cfg.MAX_TOTAL_RISK_PERCENT == 2.0
+        assert isinstance(cfg.MAX_TOTAL_RISK_PERCENT, float)
+
     def test_min_confirmations_default(self):
         """Entry-policy floors use the restored single-confirmation defaults."""
         cfg = _reload_config({})
@@ -197,6 +202,10 @@ class TestConfigEnvOverrides:
     def test_risk_percent_override(self):
         cfg = _reload_config({"RISK_PERCENT": "0.5"})
         assert cfg.RISK_PERCENT == 0.5
+
+    def test_aggregate_risk_percent_override(self):
+        cfg = _reload_config({"MAX_TOTAL_RISK_PERCENT": "2.5"})
+        assert cfg.MAX_TOTAL_RISK_PERCENT == 2.5
 
     def test_daily_loss_override(self):
         cfg = _reload_config({"DAILY_LOSS_LIMIT_PCT": "5.0"})

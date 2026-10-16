@@ -91,7 +91,17 @@ def _patch_order_dependencies(monkeypatch, order_calls):
 
     async def fake_get_symbol_params(_symbol):
         return {
-            "symbolInfo": {"digits": 2, "points": 0.01},
+            "symbolInfo": {
+                "digits": 2,
+                "points": 0.01,
+                "tickSize": 0.01,
+                "tickValue": 1.0,
+                "tickValueCurrency": "USD",
+                "contractSize": 100.0,
+                "volumeMin": 0.01,
+                "volumeStep": 0.01,
+                "volumeMax": 50.0,
+            },
             "symbolGroup": {"sl": 200.0, "tp": 0.0},
         }
 
@@ -158,6 +168,135 @@ async def test_valid_final_rr_allows_order(monkeypatch):
     assert reason == ""
     assert decision.trade_params.risk_reward_ratio == 1.99
     assert len(order_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_final_gate_sizes_one_open_trade_under_aggregate_cap(monkeypatch):
+    order_calls = []
+    _patch_order_dependencies(monkeypatch, order_calls)
+    monkeypatch.setattr(redis_ipc, "REDIS_URL", "")
+    existing_position = {
+        "ticket": 101,
+        "symbol": "XAUUSD",
+        "type": "BUY",
+        "volume": 0.01,
+        "openPrice": 100.0,
+        "stopLoss": 90.0,
+        "comment": "GSPv4|S=XVTB",
+    }
+
+    async def one_open_position(*_args, **kwargs):
+        result = ([existing_position], [])
+        return result if kwargs.get("return_diagnostics") else [existing_position]
+
+    monkeypatch.setattr(live_loop, "get_open_positions", one_open_position)
+    robot = GoldScalperLive()
+
+    result, positions, stage, reason = await robot._safe_entry_order(
+        _decision(2.0),
+        (ACTIVE_STRATEGY_SLOT,),
+        "5m",
+        datetime(2026, 10, 16, 9, 30, tzinfo=timezone.utc),
+        1.0,
+        account_balance=10_000.0,
+        account_currency="USD",
+    )
+
+    assert result is not None and result.success
+    assert stage == ""
+    assert reason == ""
+    assert len(positions) == 1
+    sent_risk = order_calls[0]["lot_size"] * (
+        abs(100.10 - 97.99) / 0.01
+    )
+    assert sent_risk <= 100.0
+    assert sent_risk + 10.0 <= 200.0
+    assert order_calls[0]["volume_step"] == 0.01
+
+
+@pytest.mark.asyncio
+async def test_final_gate_blocks_when_multiple_positions_exceed_aggregate_cap(
+    monkeypatch,
+):
+    order_calls = []
+    _patch_order_dependencies(monkeypatch, order_calls)
+    monkeypatch.setattr(redis_ipc, "REDIS_URL", "")
+    existing_positions = [
+        {
+            "ticket": ticket,
+            "symbol": "XAUUSD",
+            "type": "BUY",
+            "volume": 0.6,
+            "openPrice": 100.0,
+            "stopLoss": 98.0,
+            "comment": "GSPv4|S=XVTB",
+        }
+        for ticket in (201, 202)
+    ]
+
+    async def over_cap_positions(*_args, **kwargs):
+        result = (existing_positions, [])
+        return result if kwargs.get("return_diagnostics") else existing_positions
+
+    monkeypatch.setattr(live_loop, "get_open_positions", over_cap_positions)
+    robot = GoldScalperLive()
+
+    result, positions, stage, reason = await robot._safe_entry_order(
+        _decision(2.0),
+        (ACTIVE_STRATEGY_SLOT,),
+        "5m",
+        datetime(2026, 10, 16, 9, 35, tzinfo=timezone.utc),
+        1.0,
+        account_balance=10_000.0,
+        account_currency="USD",
+    )
+
+    assert result is None
+    assert len(positions) == 2
+    assert stage == "AGGREGATE_RISK_LIMIT"
+    assert "240.00 USD" in reason
+    assert order_calls == []
+
+
+@pytest.mark.asyncio
+async def test_final_gate_blocks_new_order_if_open_position_has_no_valid_sl(
+    monkeypatch,
+):
+    order_calls = []
+    _patch_order_dependencies(monkeypatch, order_calls)
+    monkeypatch.setattr(redis_ipc, "REDIS_URL", "")
+    unprotected_position = {
+        "ticket": 301,
+        "symbol": "XAUUSD",
+        "type": "BUY",
+        "volume": 0.01,
+        "openPrice": 100.0,
+        "stopLoss": None,
+        "comment": "GSPv4|S=XVTB",
+    }
+
+    async def unprotected(*_args, **kwargs):
+        result = ([unprotected_position], [])
+        return result if kwargs.get("return_diagnostics") else [unprotected_position]
+
+    monkeypatch.setattr(live_loop, "get_open_positions", unprotected)
+    robot = GoldScalperLive()
+
+    result, positions, stage, reason = await robot._safe_entry_order(
+        _decision(2.0),
+        (ACTIVE_STRATEGY_SLOT,),
+        "5m",
+        datetime(2026, 10, 16, 9, 40, tzinfo=timezone.utc),
+        1.0,
+        account_balance=10_000.0,
+        account_currency="USD",
+    )
+
+    assert result is None
+    assert len(positions) == 1
+    assert stage == "OPEN_POSITION_RISK_UNVERIFIABLE"
+    assert "SL must be finite and positive" in reason
+    assert order_calls == []
 
 
 @pytest.mark.asyncio

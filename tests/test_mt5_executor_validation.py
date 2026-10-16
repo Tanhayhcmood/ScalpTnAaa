@@ -12,4 +12,5 @@ def test_normalise_lot_rejects_non_finite_or_non_positive_values():
 
 def test_normalise_lot_keeps_broker_step():
     assert _normalise_lot(0.014) == 0.01
-    assert _normalise_lot(0.016) == 0.02
+    assert _normalise_lot(0.016) == 0.01
+    assert _normalise_lot(0.026) == 0.02

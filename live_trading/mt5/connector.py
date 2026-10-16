@@ -1027,7 +1027,10 @@ async def get_account_info() -> dict:
                         "margin": float(data.get("margin", 0.0)),
                         "freeMargin": float(data.get("freeMargin", 0.0)),
                         "marginLevel": float(data.get("marginLevel", 0.0)),
-                        "currency": data.get("currency", "USD"),
+                        # Do not invent USD when the broker omits account
+                        # currency; risk sizing must fail closed if it cannot
+                        # match tick economics to the account denomination.
+                        "currency": str(data.get("currency") or "").strip().upper(),
                         "leverage": int(data.get("leverage") or 0),
                         "broker": str(data.get("broker") or data.get("company") or MT5_HOST),
                         "server": str(data.get("server") or MT5_HOST),
@@ -1352,16 +1355,27 @@ async def get_last_completed_bar_time(
 
 
 def mt5_pos_to_dict(pos: dict) -> dict:
+    def _finite_or_zero(*keys: str) -> float:
+        for key in keys:
+            value = pos.get(key)
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                return number
+        return 0.0
+
     return {
         "id": str(pos.get("ticket", pos.get("identifier", ""))),
         "ticket": pos.get("ticket", pos.get("identifier", 0)),
         "symbol": pos.get("symbol", ""),
         "type": _position_direction(pos),
         "volume": _position_lots(pos) or 0.0,
-        "open_price": float(pos.get("openPrice", pos.get("price_open", 0.0))),
-        "sl": float(pos.get("stopLoss", pos.get("sl", 0.0))),
-        "tp": float(pos.get("takeProfit", pos.get("tp", 0.0))),
-        "profit": float(pos.get("profit", 0.0)),
+        "open_price": _finite_or_zero("openPrice", "price_open"),
+        "sl": _finite_or_zero("stopLoss", "sl"),
+        "tp": _finite_or_zero("takeProfit", "tp"),
+        "profit": _finite_or_zero("profit"),
         "open_time": pos.get("openTime", pos.get("time", 0)),
         "comment": pos.get("comment", ""),
     }
