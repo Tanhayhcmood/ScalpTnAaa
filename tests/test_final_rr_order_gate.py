@@ -54,6 +54,28 @@ def _false_breakout_decision():
     return decision
 
 
+def _smc_only_false_breakout_decision():
+    decision = _decision(2.0)
+    decision.pa = SimpleNamespace(
+        fake_bull_breakout=False,
+        fake_bear_breakout=False,
+        valid_bull_breakout=False,
+        valid_bear_breakout=False,
+        bullish_inside_breakout=False,
+        bearish_inside_breakout=False,
+        bullish_pullback=False,
+        bearish_pullback=False,
+        near_resistance=False,
+        near_support=False,
+        breakout_overextended=False,
+    )
+    decision.quality_filter = SimpleNamespace(
+        adx=50.0,
+        is_fake_breakout=True,
+    )
+    return decision
+
+
 def _patch_order_dependencies(monkeypatch, order_calls):
     async def fake_get_open_positions(*_args, **kwargs):
         if kwargs.get("return_diagnostics"):
@@ -151,6 +173,28 @@ async def test_explicit_false_breakout_is_blocked_at_final_order_boundary(monkey
     assert stage == "BREAKOUT_SAFETY_BLOCKED"
     assert "false breakout" in reason
     assert order_calls == []
+
+
+@pytest.mark.asyncio
+async def test_smc_fake_breakout_flag_does_not_block_final_order(monkeypatch):
+    order_calls = []
+    _patch_order_dependencies(monkeypatch, order_calls)
+    robot = GoldScalperLive()
+
+    result, positions, stage, reason = await robot._safe_entry_order(
+        _smc_only_false_breakout_decision(),
+        (ACTIVE_STRATEGY_SLOT,),
+        "5m",
+        datetime(2026, 9, 25, tzinfo=timezone.utc),
+        1.0,
+    )
+
+    assert result is not None
+    assert result.success
+    assert positions == []
+    assert stage == ""
+    assert reason == ""
+    assert len(order_calls) == 1
 
 
 @pytest.mark.asyncio

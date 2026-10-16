@@ -83,14 +83,21 @@ def test_explicit_false_breakout_is_hard_blocked():
     assert "false breakout" in reason
 
 
-def test_smc_explicit_false_breakout_is_hard_blocked():
+def test_smc_false_breakout_is_diagnostic_and_cannot_veto_entry():
     reason = _entry_breakout_block_reason(
         "BUY",
         _pa(),
         smc_fake_breakout=True,
     )
-    assert reason is not None
-    assert "SMC" in reason
+    assert reason is None
+
+    # The legacy compatibility argument must stay non-authoritative when
+    # Price Action telemetry is unavailable too.
+    assert _entry_breakout_block_reason(
+        "BUY",
+        None,
+        smc_fake_breakout=True,
+    ) is None
 
 
 def test_wick_only_breakout_is_not_authorized():

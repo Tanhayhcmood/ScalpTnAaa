@@ -172,20 +172,34 @@ def evaluate_active_entry(
     trend_direction = _trend_direction(getattr(decision, "trend", None))
     entry_filter = getattr(decision, "entry_filter", None)
     trend_confirmed = bool(getattr(entry_filter, "trend", False))
+    pa = getattr(decision, "pa", None)
     pa_direction = str(
-        getattr(getattr(decision, "pa", None), "pa_signal", "")
+        getattr(pa, "pa_signal", "")
     ).upper()
     pa_standalone_confirmed = (
         bool(getattr(entry_filter, "price_action", False))
         and direction == pa_direction
         and not trend_confirmed
     )
+    counter_trend = (
+        trend_direction in {"BUY", "SELL"}
+        and trend_direction != direction
+    )
+    if counter_trend and pa_standalone_confirmed:
+        # A single PA candle can signal a possible turn, but it is not enough
+        # to authorize a counter-trend trade in the Trend Breakout strategy.
+        # Preserve valid reversals when the existing PA engine confirms the
+        # structure with a close-confirmed breakout, inside-bar breakout, or
+        # pullback/reclaim.
+        pa_standalone_confirmed = _pa_has_structural_confirmation(pa, direction)
+
     if trend_direction != direction and not pa_standalone_confirmed:
         return ActiveEntryPolicyResult(
             False,
             ACTIVE_ENTRY_STRATEGY,
             f"{ACTIVE_ENTRY_STRATEGY} blocked: counter-trend direction "
-            f"{direction} vs trend {trend_direction}",
+            f"{direction} vs trend {trend_direction}; structural Price "
+            "Action confirmation is required",
         )
 
     if entry_filter is None or not (trend_confirmed or pa_standalone_confirmed):

@@ -125,17 +125,17 @@ def _entry_breakout_block_reason(
     *,
     smc_fake_breakout: bool = False,
 ) -> Optional[str]:
-    """Return the existing breakout-safety reason for a live entry.
+    """Return the existing Price Action breakout-safety reason for an entry.
 
     Price Action already distinguishes closed breakouts from wick-only moves
     and already marks false breakouts/overextension.  This helper only wires
     those existing signals into the live-entry authority; it does not add a
-    new threshold or reinterpret the PA detector.
+    new threshold or reinterpret the PA detector. ``smc_fake_breakout`` is
+    retained for caller compatibility but is diagnostic-only and cannot veto
+    an entry.
     """
     candidate = str(candidate).upper()
     if pa is None:
-        if smc_fake_breakout:
-            return f"{candidate} blocked: SMC explicitly identified a false breakout"
         # Legacy callers may construct a decision without PA telemetry. Real
         # decisions always carry PriceActionResult and take the full guards.
         return None
@@ -147,9 +147,6 @@ def _entry_breakout_block_reason(
     )
     if pa_false_breakout:
         return f"{candidate} blocked: Price Action explicitly identified a false breakout"
-
-    if smc_fake_breakout:
-        return f"{candidate} blocked: SMC explicitly identified a false breakout"
 
     aligned_breakout = (
         candidate == "BUY"
@@ -702,6 +699,8 @@ def run_decision_engine(
 
     fake_ob = detect_order_block_fake_breakout(candles, smc, candidate)
     if fake_ob is not None:
+        # Preserve SMC fake-breakout telemetry on the quality record, but do
+        # not promote diagnostic SMC output into an entry veto.
         quality.is_fake_breakout = True
 
     pa_fake_breakout = (
@@ -715,7 +714,6 @@ def run_decision_engine(
     breakout_block_reason = _entry_breakout_block_reason(
         candidate,
         pa,
-        smc_fake_breakout=fake_ob is not None,
     )
     if breakout_block_reason is not None:
         return _blocked_after_quality(breakout_block_reason)

@@ -59,6 +59,10 @@ def test_confidence_30_to_39_allows_clear_trend_or_pa_without_smc_wyckoff():
             direction="BUY",
             regime="STRONG_TREND_BULL",
             trend=SimpleNamespace(trend="NEUTRAL"),
+            pa=SimpleNamespace(
+                pa_signal="BUY",
+                valid_bull_breakout=True,
+            ),
             entry_filter=pa_entry,
         ),
         symbol="XAUUSD",
