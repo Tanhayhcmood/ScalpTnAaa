@@ -12,7 +12,7 @@ services:
 
   # ─── Trading robot ─────────────────────────────────────────────────────────
   - type: web
-    name: goldscalper-v4-robot-sg
+    name: goldscalper-v4-robot-va
     region: singapore
     autoDeployTrigger: commit
     runtime: python
@@ -209,7 +209,7 @@ services:
 
   # ─── Telegram control panel ────────────────────────────────────────────────
   - type: web
-    name: goldscalper-v4-panel-sg
+    name: goldscalper-v4-panel-va
     region: singapore
     autoDeployTrigger: commit
     runtime: python
@@ -238,7 +238,7 @@ services:
         value: "/tmp/robot_state.json"
       # FIX #1: ROBOT_BASE_URL and ROBOT_COMMAND_TOKEN enable HTTP fallback.
       - key: ROBOT_BASE_URL
-        value: "https://goldscalper-v4-robot-sg.onrender.com"
+        value: "https://goldscalper-v4-robot-va.onrender.com"
       - key: ROBOT_COMMAND_TOKEN
         sync: false
       - key: REDIS_URL
