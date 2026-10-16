@@ -105,6 +105,11 @@ from live_trading.trading.strategy_slots import (
     available_for_strategy_slots,
     one_way_entry_allowed,
 )
+from live_trading.trading.entry_signal import (
+    entry_signal_comment,
+    entry_signal_id,
+    entry_signal_tag,
+)
 from live_trading.trading.entry_guard import (
     staleness_limit_for_regime,
     validate_entry_price_distance,
@@ -562,6 +567,10 @@ class GoldScalperLive:
         # This remains safe if entry evaluation is ever scheduled concurrently
         # (for example, after adding independent timeframe workers).
         self._entry_lock = asyncio.Lock()
+        # Remember attempted candle IDs in this process. Redis provides the
+        # shared atomic claim when configured; this local set is the fallback
+        # for single-process development and a fast duplicate check.
+        self._attempted_entry_signal_ids: set[str] = set()
         # tracks the last successfully placed trade (direction + bar_time)
         # so the post-SL cooldown gate can detect same-direction re-entry.
         self._last_entry_bar_time: Optional[datetime] = None
@@ -2105,6 +2114,7 @@ class GoldScalperLive:
         # Re-poll and place under one lock. This closes the race where two
         # timeframe evaluations both see a flat account and then submit
         # opposite orders before the bridge exposes the first fill.
+        signal_id = entry_signal_id(SYMBOL, tf, bar_time)
         tp_params = decision.trade_params
         result, _confirm_pos_dicts, _entry_stage, _entry_reason = (
             await self._safe_entry_order(
@@ -2168,6 +2178,7 @@ class GoldScalperLive:
                 "regime":      decision.regime,
                  "timeframe":   tf,
                 "bar_time":    bar_time.isoformat(),
+                "signal_id":   signal_id,
                 "strategy":    strategy,
                 "strategy_slots": list(candidate_strategy_slots),
             }
@@ -2203,7 +2214,10 @@ class GoldScalperLive:
             # Keep the same strategy-tagged comment that was sent to MTAPI.
             # This telemetry path runs after the order succeeds; rebuilding it
             # here avoids carrying a local variable across _safe_entry_order().
-            order_comment = strategy_order_comment(COMMENT, candidate_strategy_slots)
+            order_comment = entry_signal_comment(
+                strategy_order_comment(COMMENT, candidate_strategy_slots),
+                signal_id,
+            )
             pos = {
                 "id":         result.position_id,
                 "ticket":     result.position_id,
@@ -3223,9 +3237,21 @@ class GoldScalperLive:
 
         The initial position check is intentionally kept earlier in the bar
         pipeline for fast feedback. This final check is the authoritative
-        safety boundary immediately before the broker request.
+        safety boundary immediately before the broker request. The signal ID
+        is independent of direction, so a second decision for the same closed
+        candle cannot create another trade.
         """
+        signal_id = entry_signal_id(SYMBOL, timeframe, bar_time)
+        signal_tag = entry_signal_tag(signal_id)
         async with self._entry_lock:
+            if signal_id in self._attempted_entry_signal_ids:
+                return (
+                    None,
+                    [],
+                    "DUPLICATE_CANDLE_SIGNAL",
+                    f"Entry already attempted for signal {signal_id}",
+                )
+
             active_entry = evaluate_active_entry(
                 decision,
                 symbol=SYMBOL,
@@ -3281,6 +3307,17 @@ class GoldScalperLive:
             confirm_dicts = [
                 mt5_pos_to_dict(position) for position in confirm_positions
             ]
+            if any(
+                signal_tag in str(position.get("comment") or "")
+                for position in confirm_dicts
+            ):
+                self._attempted_entry_signal_ids.add(signal_id)
+                return (
+                    None,
+                    confirm_dicts,
+                    "DUPLICATE_CANDLE_SIGNAL",
+                    "Broker already reports an open position for this candle signal",
+                )
             if dropped_unknown:
                 return (
                     None,
@@ -3513,18 +3550,62 @@ class GoldScalperLive:
                 f"digits={stop_constraints['digits']}  "
                 f"reanchored_from={original_entry_price}"
             )
-            order_comment = strategy_order_comment(
-                COMMENT,
-                candidate_strategy_slots,
+            order_comment = entry_signal_comment(
+                strategy_order_comment(COMMENT, candidate_strategy_slots),
+                signal_id,
             )
             log.info(
                 f"🔔 SIGNAL [{timeframe}] {decision.direction}  "
+                f"id={signal_id}  "
                 f"conf={decision.confidence:.1f}%  "
                 f"lot={tp_params.lot_size}  "
                 f"SL={tp_params.stop_loss}  TP={tp_params.take_profit}  "
                 f"R:R={tp_params.risk_reward_ratio:.2f}  "
                 f"slippage≤{SLIPPAGE_POINTS}pts"
             )
+
+            # The instance lock above serializes tasks in this event loop.
+            # Redis SET NX extends the claim across independently running
+            # engine processes; if Redis is configured but unavailable, fail
+            # closed rather than silently losing the shared guarantee.
+            redis_ipc = None
+            shared_claim_required = False
+            try:
+                from live_trading import redis_ipc as _redis_ipc
+
+                redis_ipc = _redis_ipc
+                shared_claim_required = bool(redis_ipc.REDIS_URL)
+                if shared_claim_required:
+                    claimed = redis_ipc.redis_claim_entry_signal(signal_id)
+                    if claimed is False:
+                        self._attempted_entry_signal_ids.add(signal_id)
+                        return (
+                            None,
+                            confirm_dicts,
+                            "DUPLICATE_CANDLE_SIGNAL",
+                            f"Signal {signal_id} is already claimed by another engine",
+                        )
+                    if claimed is None:
+                        return (
+                            None,
+                            confirm_dicts,
+                            "SIGNAL_DEDUP_UNAVAILABLE",
+                            "Shared Redis signal claim is unavailable; order was not sent",
+                        )
+            except Exception as exc:
+                if shared_claim_required:
+                    return (
+                        None,
+                        confirm_dicts,
+                        "SIGNAL_DEDUP_UNAVAILABLE",
+                        f"Could not claim signal in shared Redis: {exc}",
+                    )
+                log.warning("Shared signal deduplication is not configured: %s", exc)
+
+            # Keep this claim even for a failed or ambiguous response so this
+            # closed candle cannot submit a second request. Failed requests are
+            # still returned as failures and are not trade-history records.
+            self._attempted_entry_signal_ids.add(signal_id)
             result = await place_market_order(
                 symbol=SYMBOL,
                 direction=decision.direction,
@@ -3535,6 +3616,19 @@ class GoldScalperLive:
                 deviation=SLIPPAGE_POINTS,
                 price_digits=stop_constraints["digits"],
             )
+            if shared_claim_required and redis_ipc is not None:
+                try:
+                    redis_ipc.redis_mark_entry_signal(
+                        signal_id,
+                        "SUCCESS" if result.success else "FAILED",
+                        position_id=result.position_id if result.success else None,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Could not record broker outcome for signal %s: %s",
+                        signal_id,
+                        exc,
+                    )
             return result, confirm_dicts, "", ""
 
     # ── Trade history persistence (survives restarts) ─────────────────────────

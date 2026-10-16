@@ -17,8 +17,10 @@ Redis keys
   goldscalper:snapshot — MT5 snapshot JSON (TTL 5 min)
   goldscalper:commands — pending commands dict in engine-key format (TTL 5 min)
   goldscalper:guardian — RiskGuardian circuit-breaker state (TTL 27 hours)
+  goldscalper:entry-signal:<sha256> — atomic order dedup key (TTL 7 days)
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -36,6 +38,8 @@ _GUARDIAN_KEY = "goldscalper:guardian"
 _STATE_TTL    = 300   # 5 min — prevents stale reads if robot crashes
 _CMD_TTL      = 300   # 5 min — stale commands become irrelevant
 _GUARDIAN_TTL = 97200  # 27h — covers the 26h freshness window after a restart
+_ENTRY_SIGNAL_PREFIX = "goldscalper:entry-signal:"
+_ENTRY_SIGNAL_TTL = 7 * 24 * 60 * 60  # retain dedup keys across process restarts
 
 _client              = None
 _last_failure_time: float = 0.0   # monotonic timestamp of last connection failure
@@ -107,6 +111,65 @@ def _get_client():
 def redis_available() -> bool:
     """True when Redis is configured and reachable."""
     return _get_client() is not None
+
+
+def _entry_signal_key(signal_id: str) -> str:
+    digest = hashlib.sha256(str(signal_id).encode("utf-8")).hexdigest()
+    return f"{_ENTRY_SIGNAL_PREFIX}{digest}"
+
+
+def redis_claim_entry_signal(signal_id: str) -> Optional[bool]:
+    """Atomically reserve a signal ID; None means Redis is unavailable.
+
+    The reservation is intentionally retained after an uncertain/failed order
+    response. That prevents a retry of the same closed candle from duplicating
+    an order that the broker may have accepted before the response was lost.
+    """
+    if not signal_id:
+        return False
+    r = _get_client()
+    if r is None:
+        return None
+    try:
+        claimed = r.set(
+            _entry_signal_key(signal_id),
+            json.dumps({"status": "PENDING"}),
+            nx=True,
+            ex=_ENTRY_SIGNAL_TTL,
+        )
+        return bool(claimed)
+    except Exception as exc:
+        logger.warning("Redis claim_entry_signal: %s", exc)
+        _reset_client()
+        return None
+
+
+def redis_mark_entry_signal(
+    signal_id: str,
+    status: str,
+    position_id: Optional[str] = None,
+) -> bool:
+    """Record the broker outcome for a dedup key, separately from trade history."""
+    normalized_status = str(status or "").strip().upper()
+    if not signal_id or normalized_status not in {"SUCCESS", "FAILED"}:
+        return False
+    r = _get_client()
+    if r is None:
+        return False
+    try:
+        value = {"status": normalized_status}
+        if position_id is not None:
+            value["position_id"] = str(position_id)
+        r.set(
+            _entry_signal_key(signal_id),
+            json.dumps(value),
+            ex=_ENTRY_SIGNAL_TTL,
+        )
+        return True
+    except Exception as exc:
+        logger.warning("Redis mark_entry_signal: %s", exc)
+        _reset_client()
+        return False
 
 
 # ─── Robot writes state to Redis ──────────────────────────────────────────────
