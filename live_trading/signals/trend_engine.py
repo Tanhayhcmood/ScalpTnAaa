@@ -37,6 +37,8 @@ class TrendResult:
     quality: float = 0.0
     state: TrendState = "RANGE"
     pullback: bool = False
+    plus_di: float = 0.0
+    minus_di: float = 0.0
 
 
 def _ema_series(closes: List[float], period: int) -> List[float]:
@@ -66,9 +68,10 @@ def _signed_component(value: float, scale: float, weight: float) -> float:
     return normalized * weight
 
 
-def _calc_adx(candles: List[OHLCV], period: int = 14) -> float:
+def _calc_dmi(candles: List[OHLCV], period: int = 14) -> tuple[float, float, float]:
+    """Return ADX, +DI and -DI from the same Wilder-smoothed movement series."""
     if len(candles) < period * 2:
-        return 20.0
+        return 20.0, 0.0, 0.0
     trs: List[float] = []
     dm_plus: List[float] = []
     dm_minus: List[float] = []
@@ -99,8 +102,16 @@ def _calc_adx(candles: List[OHLCV], period: int = 14) -> float:
             100.0 * abs(plus_di - minus_di) / total if total > 0 else 0.0
         )
     if len(dx_values) < period:
-        return 20.0
-    return round(sum(dx_values[-period:]) / period, 2)
+        return 20.0, 0.0, 0.0
+    plus_di = 100.0 * plus_sum / tr_sum if tr_sum > 0 else 0.0
+    minus_di = 100.0 * minus_sum / tr_sum if tr_sum > 0 else 0.0
+    adx = round(sum(dx_values[-period:]) / period, 2)
+    return adx, round(plus_di, 2), round(minus_di, 2)
+
+
+def _calc_adx(candles: List[OHLCV], period: int = 14) -> float:
+    """Backward-compatible ADX helper."""
+    return _calc_dmi(candles, period)[0]
 
 
 def _neutral_result(candles: List[OHLCV]) -> TrendResult:
@@ -137,7 +148,7 @@ def analyze_trend(candles: List[OHLCV]) -> TrendResult:
     slope50 = (series50[-1] - series50[-11]) / atr
     slope100 = (series100[-1] - series100[-11]) / atr
     rsi = calc_rsi(closes, 14)
-    adx = _calc_adx(candles, 14)
+    adx, plus_di, minus_di = _calc_dmi(candles, 14)
 
     # The score is signed from -100 to +100. It combines structure, distance,
     # slope and momentum instead of trusting one closing-price crossover.
@@ -168,6 +179,10 @@ def analyze_trend(candles: List[OHLCV]) -> TrendResult:
         and price >= ema100 - 1.25 * atr
         and price <= ema50 + 0.75 * atr
         and score >= 8.0
+        # Once price has lost EMA50, do not keep authorizing a long pullback
+        # while directional movement is still decisively bearish. The EMA
+        # stack and ADX lag; +DI/-DI tell us whether the pullback has turned.
+        and plus_di > minus_di
     )
     bearish_pullback = (
         bearish_structure
@@ -176,6 +191,7 @@ def analyze_trend(candles: List[OHLCV]) -> TrendResult:
         and price <= ema100 + 1.25 * atr
         and price >= ema50 - 0.75 * atr
         and score <= -8.0
+        and minus_di > plus_di
     )
 
     if (bullish_core and score >= 25.0) or bullish_pullback:
@@ -220,4 +236,6 @@ def analyze_trend(candles: List[OHLCV]) -> TrendResult:
         quality=quality,
         state=state,
         pullback=is_pullback,
+        plus_di=plus_di,
+        minus_di=minus_di,
     )

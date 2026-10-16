@@ -41,11 +41,27 @@ def test_flat_market_is_not_mislabeled_as_a_trend():
 
 def test_shallow_retracement_keeps_the_higher_timeframe_bias():
     closes = [2400.0 + index * 0.45 for index in range(250)]
-    closes.extend(closes[-1] - index * 0.20 for index in range(1, 11))
+    last_close = closes[-1]
+    closes.extend(last_close - index * 0.20 for index in range(1, 11))
     result = analyze_trend(_candles(closes))
 
     assert result.trend == "BULLISH"
+    assert result.plus_di > result.minus_di
     assert result.pullback or result.state in {"TRENDING", "DEVELOPING"}
+
+
+def test_bearish_directional_pressure_invalidates_a_stale_bullish_pullback():
+    closes = [2400.0 + index * 0.35 for index in range(230)]
+    peak = closes[-1]
+    closes.extend(peak - index * 0.8 for index in range(1, 12))
+
+    result = analyze_trend(_candles(closes))
+
+    assert result.minus_di > result.plus_di
+    assert result.rsi < 35.0
+    assert result.trend == "NEUTRAL"
+    assert result.state == "TRANSITION"
+    assert result.pullback is False
 
 
 def test_insufficient_history_is_neutral_and_safe():

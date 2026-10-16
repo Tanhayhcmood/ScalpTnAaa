@@ -274,7 +274,7 @@ def test_bullish_pullback_needs_a_close_reclaim_above_support():
 
 def test_bullish_pullback_is_valid_after_a_close_reclaims_support():
     bars = [
-        SimpleNamespace(open=98.8, high=99.0, low=98.6, close=98.8)
+        SimpleNamespace(open=98.0, high=98.2, low=97.8, close=98.0)
         for _ in range(10)
     ]
     bars.extend(
@@ -286,6 +286,26 @@ def test_bullish_pullback_is_valid_after_a_close_reclaims_support():
 
     result = _detect_breakout_pullback(
         bars, [100.0], [], [], [], CFG_M5, atr=1.0
+    )
+
+    assert result[4] is True
+
+
+def test_bullish_pullback_uses_atr_not_fixed_price_percentage():
+    def bar(open_, high, low, close):
+        return SimpleNamespace(open=open_, high=high, low=low, close=close)
+
+    # The same 2.4-ATR move should be treated consistently at both price
+    # scales. At 2500, the former fixed 0.2% rule incorrectly needed a $5 move.
+    bars = [bar(2498.9, 2499.1, 2498.7, 2498.9) for _ in range(10)]
+    bars.extend(
+        [
+            bar(2500.0, 2500.05, 2499.8, 2499.9),
+            bar(2499.9, 2500.3, 2499.8, 2500.1),
+        ]
+    )
+    result = _detect_breakout_pullback(
+        bars, [2500.0], [], [], [], CFG_M5, atr=0.5
     )
 
     assert result[4] is True
@@ -308,6 +328,24 @@ def test_bearish_pullback_needs_a_close_reclaim_below_resistance():
     )
 
     assert result[5] is False
+
+
+def test_bearish_pullback_uses_atr_normalized_move_at_high_price():
+    def bar(open_, high, low, close):
+        return SimpleNamespace(open=open_, high=high, low=low, close=close)
+
+    bars = [bar(2501.1, 2501.3, 2500.9, 2501.1) for _ in range(10)]
+    bars.extend(
+        [
+            bar(2500.0, 2500.2, 2499.8, 2500.1),
+            bar(2500.1, 2500.2, 2499.6, 2499.75),
+        ]
+    )
+    result = _detect_breakout_pullback(
+        bars, [], [2500.0], [], [], CFG_M5, atr=0.5
+    )
+
+    assert result[5] is True
 
 
 def test_sr_touch_clustering_groups_multiple_pivots_across_the_tolerance_band():
