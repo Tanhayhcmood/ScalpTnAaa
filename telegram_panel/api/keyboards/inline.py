@@ -56,6 +56,9 @@ class Keyboards:
                 InlineKeyboardButton(f"{ICONS['pause']} Pause", callback_data="robot:pause"),
             ],
             [
+                InlineKeyboardButton("♻️ Reset Cooldown", callback_data="robot:reset_guardian_confirm"),
+            ],
+            [
                 InlineKeyboardButton(f"{ICONS['stop']} Stop", callback_data="robot:stop_confirm"),
                 InlineKeyboardButton(f"{ICONS['emergency']} Emergency", callback_data="robot:emergency_confirm"),
             ],
