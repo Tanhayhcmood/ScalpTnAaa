@@ -4,6 +4,7 @@ Ported from goldEngine.ts
 """
 from typing import List
 from dataclasses import dataclass
+import math
 
 
 @dataclass
@@ -14,6 +15,27 @@ class OHLCV:
     low: float
     close: float
     volume: float
+
+
+def is_valid_ohlcv(candle: OHLCV) -> bool:
+    """Return whether one candle has finite, internally consistent OHLCV data."""
+    try:
+        open_price = float(candle.open)
+        high = float(candle.high)
+        low = float(candle.low)
+        close = float(candle.close)
+        volume = float(candle.volume)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return False
+    values = (open_price, high, low, close, volume)
+    return (
+        all(math.isfinite(value) for value in values)
+        and min(open_price, high, low, close) > 0
+        and volume >= 0
+        and high >= max(open_price, close)
+        and low <= min(open_price, close)
+        and high >= low
+    )
 
 
 def calc_ema(closes: List[float], period: int) -> float:

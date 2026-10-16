@@ -8,7 +8,14 @@ and pullback awareness so a healthy trend is not lost during a retracement.
 """
 from dataclasses import dataclass
 from typing import List, Literal
-from live_trading.signals.gold_engine import OHLCV, calc_atr, calc_ema, calc_rsi
+import math
+from live_trading.signals.gold_engine import (
+    OHLCV,
+    calc_atr,
+    calc_ema,
+    calc_rsi,
+    is_valid_ohlcv,
+)
 
 
 TrendState = Literal["TRENDING", "PULLBACK", "DEVELOPING", "TRANSITION", "RANGE"]
@@ -50,7 +57,10 @@ def _ema_series(closes: List[float], period: int) -> List[float]:
 
 
 def _signed_component(value: float, scale: float, weight: float) -> float:
-    if scale <= 0:
+    if (
+        not all(math.isfinite(number) for number in (value, scale, weight))
+        or scale <= 0
+    ):
         return 0.0
     normalized = max(-1.0, min(1.0, value / scale))
     return normalized * weight
@@ -94,7 +104,11 @@ def _calc_adx(candles: List[OHLCV], period: int = 14) -> float:
 
 
 def _neutral_result(candles: List[OHLCV]) -> TrendResult:
-    last = candles[-1].close if candles else 0.0
+    try:
+        candidate = float(candles[-1].close) if candles else 0.0
+        last = candidate if math.isfinite(candidate) and candidate > 0 else 0.0
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        last = 0.0
     return TrendResult(
         ema50=last,
         ema100=last,
@@ -107,9 +121,9 @@ def _neutral_result(candles: List[OHLCV]) -> TrendResult:
 
 
 def analyze_trend(candles: List[OHLCV]) -> TrendResult:
-    closes = [c.close for c in candles]
-    if len(closes) < 210:
+    if len(candles) < 210 or not all(is_valid_ohlcv(candle) for candle in candles):
         return _neutral_result(candles)
+    closes = [c.close for c in candles]
 
     price = closes[-1]
     atr = max(calc_atr(candles, 14), 1e-6)

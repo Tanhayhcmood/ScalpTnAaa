@@ -47,6 +47,26 @@ def test_sell_at_support_requires_breakdown_or_retest():
     ) is None
 
 
+def test_bullish_inside_bar_breakout_can_confirm_a_buy_at_resistance():
+    assert _entry_location_block_reason(
+        "BUY",
+        _pa(
+            near_resistance=True,
+            bullish_inside_breakout=True,
+        ),
+    ) is None
+
+
+def test_bearish_inside_bar_breakout_can_confirm_a_sell_at_support():
+    assert _entry_location_block_reason(
+        "SELL",
+        _pa(
+            near_support=True,
+            bearish_inside_breakout=True,
+        ),
+    ) is None
+
+
 def test_confirmed_close_breakout_remains_allowed():
     assert _entry_breakout_block_reason(
         "BUY",

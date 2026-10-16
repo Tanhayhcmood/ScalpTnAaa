@@ -4,7 +4,7 @@ Ported from priceActionEngine.ts — signal confirmation and standalone paths.
 """
 from dataclasses import dataclass, replace
 from typing import List, Literal
-from live_trading.signals.gold_engine import OHLCV
+from live_trading.signals.gold_engine import OHLCV, is_valid_ohlcv
 from live_trading.config import (
     PA_MAX_BREAKOUT_EXTENSION_ATR,
     PA_STANDALONE_MIN_SCORE,
@@ -97,12 +97,13 @@ def _detect_patterns(candles: List[OHLCV], cfg: PaConfig, atr: float):
 
     c0b, c1b = _body(c0), _body(c1)
 
+    min_engulf_body = max(cfg.breakout_min_body * 0.5, atr * 0.10)
     bull_engulf = (_is_bull(c0) and _is_bear(c1) and
                    c0.open <= c1.close and c0.close >= c1.open and
-                   c0b >= c1b * cfg.engulf_body_ratio)
+                   c0b >= max(c1b * cfg.engulf_body_ratio, min_engulf_body))
     bear_engulf = (_is_bear(c0) and _is_bull(c1) and
                    c0.open >= c1.close and c0.close <= c1.open and
-                   c0b >= c1b * cfg.engulf_body_ratio)
+                   c0b >= max(c1b * cfg.engulf_body_ratio, min_engulf_body))
 
     r0      = _range(c0)
     min_sz  = atr * 0.25
@@ -146,17 +147,17 @@ def _detect_sr_levels(candles: List[OHLCV], cfg: PaConfig, tolerance: float | No
             swing_lows.append(sl[i].low)
 
     def cluster(prices):
-        confirmed, used = [], set()
-        for i, p in enumerate(prices):
-            if i in used: continue
-            grp = [p]
-            for j in range(i + 1, len(prices)):
-                if j not in used and abs(prices[j] - p) <= tol:
-                    grp.append(prices[j])
-                    used.add(j)
-            used.add(i)
+        confirmed, grp = [], []
+        max_cluster_width = max(0.0, tol) * 2.0
+        for price in sorted(prices):
+            if not grp or price - grp[0] <= max_cluster_width:
+                grp.append(price)
+                continue
             if len(grp) >= cfg.min_level_touches:
                 confirmed.append(sum(grp) / len(grp))
+            grp = [price]
+        if len(grp) >= cfg.min_level_touches:
+            confirmed.append(sum(grp) / len(grp))
         return confirmed
 
     return cluster(swing_lows), cluster(swing_highs)
@@ -183,8 +184,16 @@ def _detect_supply_demand(candles: List[OHLCV], cfg: PaConfig, atr: float):
         if not is_strong: continue
 
         if _is_bull(impulse):
+            if impulse.close <= base_high or any(
+                candle.close < base_low for candle in sl[i + 1:]
+            ):
+                continue
             demand_zones.append({"top": round(base_high, 2), "bottom": round(base_low, 2)})
         elif _is_bear(impulse):
+            if impulse.close >= base_low or any(
+                candle.close > base_high for candle in sl[i + 1:]
+            ):
+                continue
             supply_zones.append({"top": round(base_high, 2), "bottom": round(base_low, 2)})
 
     return demand_zones[-3:], supply_zones[-3:]
@@ -222,6 +231,7 @@ def _detect_inside_bar_breakout(
         if not (
             inside.high <= mother.high
             and inside.low >= mother.low
+            and (inside.high < mother.high or inside.low > mother.low)
             and _range(inside) > 0
             and _range(mother) > 0
         ):
@@ -267,12 +277,13 @@ def _detect_breakout_pullback(
     previous_close = previous.close
 
     vbull = vbear = fbull = fbear = bull_pb = bear_pb = False
+    minimum_breakout_body = max(cfg.breakout_min_body, atr * 0.15)
 
     for level in resistance_lvls:
         # A breakout is a transition through the level on this closed candle,
         # not merely a candle that remains above a stale resistance.
         if (previous_close <= level < cp and
-                _body(curr) >= cfg.breakout_min_body and
+                _body(curr) >= minimum_breakout_body and
                 _body_ratio(curr) >= cfg.breakout_body_ratio and _is_bull(curr)):
             vbull = True
         recent = candles[n - cfg.fake_retrace_bars - 1: n - 1]
@@ -283,7 +294,7 @@ def _detect_breakout_pullback(
         # Symmetrically, require a fresh close through support before calling
         # a move a breakdown; stale levels must not authorize a SELL at support.
         if (previous_close >= level > cp and
-                _body(curr) >= cfg.breakout_min_body and
+                _body(curr) >= minimum_breakout_body and
                 _body_ratio(curr) >= cfg.breakout_body_ratio and _is_bear(curr)):
             vbear = True
         recent = candles[n - cfg.fake_retrace_bars - 1: n - 1]
@@ -294,35 +305,35 @@ def _detect_breakout_pullback(
     prior = candles[n - 1 - look].close
     trend_up   = cp > prior * 1.002
     trend_down = cp < prior * 0.998
-    pull_zone  = cp * cfg.pullback_zone_pct
+    # A fixed percentage of XAUUSD's price creates a multi-dollar retest zone
+    # even when ATR is compressed. Use a bounded ATR-scaled distance instead.
+    pull_zone = max(cfg.level_tolerance, min(1.5, atr * 0.25))
 
-    def touched_support(candle):
-        return (
-            any(
-                candle.low <= level + pull_zone
-                and candle.high >= level - pull_zone
-                for level in support_lvls
-            )
-            or any(
-                candle.low <= zone["top"] + pull_zone
-                and candle.high >= zone["bottom"] - pull_zone
-                for zone in demand_zones
-            )
+    def touched_support_levels(candle):
+        levels = [
+            level for level in support_lvls
+            if candle.low <= level + pull_zone
+            and candle.high >= level - pull_zone
+        ]
+        levels.extend(
+            zone["top"] for zone in demand_zones
+            if candle.low <= zone["top"] + pull_zone
+            and candle.high >= zone["bottom"] - pull_zone
         )
+        return levels
 
-    def touched_resistance(candle):
-        return (
-            any(
-                candle.low <= level + pull_zone
-                and candle.high >= level - pull_zone
-                for level in resistance_lvls
-            )
-            or any(
-                candle.low <= zone["top"] + pull_zone
-                and candle.high >= zone["bottom"] - pull_zone
-                for zone in supply_zones
-            )
+    def touched_resistance_levels(candle):
+        levels = [
+            level for level in resistance_lvls
+            if candle.low <= level + pull_zone
+            and candle.high >= level - pull_zone
+        ]
+        levels.extend(
+            zone["bottom"] for zone in supply_zones
+            if candle.low <= zone["top"] + pull_zone
+            and candle.high >= zone["bottom"] - pull_zone
         )
+        return levels
 
     # A pullback is a retest followed by a closed-candle reclaim, not merely a
     # trend candle whose close happens to be near a stale level.
@@ -342,13 +353,19 @@ def _detect_breakout_pullback(
     )
 
     if trend_up:
-        retest = touched_support(previous) or touched_support(curr)
-        if retest and bullish_reclaim:
+        retested_levels = (
+            touched_support_levels(previous) + touched_support_levels(curr)
+        )
+        reclaimed = any(cp > level for level in retested_levels)
+        if reclaimed and bullish_reclaim:
             bull_pb = True
 
     if trend_down:
-        retest = touched_resistance(previous) or touched_resistance(curr)
-        if retest and bearish_reclaim:
+        retested_levels = (
+            touched_resistance_levels(previous) + touched_resistance_levels(curr)
+        )
+        reclaimed = any(cp < level for level in retested_levels)
+        if reclaimed and bearish_reclaim:
             bear_pb = True
 
     (
@@ -473,6 +490,8 @@ def _config_for_timeframe(timeframe: str) -> PaConfig:
 def analyze_price_action(candles: List[OHLCV], timeframe: str = "M5") -> PriceActionResult:
     cfg = _config_for_timeframe(timeframe)
     if len(candles) < cfg.level_lookback + cfg.atr_period + 5:
+        return _NEUTRAL_PA
+    if not all(is_valid_ohlcv(candle) for candle in candles):
         return _NEUTRAL_PA
 
     atr = _calc_atr(candles, cfg.atr_period)

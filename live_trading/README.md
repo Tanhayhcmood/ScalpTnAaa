@@ -86,7 +86,7 @@ live_trading/
 │   ├── market_regime.py          ← 11 regimes + ADX
 │   ├── confidence_engine.py      ← 0–100 weighted score
 │   ├── quality_filter.py         ← Session quality / ADX / late-entry gate
-│   ├── entry_filter.py           ← Trend-only live-entry gate
+│   ├── entry_filter.py           ← Trend + Price Action live-entry gate
 │   └── decision_engine.py        ← master orchestrator
 ├── risk/
 │   ├── capital_manager.py        ← SL (structural), TP=2R, lot=1%
@@ -112,7 +112,7 @@ candles (300 M5 bars)
    ├─► Price Action      → Engulf, Pin Bar, Breakout
    ├─► Wyckoff Engine    → Phase, Spring, Upthrust
    │
-    ├─► Entry Filter      → Trend only (other engines stay diagnostic)
+    ├─► Entry Filter      → Trend + Price Action; SMC/Wyckoff are diagnostic
    ├─► Market Regime     → 11 regimes + ADX + rules per regime
    ├─► Confidence Engine → 0–100 score (6 weighted bands)
    ├─► Quality Filter    → Session quality / ADX / late-entry / volume gate
@@ -127,10 +127,10 @@ candles (300 M5 bars)
 
 | Parameter | Default | Source |
 |---|---|---|
-| Confidence hard minimum | 70% | decisionEngine.ts |
-| Risk per trade | 1% of balance | capitalManager.ts |
-| Take profit | 2R | capitalManager.ts |
-| Min confirmations | 1-of-1 | entry_filter.py |
+| Confidence hard minimum | 30% | config.py |
+| Risk per trade | 1% of balance | config.py |
+| Take profit | 2R (range regime has its own target rule) | capital_manager.py |
+| Minimum confirmations | 1 configured; a single vote must pass its standalone gate | config.py / entry_filter.py |
 | SMC swing lookback | 5 bars | smcEngine.ts |
 | ATR period | 14 (Wilder) | goldEngine.ts |
 

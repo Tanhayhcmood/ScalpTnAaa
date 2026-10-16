@@ -115,6 +115,8 @@ def test_trend_only_authorization_reaches_quality_gate_without_smc():
         wyckoff_signal="NEUTRAL",
         min_confirmations=1,
         price_action_standalone=True,
+        trend_standalone=True,
+        trend_score=55.0,
     )
 
     assert _allow_without_smc_for_quality(
