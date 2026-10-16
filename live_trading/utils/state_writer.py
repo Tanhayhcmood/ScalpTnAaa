@@ -434,7 +434,11 @@ def read_commands() -> dict:
         cmd_name   = str(item.get("command", "")).strip().upper()
         engine_key = _PANEL_COMMAND_MAP.get(cmd_name)
         if engine_key:
-            result[engine_key] = True
+            payload = item.get("payload")
+            if engine_key == "reset_guardian" and isinstance(payload, dict) and payload:
+                result[engine_key] = payload
+            else:
+                result[engine_key] = True
 
     return result
 

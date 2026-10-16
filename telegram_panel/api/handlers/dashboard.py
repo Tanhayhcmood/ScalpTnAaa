@@ -3,8 +3,10 @@ Dashboard Handler — main home screen and robot control.
 """
 
 import asyncio
+import html
 import logging
 from typing import Optional
+from uuid import uuid4
 from telegram import Update
 from telegram.ext import ContextTypes
 from .base import BaseHandler
@@ -12,6 +14,75 @@ from ..keyboards.inline import Keyboards
 from ..formatters.messages import MessageFormatter
 from ...models.account import Account
 from ...config.constants import AccountType, ConnectionStatus
+
+
+def _format_guardian_reset_receipt(receipt: dict) -> str:
+    """Format the robot's applied/no-op reset receipt for Telegram."""
+    status = str(receipt.get("status") or "failed")
+    if status == "ignored":
+        reason = html.escape(str(receipt.get("reason") or "Guardian was not halted."))
+        return (
+            "🛡️ <b>No reset applied.</b> "
+            + reason
+            + " Existing baselines and limits were left unchanged."
+        )
+    if status != "applied":
+        reason = html.escape(str(receipt.get("reason") or "The robot could not apply the reset."))
+        return "⚠️ <b>Guardian reset not applied.</b> " + reason
+
+    baseline = receipt.get("baseline") or {}
+    currency = html.escape(str(receipt.get("currency") or ""))
+
+    def amount(value, signed: bool = False) -> str:
+        try:
+            number = float(value)
+            return f"{number:+,.2f}" if signed else f"{number:,.2f}"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    reset_at = html.escape(str(baseline.get("reset_at") or "unknown"))
+    trading_day = html.escape(str(baseline.get("trading_day") or "unknown"))
+    daily_limit = amount(receipt.get("daily_loss_limit_pct"))
+    drawdown_limit = amount(receipt.get("max_drawdown_pct"))
+    return (
+        "🛡️ <b>Guardian reset applied.</b>\n"
+        "Daily-loss and drawdown limits now count from the reset point.\n"
+        f"Reset (UTC): <code>{reset_at}</code> · trading day: <code>{trading_day}</code>\n"
+        f"Day PnL at reset: <code>{amount(baseline.get('realized_day_pnl'), True)} {currency}</code>\n"
+        f"Balance at reset: <code>{amount(baseline.get('balance'))} {currency}</code>\n"
+        f"Equity / peak at reset: <code>{amount(baseline.get('equity'))} / {amount(baseline.get('equity_peak'))} {currency}</code>\n"
+        f"Configured limits unchanged: daily loss {daily_limit}% · max drawdown {drawdown_limit}%"
+    )
+
+
+async def _wait_for_guardian_reset_receipt(
+    robot, request_id: str, timeout_seconds: float = 7.5
+) -> Optional[dict]:
+    """Wait briefly for the live robot to acknowledge a queued reset command."""
+    get_fresh_state = getattr(robot, "get_fresh_state", None)
+    if not callable(get_fresh_state):
+        return None
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return None
+        try:
+            state = await asyncio.wait_for(
+                get_fresh_state(), timeout=min(1.5, remaining)
+            )
+            receipt = state.get("guardian_reset_receipt") if isinstance(state, dict) else None
+            if (isinstance(receipt, dict)
+                    and str(receipt.get("request_id") or "") == request_id):
+                return receipt
+        except Exception:
+            # A transient state-read failure must not turn a queued command into
+            # a false success; keep polling until the bounded wait expires.
+            pass
+        remaining = deadline - loop.time()
+        if remaining > 0:
+            await asyncio.sleep(min(0.25, remaining))
 
 
 def _account_from_robot_state(robot_state: dict) -> Optional[Account]:
@@ -190,10 +261,11 @@ class DashboardHandler(BaseHandler):
             if action == "reset_guardian":
                 confirmation_text = (
                     "⚠️ <b>Reset Cooldown?</b>\n\n"
-                    "This clears the RiskGuardian halt and resumes the robot. "
-                    "It does not reset the daily-loss baseline or bypass the separate "
-                    "post-SL entry cooldown. If the risk limit is still exceeded, "
-                    "the Guardian may halt the robot again on its next check.\n\n"
+                    "This clears an active RiskGuardian halt and resumes the robot. "
+                    "Daily-loss and drawdown checks will count from the live account "
+                    "snapshot at reset; configured limits stay unchanged. The separate "
+                    "post-SL entry cooldown still applies. If the Guardian is not halted, "
+                    "the command does nothing.\n\n"
                     "Continue?"
                 )
             else:
@@ -224,8 +296,12 @@ class DashboardHandler(BaseHandler):
         }
 
         fn = action_map.get(action)
+        reset_request_id = uuid4().hex if action == "reset_guardian_confirmed" else ""
         if fn:
-            result = await fn()
+            if reset_request_id:
+                result = await fn(request_id=reset_request_id)
+            else:
+                result = await fn()
             await self._auth.record_action(
                 user,
                 f"ROBOT_{action.upper()}",
@@ -234,8 +310,31 @@ class DashboardHandler(BaseHandler):
             )
 
         if result:
-            await self.answer_callback(update, f"✅ Command sent: {action}", show_alert=False)
-            await self.show_dashboard(update, context)
+            if action == "reset_guardian_confirmed":
+                request_id = reset_request_id
+                await self.answer_callback(
+                    update, "✅ Reset command sent; waiting for robot confirmation.",
+                    show_alert=False,
+                )
+                receipt = await _wait_for_guardian_reset_receipt(
+                    self._robot, request_id
+                )
+                if receipt is not None:
+                    await self.send_message(
+                        update, context, _format_guardian_reset_receipt(receipt)
+                    )
+                else:
+                    await self.send_message(
+                        update, context,
+                        "⏳ Reset command was queued, but the robot has not confirmed "
+                        "it yet. This does not mean the reset was applied.",
+                    )
+                await self.show_dashboard(update, context)
+            else:
+                await self.answer_callback(
+                    update, f"✅ Command sent: {action}", show_alert=False
+                )
+                await self.show_dashboard(update, context)
         else:
             await self.answer_callback(
                 update, f"⚠️ Command may not have reached the robot.", show_alert=True

@@ -91,6 +91,8 @@ class RiskGuardian:
         self._session_open_balance: float           = 0.0
         self._day_open_balance:     float           = 0.0
         self._last_day:             Optional[date]  = None
+        # Manual resets are scoped to one UTC trading day and persist across restarts.
+        self._manual_reset_baseline: Optional[dict] = None
 
         # Suppress repeated WARNING logs when already halted
         self._halt_log_count:       int             = 0
@@ -107,6 +109,7 @@ class RiskGuardian:
         self._session_open_balance = balance
         self._day_open_balance     = balance
         self._last_day             = datetime.now(timezone.utc).date()
+        self._manual_reset_baseline = None
         self._initialized          = True
 
         log.info(
@@ -145,17 +148,39 @@ class RiskGuardian:
             self._save_state()
 
         # ── Compute risk metrics ──────────────────────────────────────────────
-        day_open   = self._day_open_balance
-        daily_pnl  = balance - day_open
-        daily_pct  = (daily_pnl / day_open * 100) if day_open > 0 else 0.0
-        drawdown   = ((self._equity_peak - equity) / self._equity_peak * 100
-                      if self._equity_peak > 0 else 0.0)
+        day_open = self._day_open_balance
+        raw_daily_pnl = balance - day_open
+        baseline = self._active_manual_reset_baseline()
+        if baseline:
+            # Ignore losses realized before the operator's reset, but keep the
+            # configured percentage limit and measure new losses from reset-time
+            # balance. The baseline is persisted so a process restart cannot
+            # resurrect the already-cleared loss.
+            daily_pnl = raw_daily_pnl - float(baseline["realized_day_pnl"])
+            baseline_balance = float(baseline["balance"])
+            daily_pct = (daily_pnl / baseline_balance * 100) if baseline_balance > 0 else 0.0
+        else:
+            daily_pnl = raw_daily_pnl
+            daily_pct = (daily_pnl / day_open * 100) if day_open > 0 else 0.0
+        drawdown = ((self._equity_peak - equity) / self._equity_peak * 100
+                    if self._equity_peak > 0 else 0.0)
+
+        if baseline:
+            log.info(
+                "🛡️  Manual-reset baseline active — "
+                f"effective day PnL={daily_pnl:+.2f} ({daily_pct:+.3f}%) "
+                f"vs daily-loss limit={self._daily_loss_limit_pct:.2f}%; "
+                f"drawdown={drawdown:.3f}% vs max-drawdown limit="
+                f"{self._max_drawdown_pct:.2f}%"
+            )
 
         # ── Evaluate circuit breakers (only once — halt is sticky) ────────────
         if not self._halted:
 
             # Layer 1 — Daily loss limit
-            if daily_pct <= -self._daily_loss_limit_pct:
+            # Tiny tolerance makes an exact configured percentage threshold
+            # robust to binary floating-point rounding (e.g. 3% of 9502).
+            if daily_pct <= -self._daily_loss_limit_pct + 1e-9:
                 self._trigger(
                     f"🚨 DAILY LOSS LIMIT — "
                     f"day PnL={daily_pnl:+.2f} ({daily_pct:+.2f}%)  "
@@ -163,7 +188,7 @@ class RiskGuardian:
                 )
 
             # Layer 2 — Peak drawdown
-            elif drawdown >= self._max_drawdown_pct:
+            elif drawdown >= self._max_drawdown_pct - 1e-9:
                 self._trigger(
                     f"🚨 MAX DRAWDOWN STOP — "
                     f"drawdown={drawdown:.2f}%  "
@@ -185,38 +210,89 @@ class RiskGuardian:
             drawdown_pct = drawdown,
         )
 
-    def reset_halt(self, *, reset_daily_baseline: bool = False,
-                   current_balance: float | None = None) -> bool:
-        """
-        Manually clear a halt.
-        Exposed to Telegram panel via /reset_guardian command.
-        Use with caution — understand WHY the halt triggered first.
+    def reset_halt(
+        self,
+        *,
+        current_balance: float | None = None,
+        current_equity: float | None = None,
+        request_id: str = "",
+    ) -> bool:
+        """Clear an active halt and rebase current-day loss/drawdown checks.
 
-        When ``reset_daily_baseline`` is requested, ``current_balance`` must
-        be a positive live account balance.  This intentionally resets only
-        the UTC-day loss window; the session equity high-water mark is kept so
-        the max-drawdown circuit breaker remains effective.
+        A reset is accepted only while halted and with a valid live account
+        snapshot. Duplicate request IDs and resets while running are no-ops.
         """
-        if reset_daily_baseline:
-            if current_balance is None or current_balance <= 0:
-                log.warning(
-                    "🛡️  Daily baseline reset rejected — "
-                    "live balance is unavailable or invalid"
+        request_id = str(request_id or "")
+        existing = self._manual_reset_baseline or {}
+        if request_id and request_id == str(existing.get("request_id") or ""):
+            log.info(
+                "🛡️  Duplicate Guardian reset ignored — "
+                f"request_id={request_id} was already applied"
+            )
+            return False
+        if not self._halted:
+            log.info("🛡️  Guardian reset ignored — Guardian is not halted")
+            return False
+        if not self._initialized:
+            log.warning("🛡️  Guardian reset rejected — Guardian is not initialized")
+            return False
+        try:
+            balance = float(current_balance)
+            equity = float(current_equity)
+        except (TypeError, ValueError):
+            log.warning(
+                "🛡️  Guardian reset rejected — live balance/equity is "
+                "unavailable or invalid"
+            )
+            return False
+        if balance <= 0 or equity <= 0:
+            log.warning(
+                "🛡️  Guardian reset rejected — live balance/equity is "
+                "unavailable or invalid"
+            )
+            return False
+
+        today = datetime.now(timezone.utc).date()
+        if self._last_day is None or today > self._last_day:
+            self._maybe_day_reset(balance)
+            if not self._halted:
+                log.info(
+                    "🛡️  Guardian reset ignored — the daily halt cleared "
+                    "automatically at UTC rollover"
                 )
                 return False
-            self._day_open_balance = float(current_balance)
-            self._last_day = datetime.now(timezone.utc).date()
-            log.warning(
-                "🛡️  Daily loss baseline RESET to current balance "
-                f"{self._day_open_balance:.2f}"
-            )
+
+        previous_reason = self._halt_reason or "none"
+        previous_peak = self._equity_peak
+        baseline = {
+            "reset_at": datetime.now(timezone.utc).isoformat(),
+            "trading_day": today.isoformat(),
+            "realized_day_pnl": balance - self._day_open_balance,
+            "balance": balance,
+            "equity": equity,
+            "equity_peak": equity,
+            "previous_equity_peak": previous_peak,
+            "request_id": request_id,
+        }
+        self._manual_reset_baseline = baseline
+        # Start the high-water mark at reset-time equity. Future gains may
+        # establish a new peak, but pre-reset peaks cannot immediately trip it.
+        self._equity_peak = equity
+        self._last_day = today
 
         log.warning(
-            "🛡️  Guardian halt MANUALLY CLEARED — "
-            "previous reason: " + (self._halt_reason or "none")
+            "🛡️  MANUAL RESET BASELINE SAVED — "
+            f"at={baseline['reset_at']} UTC day={baseline['trading_day']} "
+            f"realized_day_pnl={baseline['realized_day_pnl']:+.2f} "
+            f"balance={balance:.2f} equity={equity:.2f} "
+            f"equity_peak={equity:.2f} previous_peak={previous_peak:.2f}"
         )
-        self._halted       = False
-        self._halt_reason  = ""
+        log.warning(
+            "🛡️  Guardian halt MANUALLY CLEARED — previous reason: "
+            + previous_reason
+        )
+        self._halted = False
+        self._halt_reason = ""
         self._triggered_at = None
         self._halt_log_count = 0
         self._save_state()
@@ -286,6 +362,36 @@ class RiskGuardian:
             except Exception:
                 self._last_day = None
 
+        self._manual_reset_baseline = None
+        saved_baseline = data.get("manual_reset_baseline")
+        if isinstance(saved_baseline, dict):
+            try:
+                baseline_day = date.fromisoformat(str(saved_baseline.get("trading_day", "")))
+                baseline = {
+                    "reset_at": str(saved_baseline.get("reset_at", "")),
+                    "trading_day": baseline_day.isoformat(),
+                    "realized_day_pnl": float(saved_baseline["realized_day_pnl"]),
+                    "balance": float(saved_baseline["balance"]),
+                    "equity": float(saved_baseline["equity"]),
+                    "equity_peak": float(saved_baseline["equity_peak"]),
+                    "previous_equity_peak": float(saved_baseline.get("previous_equity_peak", 0.0)),
+                    "request_id": str(saved_baseline.get("request_id") or ""),
+                }
+                if (self._last_day == baseline_day and baseline["reset_at"]
+                        and baseline["balance"] > 0 and baseline["equity"] > 0
+                        and baseline["equity_peak"] > 0):
+                    self._manual_reset_baseline = baseline
+                    log.info(
+                        "🛡️  Manual-reset baseline RESTORED — "
+                        f"day={baseline['trading_day']} "
+                        f"realized_day_pnl={baseline['realized_day_pnl']:+.2f} "
+                        f"balance={baseline['balance']:.2f} "
+                        f"equity/peak={baseline['equity']:.2f}/"
+                        f"{baseline['equity_peak']:.2f}"
+                    )
+            except (KeyError, TypeError, ValueError):
+                log.warning("🛡️  Invalid manual-reset baseline discarded")
+
         # Restore risk limits if they were saved (UPDATE_RISK via panel persists
         # these). An explicitly configured environment value takes precedence,
         # so an operator can intentionally change a limit in Render without a
@@ -320,6 +426,12 @@ class RiskGuardian:
         return True
 
     @property
+    def manual_reset_baseline(self) -> Optional[dict]:
+        """A copy of the active reset baseline, if one is in effect today."""
+        baseline = self._active_manual_reset_baseline()
+        return dict(baseline) if baseline else None
+
+    @property
     def is_halted(self) -> bool:
         return self._halted
 
@@ -346,6 +458,9 @@ class RiskGuardian:
                 f"🌅 UTC day rollover — resetting daily loss counter.  "
                 f"Previous day balance: {self._day_open_balance:.2f} → now: {balance:.2f}"
             )
+            if self._manual_reset_baseline is not None:
+                log.info("🛡️  Manual-reset baseline expired at UTC day rollover")
+                self._manual_reset_baseline = None
             self._day_open_balance = balance
             self._last_day         = today
 
@@ -358,6 +473,18 @@ class RiskGuardian:
                 self._halt_log_count = 0
 
             self._save_state()
+
+    def _active_manual_reset_baseline(self) -> Optional[dict]:
+        baseline = self._manual_reset_baseline
+        if baseline is None:
+            return None
+        today = datetime.now(timezone.utc).date().isoformat()
+        if baseline.get("trading_day") != today:
+            self._manual_reset_baseline = None
+            log.info("🛡️  Manual-reset baseline expired — trading day changed")
+            self._save_state()
+            return None
+        return baseline
 
     def _save_state(self) -> None:
         """Persist current Guardian state to Redis and disk.
@@ -375,6 +502,10 @@ class RiskGuardian:
             "session_open_balance": self._session_open_balance,
             "day_open_balance":     self._day_open_balance,
             "last_day":             self._last_day.isoformat() if self._last_day else None,
+            "manual_reset_baseline": (
+                dict(self._manual_reset_baseline)
+                if self._manual_reset_baseline else None
+            ),
             "written_at":           datetime.now(timezone.utc).isoformat(),
             # Account identity — lets restore_state() reject foreign-account state
             "account_login":        self._account_login,
