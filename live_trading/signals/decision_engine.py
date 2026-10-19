@@ -30,6 +30,7 @@ from live_trading.risk.capital_manager import (
 )
 from live_trading.trading.active_entry_policy import (
     ACTIVE_ENTRY_STRATEGY,
+    _pa_has_structural_confirmation,
     evaluate_active_entry,
 )
 from live_trading.config import (
@@ -285,6 +286,41 @@ def _range_confirmation_gate(
     return True, ""
 
 
+def _range_trend_breakout_block_reason(
+    direction: str,
+    trend: TrendResult,
+    pa: PriceActionResult,
+    entry_filter: EntryFilterResult,
+) -> Optional[str]:
+    """Require the active Trend-breakout strategy, not the range playbook.
+
+    A RANGE label can be assigned before an expansion breakout has raised
+    ADX.  In that case the breakout remains eligible only when Trend and
+    structurally confirmed Price Action agree.  Range-reversion sweep and
+    reversal checks are diagnostic context, not authorization for this
+    strategy.
+    """
+    direction = str(direction).upper().strip()
+    trend_direction = (
+        "BUY" if str(getattr(trend, "trend", "")).upper() == "BULLISH"
+        else "SELL" if str(getattr(trend, "trend", "")).upper() == "BEARISH"
+        else "NEUTRAL"
+    )
+    if not bool(getattr(entry_filter, "trend", False)) or trend_direction != direction:
+        return "RANGE breakout blocked: aligned Trend confirmation is required"
+    if (
+        not bool(getattr(entry_filter, "price_action", False))
+        or str(getattr(pa, "pa_signal", "")).upper() != direction
+    ):
+        return "RANGE breakout blocked: same-direction Price Action confirmation is required"
+    if not _pa_has_structural_confirmation(pa, direction):
+        return (
+            "RANGE breakout blocked: closed breakout, inside-bar breakout, "
+            "or pullback/reclaim confirmation is required"
+        )
+    return None
+
+
 @dataclass
 class DecisionResult:
     allowed:         bool
@@ -314,6 +350,7 @@ class DecisionResult:
     effective_min_confirmations: Optional[int]   = None
     regime_strength: str                         = ""
     policy_regime: str                           = ""
+    minimum_rr: Optional[float]                  = None
 
 
 def _candidate_direction(
@@ -561,8 +598,10 @@ def run_decision_engine(
             candles=candles,
         )
 
-    # RANGE is a separate playbook. It must never inherit a trend entry just
-    # because the generic four-engine vote happened to pass.
+    # RANGE is a regime label, not permission to switch from the active
+    # volatility-expansion Trend Breakout strategy to a range-reversion
+    # strategy. Keep the range measurements for stop/target context and
+    # telemetry, but authorize only aligned Trend + structural Price Action.
     range_context: Optional[RangeContext] = None
     if is_range_regime:
         if not range_trading_enabled:
@@ -586,17 +625,34 @@ def run_decision_engine(
             strict_filters=range_entry_filters_enabled,
             require_edge_position=range_require_edge_position,
         )
-        if not range_context.valid:
+        range_breakout_reason = _range_trend_breakout_block_reason(
+            candidate,
+            trend,
+            pa,
+            ef,
+        )
+        if range_breakout_reason is not None:
+            range_context.valid = False
+            range_context.direction = "NEUTRAL"
+            range_context.reason = range_breakout_reason
             return _make_neutral(
                 smc, wyckoff, pa, trend,
-                [range_context.reason],
-                [range_context.reason],
+                [range_breakout_reason],
+                [range_breakout_reason],
                 range_context=range_context,
                 regime_result=regime,
                 entry_filter=ef,
                 direction=candidate,
                 candles=candles,
             )
+        # A valid active-strategy breakout is not vetoed for lacking a
+        # range-reversion liquidity sweep or reversal candle.
+        range_context.valid = True
+        range_context.direction = candidate
+        range_context.reason = (
+            "RANGE breakout accepted: aligned Trend + structural Price Action; "
+            "liquidity sweep and range-reversal checks are diagnostic only"
+        )
 
     if candidate == "BUY"  and not regime.rules.allow_long:
         return _make_neutral(smc, wyckoff, pa, trend,
@@ -856,6 +912,7 @@ def run_decision_engine(
         effective_min_confirmations=effective_min_confirmations,
         regime_strength=effective_regime_strength,
         policy_regime=policy_regime,
+        minimum_rr=required_rr,
     )
     active_entry = evaluate_active_entry(
         permitted_decision,

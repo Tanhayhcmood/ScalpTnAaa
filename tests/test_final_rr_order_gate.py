@@ -138,11 +138,11 @@ async def test_valid_initial_rr_invalid_after_rebase_blocks_order(monkeypatch):
         1.0,
     )
 
-    assert decision.trade_params.risk_reward_ratio == 1.49
+    assert decision.trade_params.risk_reward_ratio == 1.42
     assert result is None
     assert positions == []
     assert stage == "FINAL_RR_BELOW_REGIME_MINIMUM"
-    assert "Final R:R 1.49 < 1.50" in reason
+    assert "Final R:R 1.42 < 1.50" in reason
     assert order_calls == []
 
 
@@ -166,7 +166,58 @@ async def test_valid_final_rr_allows_order(monkeypatch):
     assert positions == []
     assert stage == ""
     assert reason == ""
-    assert decision.trade_params.risk_reward_ratio == 1.99
+    assert decision.trade_params.risk_reward_ratio == 1.90
+    assert len(order_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_final_rr_uses_actual_executable_entry_including_spread(monkeypatch):
+    order_calls = []
+    _patch_order_dependencies(monkeypatch, order_calls)
+    robot = GoldScalperLive()
+    decision = _decision(1.52)
+
+    result, positions, stage, reason = await robot._safe_entry_order(
+        decision,
+        (ACTIVE_STRATEGY_SLOT,),
+        "5m",
+        datetime(2026, 9, 25, tzinfo=timezone.utc),
+        1.0,
+    )
+
+    assert result is None
+    assert positions == []
+    assert stage == "FINAL_RR_BELOW_REGIME_MINIMUM"
+    assert decision.trade_params.risk_reward_ratio == 1.44
+    assert "Final R:R 1.44 < 1.50" in reason
+    assert order_calls == []
+
+
+@pytest.mark.asyncio
+async def test_range_uses_its_configured_minimum_rr_not_generic_range_rule(
+    monkeypatch,
+):
+    order_calls = []
+    _patch_order_dependencies(monkeypatch, order_calls)
+    robot = GoldScalperLive()
+    decision = _decision(1.6)
+    decision.regime = "RANGE"
+    decision.regime_rules = SimpleNamespace(min_rr=2.0, label="Range / Choppy")
+    decision.minimum_rr = 1.5
+
+    result, positions, stage, reason = await robot._safe_entry_order(
+        decision,
+        (ACTIVE_STRATEGY_SLOT,),
+        "5m",
+        datetime(2026, 9, 25, tzinfo=timezone.utc),
+        1.0,
+    )
+
+    assert result is not None and result.success
+    assert positions == []
+    assert stage == ""
+    assert reason == ""
+    assert decision.trade_params.risk_reward_ratio == 1.52
     assert len(order_calls) == 1
 
 

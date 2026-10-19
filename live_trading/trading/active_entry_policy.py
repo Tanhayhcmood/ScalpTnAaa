@@ -181,17 +181,18 @@ def evaluate_active_entry(
         and direction == pa_direction
         and not trend_confirmed
     )
+    if pa_standalone_confirmed and not _pa_has_structural_confirmation(pa, direction):
+        return ActiveEntryPolicyResult(
+            False,
+            ACTIVE_ENTRY_STRATEGY,
+            f"{ACTIVE_ENTRY_STRATEGY} blocked: standalone Price Action "
+            "requires a closed breakout, inside-bar breakout, or "
+            "pullback/reclaim",
+        )
     counter_trend = (
         trend_direction in {"BUY", "SELL"}
         and trend_direction != direction
     )
-    if counter_trend and pa_standalone_confirmed:
-        # A single PA candle can signal a possible turn, but it is not enough
-        # to authorize a counter-trend trade in the Trend Breakout strategy.
-        # Preserve valid reversals when the existing PA engine confirms the
-        # structure with a close-confirmed breakout, inside-bar breakout, or
-        # pullback/reclaim.
-        pa_standalone_confirmed = _pa_has_structural_confirmation(pa, direction)
 
     if trend_direction != direction and not pa_standalone_confirmed:
         return ActiveEntryPolicyResult(

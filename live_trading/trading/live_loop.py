@@ -467,6 +467,27 @@ def _rebase_order_prices(
     }
 
 
+def _risk_reward_from_order_prices(
+    entry_price: object,
+    stop_loss: object,
+    take_profit: object,
+) -> Optional[float]:
+    """Calculate R:R from the exact executable entry, SL, and TP prices."""
+    try:
+        entry = float(entry_price)
+        stop = float(stop_loss)
+        target = float(take_profit)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not all(math.isfinite(value) and value > 0 for value in (entry, stop, target)):
+        return None
+    risk_distance = abs(entry - stop)
+    reward_distance = abs(target - entry)
+    if risk_distance <= 0 or reward_distance <= 0:
+        return None
+    return reward_distance / risk_distance
+
+
 def _history_value(record: dict, *keys: str):
     for key in keys:
         value = record.get(key)
@@ -3590,9 +3611,23 @@ class GoldScalperLive:
             tp_params.take_profit = rebased["take_profit"]
             tp_params.sl_distance_usd = round(rebased["sl_distance"], 2)
             tp_params.sl_distance_pips = round(rebased["sl_distance_pips"], 2)
-            final_rr = rebased["tp_distance"] / rebased["sl_distance"]
+            final_rr = _risk_reward_from_order_prices(
+                tp_params.entry_price,
+                tp_params.stop_loss,
+                tp_params.take_profit,
+            )
+            if final_rr is None:
+                return (
+                    None,
+                    confirm_dicts,
+                    "INVALID_REBASED_STOPS",
+                    "Could not calculate R:R from executable entry, stop-loss, and take-profit prices",
+                )
             tp_params.risk_reward_ratio = round(final_rr, 2)
-            minimum_rr = float(decision.regime_rules.min_rr)
+            minimum_rr = getattr(decision, "minimum_rr", None)
+            if minimum_rr is None:
+                minimum_rr = decision.regime_rules.min_rr
+            minimum_rr = float(minimum_rr)
             if final_rr + 1e-9 < minimum_rr:
                 reason = (
                     f"Final R:R {final_rr:.2f} < {minimum_rr:.2f} "

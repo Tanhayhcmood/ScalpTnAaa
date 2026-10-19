@@ -119,7 +119,7 @@ def test_countertrend_buy_from_candle_pattern_requires_structural_confirmation()
     )
 
     assert result.allowed is False
-    assert "structural Price Action confirmation is required" in result.reason
+    assert "standalone Price Action requires a closed breakout" in result.reason
 
 
 def test_countertrend_sell_from_candle_pattern_requires_structural_confirmation():
@@ -145,7 +145,32 @@ def test_countertrend_sell_from_candle_pattern_requires_structural_confirmation(
     )
 
     assert result.allowed is False
-    assert "structural Price Action confirmation is required" in result.reason
+    assert "standalone Price Action requires a closed breakout" in result.reason
+
+
+def test_standalone_price_action_requires_structure_even_when_trend_is_neutral():
+    result = evaluate_active_entry(
+        _decision(
+            trend=SimpleNamespace(trend="NEUTRAL"),
+            pa=SimpleNamespace(
+                pa_signal="BUY",
+                valid_bull_breakout=False,
+                bullish_inside_breakout=False,
+                bullish_pullback=False,
+            ),
+            entry_filter=SimpleNamespace(
+                trend=False,
+                price_action=True,
+                smc=False,
+                wyckoff=False,
+            ),
+        ),
+        symbol="XAUUSD",
+        timeframe="5m",
+    )
+
+    assert result.allowed is False
+    assert "standalone Price Action requires a closed breakout" in result.reason
 
 
 @pytest.mark.parametrize(

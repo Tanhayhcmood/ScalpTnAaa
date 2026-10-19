@@ -324,6 +324,8 @@ def test_live_loop_emits_one_new_bar_when_latest_closed_time_advances():
 
     first, unchanged, advanced = asyncio.run(run())
 
-    assert first == [("5m", previous_bar.replace(tzinfo=None))]
+    # A process restart establishes the latest closed bar as its baseline
+    # instead of replaying it; only the next completed bar is eligible.
+    assert first == []
     assert unchanged == []
     assert advanced == [("5m", current_bucket.replace(tzinfo=None))]

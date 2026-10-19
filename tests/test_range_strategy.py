@@ -111,7 +111,7 @@ def test_range_blocks_middle_of_range_even_with_confirmations():
     assert result.location == "MIDDLE"
 
 
-def test_range_edge_check_is_disabled_by_default():
+def test_disabling_range_edge_check_does_not_disable_strict_sweep_requirement():
     candles = _candles()
     candles[-1] = OHLCV(
         time=candles[-1].time,
@@ -124,16 +124,27 @@ def test_range_edge_check_is_disabled_by_default():
     result = evaluate_range_entry(
         candles, "BUY", _smc("BUY", 20), _pa(True), 1, 1
     )
-    assert result.valid
+    assert not result.valid
     assert result.location == "MIDDLE"
-    assert "edge check disabled" in result.reason
+    assert "no fresh same-direction Liquidity Sweep" in result.reason
 
-def test_range_blocks_stale_liquidity_sweep():
+
+def test_range_sweep_telemetry_uses_fresh_candle_data_not_smc_event_age():
+    candles = _candles()
+    candles[-1] = OHLCV(
+        time=candles[-1].time,
+        open=101.5,
+        high=102.1,
+        low=100.2,
+        close=101.8,
+        volume=150.0,
+    )
     result = evaluate_range_entry(
-        _candles(), "BUY", _smc("BUY", 10), _pa(True), 2, 2
+        candles, "BUY", _smc("BUY", 10), _pa(True), 2, 2
     )
     assert not result.valid
-    assert "Liquidity Sweep" in result.reason
+    assert not result.liquidity_sweep
+    assert "no fresh same-direction Liquidity Sweep" in result.reason
 
 
 def test_relaxed_range_filters_keep_context_without_blocking():
