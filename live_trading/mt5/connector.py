@@ -29,6 +29,7 @@ import asyncio
 import json
 import math
 import time as _time
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote, quote_plus
@@ -38,7 +39,7 @@ import aiohttp
 from live_trading.config import (
     MTAPI_URL, MT5_HOST, MT5_PORT,
     MT5_USER, MT5_PASSWORD,
-    SYNC_TIMEOUT,
+    SYNC_TIMEOUT, XAUUSD_TICK_SIZE,
 )
 from live_trading.signals.gold_engine import OHLCV
 from live_trading.logger import get_logger
@@ -73,6 +74,11 @@ _MT5_KEEPALIVE_INTERVAL_S: float = 180.0
 _MT5_SESSION_REFRESH_AGE_S: float = 14400.0
 _CANDLE_FETCH_CONNECT_TIMEOUT_S: float = 30.0
 _CANDLE_FETCH_HTTP_TIMEOUT_S: float = 60.0
+_SYMBOL_PARAMS_RETRY_ATTEMPTS = 3
+_SYMBOL_PARAMS_RETRY_DELAY_S = 0.5
+_SYMBOL_TICK_SIZE_CACHE: dict[str, float] = {}
+
+
 def _connect_params(
     user: str,
     password: str,
@@ -1422,46 +1428,330 @@ async def get_current_quote(symbol: str) -> dict:
     return {}
 
 
-async def get_symbol_params(symbol: str) -> dict:
-    """Fetch broker-provided symbol trading constraints from MTAPI.
+def _positive_symbol_number(value: object) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
 
-    MTAPI's ``/SymbolParams`` response contains ``symbolInfo`` (digits,
-    point/tick size) and ``symbolGroup``.  The latter exposes the broker's
-    minimum SL/TP distances as ``sl`` and ``tp`` points on current MTAPI
-    versions; newer versions may also expose explicit stops/freeze-level
-    fields.  Keep the raw response so callers can handle both shapes without
-    inventing broker defaults.
-    """
-    for attempt in range(2):
-        if not _conn_id and not await ensure_connected():
-            return {}
+
+def _symbol_params_payload(data: object, symbol: str) -> Optional[dict]:
+    """Unwrap the documented object plus common API envelope/list variants."""
+    if isinstance(data, list):
+        rows = [row for row in data if isinstance(row, dict)]
+        wanted = symbol.strip().casefold()
+        matching = [
+            row for row in rows
+            if str(_field_value(row, "symbol", "name") or "").strip().casefold()
+            == wanted
+        ]
+        if matching:
+            data = matching[0]
+        elif len(rows) == 1 and not _field_value(rows[0], "symbol", "name"):
+            data = rows[0]
+        else:
+            return None
+    if not isinstance(data, dict):
+        return None
+
+    # Some MTAPI bridges wrap their result; the official SymbolParams contract
+    # is the unwrapped {symbol, symbolInfo, symbolGroup} object.
+    current = data
+    for _ in range(4):
+        nested = _field_value(
+            current, "data", "result", "symbolParams", "symbol_parameters",
+            "payload",
+        )
+        if isinstance(nested, list):
+            return _symbol_params_payload(nested, symbol)
+        if not isinstance(nested, dict) or nested is current:
+            break
+        current = nested
+    return current
+
+
+def _canonical_symbol_fields(source: object) -> dict:
+    """Copy broker aliases into stable MT5-style names without dropping fields."""
+    if not isinstance(source, dict):
+        return {}
+    result = dict(source)
+    aliases = {
+        "tickSize": (
+            "tickSize", "tick_size", "tradeTickSize", "trade_tick_size",
+            "minPriceIncrement", "priceStep",
+        ),
+        "tickValue": (
+            "tickValue", "tick_value", "tradeTickValue", "trade_tick_value",
+            "tickValueLoss", "tick_value_loss", "tradeTickValueLoss",
+        ),
+        "tickValueCurrency": (
+            "tickValueCurrency", "tick_value_currency",
+            "tradeTickValueCurrency", "trade_tick_value_currency",
+        ),
+        "contractSize": (
+            "contractSize", "contract_size", "tradeContractSize",
+        ),
+        "currencyProfit": (
+            "currencyProfit", "currency_profit", "profitCurrency",
+            "profit_currency",
+        ),
+        "digits": ("digits", "precision", "priceDigits", "decimalPlaces"),
+        "points": ("points", "point", "pointSize", "pricePoint"),
+        "volumeMin": ("volumeMin", "volume_min", "minVolume", "min_volume"),
+        "volumeStep": (
+            "volumeStep", "volume_step", "volumeIncrement", "volume_increment",
+        ),
+        "volumeMax": ("volumeMax", "volume_max", "maxVolume", "max_volume"),
+    }
+    for canonical, names in aliases.items():
+        value = _field_value(source, *names)
+        if value is not None:
+            result[canonical] = value
+    return result
+
+
+def _normalize_symbol_params(data: object, symbol: str) -> dict:
+    """Normalize MTAPI's SymbolParams and common casing/envelope variants."""
+    root = _symbol_params_payload(data, symbol)
+    if root is None:
+        return {}
+
+    info = _field_value(
+        root, "symbolInfo", "symbol_info", "info", "symbolDetails",
+        "symbol_details",
+    )
+    group = _field_value(root, "symbolGroup", "symbol_group", "group")
+    if not isinstance(info, dict):
+        # A bridge may return the symbol's fields directly instead of nesting
+        # them under symbolInfo.
+        info = root
+
+    normalized = dict(root)
+    normalized["symbol"] = str(
+        _field_value(root, "symbol", "name") or symbol
+    ).strip()
+    normalized["symbolInfo"] = _canonical_symbol_fields(info)
+    normalized["symbolGroup"] = _canonical_symbol_fields(group)
+    # Preserve a top-level form too; the risk parser supports both layouts.
+    normalized = _canonical_symbol_fields(normalized)
+    return normalized
+
+
+def _symbol_tick_size(symbol_params: dict) -> Optional[float]:
+    for mapping in (
+        symbol_params.get("symbolInfo"),
+        symbol_params,
+        symbol_params.get("symbolGroup"),
+    ):
+        if not isinstance(mapping, dict):
+            continue
+        value = _field_value(
+            mapping, "tickSize", "tick_size", "tradeTickSize",
+            "trade_tick_size", "minPriceIncrement", "priceStep",
+        )
+        number = _positive_symbol_number(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _decimal_places(value: object) -> Optional[int]:
+    try:
+        exponent = Decimal(str(value)).normalize().as_tuple().exponent
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return max(0, -exponent)
+
+
+def _with_tick_size(
+    symbol_params: dict,
+    symbol: str,
+    tick_size: float,
+    source: str,
+    *,
+    fetched_from_broker: bool,
+) -> dict:
+    """Attach a verified/fallback tick size and usable point precision."""
+    result = dict(symbol_params)
+    info = dict(result.get("symbolInfo") or {})
+    info["tickSize"] = tick_size
+
+    point = _positive_symbol_number(
+        _field_value(info, "points", "point", "pointSize", "pricePoint")
+    )
+    digits_raw = _field_value(
+        info, "digits", "precision", "priceDigits", "decimalPlaces"
+    )
+    digits: Optional[int] = None
+    if digits_raw is not None and not isinstance(digits_raw, bool):
         try:
+            parsed_digits = float(digits_raw)
+            if math.isfinite(parsed_digits) and 0 <= parsed_digits <= 12:
+                digits = int(parsed_digits)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    if digits is None:
+        digits = _decimal_places(point if point is not None else tick_size)
+    if digits is None:
+        digits = 2
+    if point is None:
+        point = 10 ** (-digits)
+
+    info["points"] = point
+    info["digits"] = digits
+    result["symbolInfo"] = info
+    result["symbol"] = str(result.get("symbol") or symbol)
+    result["_tick_size_source"] = source
+    result["_symbol_params_fetch_ok"] = fetched_from_broker
+    return result
+
+
+def _is_xauusd_symbol(symbol: str) -> bool:
+    # Broker suffixes such as XAUUSDb and XAUUSD.a are common.
+    return symbol.strip().upper().startswith("XAUUSD")
+
+
+async def get_symbol_params(symbol: str) -> dict:
+    """Fetch and normalize broker metadata, with explicit tick-size fallbacks.
+
+    MTAPI documents /SymbolParams as GET with query fields ``id`` and
+    ``symbol``. Its normal response is {symbol, symbolInfo, symbolGroup}; error
+    responses may use HTTP 201, so only HTTP 200 is considered successful.
+    """
+    endpoint = f"{_base_url.rstrip('/')}/SymbolParams"
+    request_description = (
+        f"GET {endpoint} params={{'id': '[REDACTED]', 'symbol': {symbol!r}}}"
+    )
+    cache_key = symbol.strip().upper()
+    last_params: dict = {}
+    last_failure = "no response"
+
+    for attempt in range(1, _SYMBOL_PARAMS_RETRY_ATTEMPTS + 1):
+        status: object = "unavailable"
+        raw_body = ""
+        try:
+            if not _conn_id and not await ensure_connected():
+                raise RuntimeError("no active MTAPI session")
             async with _get_session().get(
-                f"{_base_url}/SymbolParams",
+                endpoint,
                 params={"id": _conn_id, "symbol": symbol},
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as resp:
-                data = await resp.json(content_type=None)
-                if (
-                    resp.status < 400
-                    and isinstance(data, dict)
-                    and not _is_error_quote(data)
-                ):
-                    return data
-                if attempt == 0:
-                    _invalidate_connection()
-                    continue
-                return {}
-        except Exception as exc:
-            if attempt == 0:
-                _invalidate_connection()
-                continue
-            log.warning(
-                "get_symbol_params error after reconnect: %s",
-                _redact_candle_diagnostic(exc),
+                status = resp.status
+                raw_body = await resp.text()
+            data: object = None
+            parse_error = ""
+            try:
+                data = json.loads(raw_body) if raw_body.strip() else None
+            except (TypeError, ValueError) as exc:
+                parse_error = f"invalid JSON ({type(exc).__name__})"
+
+            normalized = _normalize_symbol_params(data, symbol)
+            tick_size = _symbol_tick_size(normalized)
+            is_error_payload = (
+                isinstance(data, dict)
+                and (
+                    _is_error_quote(data)
+                    or _field_value(data, "error", "exception", "stackTrace")
+                    is not None
+                )
             )
-            return {}
-    return {}
+            if status == 200 and normalized and tick_size is not None and not is_error_payload:
+                _SYMBOL_TICK_SIZE_CACHE[cache_key] = tick_size
+                loaded = _with_tick_size(
+                    normalized,
+                    symbol,
+                    tick_size,
+                    "broker",
+                    fetched_from_broker=True,
+                )
+                log.debug(
+                    "MTAPI SymbolParams loaded symbol=%s tick_size=%s",
+                    symbol,
+                    tick_size,
+                )
+                return loaded
+
+            if normalized:
+                last_params = normalized
+            if status != 200:
+                last_failure = f"HTTP {status}"
+            elif parse_error:
+                last_failure = parse_error
+            elif is_error_payload:
+                last_failure = "error payload"
+            elif not normalized:
+                last_failure = "empty or unsupported response shape"
+            else:
+                last_failure = "tick size field missing, empty, or invalid"
+        except Exception as exc:
+            last_failure = f"{type(exc).__name__}: {_redact_candle_diagnostic(exc, limit=200)}"
+            # The request did not yield a response. The empty body and
+            # unavailable status are still included in the failure diagnostic.
+
+        log.warning(
+            "MTAPI SymbolParams tick-size lookup failed request=%s status=%s "
+            "body=%s reason=%s attempt=%d/%d",
+            request_description,
+            status,
+            _redact_candle_diagnostic(raw_body, limit=500),
+            last_failure,
+            attempt,
+            _SYMBOL_PARAMS_RETRY_ATTEMPTS,
+        )
+
+        # Prefer a previously broker-verified tick size over a guessed value.
+        cached_tick_size = _SYMBOL_TICK_SIZE_CACHE.get(cache_key)
+        if cached_tick_size is not None:
+            log.warning(
+                "MTAPI SymbolParams fallback=cache symbol=%s tick_size=%s "
+                "(last successfully fetched broker value)",
+                symbol,
+                cached_tick_size,
+            )
+            return _with_tick_size(
+                last_params,
+                symbol,
+                cached_tick_size,
+                "cache",
+                fetched_from_broker=False,
+            )
+
+        if attempt < _SYMBOL_PARAMS_RETRY_ATTEMPTS:
+            await asyncio.sleep(_SYMBOL_PARAMS_RETRY_DELAY_S)
+
+    if _is_xauusd_symbol(symbol):
+        log.error(
+            "MTAPI SymbolParams unavailable for XAUUSD after %d attempts; "
+            "using configured fallback XAUUSD_TICK_SIZE=%s symbol=%s",
+            _SYMBOL_PARAMS_RETRY_ATTEMPTS,
+            XAUUSD_TICK_SIZE,
+            symbol,
+        )
+        log.warning(
+            "MTAPI SymbolParams fallback=configured_env symbol=%s "
+            "tick_size=%s source=XAUUSD_TICK_SIZE",
+            symbol,
+            XAUUSD_TICK_SIZE,
+        )
+        return _with_tick_size(
+            last_params,
+            symbol,
+            XAUUSD_TICK_SIZE,
+            "env:XAUUSD_TICK_SIZE",
+            fetched_from_broker=False,
+        )
+
+    log.error(
+        "MTAPI SymbolParams tick size unavailable for symbol=%s after %d attempts; "
+        "no symbol-specific configured fallback exists",
+        symbol,
+        _SYMBOL_PARAMS_RETRY_ATTEMPTS,
+    )
+    return last_params
 
 
 def _is_error_quote(data: dict) -> bool:

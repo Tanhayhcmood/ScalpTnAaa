@@ -232,6 +232,16 @@ METAAPI_ACCOUNT_ID = ""
 
 # ── Symbol & Timeframe ───────────────────────────────────────────────────────
 SYMBOL        = os.getenv("SYMBOL", "XAUUSD")
+# Explicit final fallback for XAUUSD when MTAPI omits the broker tick size.
+# Keep this visible/configurable rather than silently assuming a price step.
+XAUUSD_TICK_SIZE = _float("XAUUSD_TICK_SIZE", 0.01, lo=0.00000001, hi=10.0)
+if not (0 < XAUUSD_TICK_SIZE <= 10.0):
+    print(
+        "ERROR: XAUUSD_TICK_SIZE must be finite and between 0 and 10. "
+        "Fix it in the Render dashboard and redeploy.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 TIMEFRAME     = _timeframe("TIMEFRAME", "5m")
 CANDLE_WINDOW = _int("CANDLE_WINDOW", 300, lo=50, hi=5000)
 # Stop-loss volatility is intentionally independent from the signal timeframe.

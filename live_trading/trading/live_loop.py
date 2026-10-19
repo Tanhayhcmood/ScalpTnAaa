@@ -761,19 +761,28 @@ class GoldScalperLive:
             symbol_info = symbol_params.get("symbolInfo")
             if not isinstance(symbol_info, dict):
                 symbol_info = {}
+            tick_size_source = symbol_params.get("_tick_size_source", "unknown")
+            if not symbol_params.get("_symbol_params_fetch_ok", False):
+                log.error(
+                    "MTAPI startup SymbolParams check failed for symbol=%s; "
+                    "continuing with explicit tick-size fallback source=%s",
+                    SYMBOL,
+                    tick_size_source,
+                )
             log.info(
-                "MTAPI symbol parameters confirmed symbol=%s digits=%s "
-                "points=%s tickSize=%s contractSize=%s",
+                "MTAPI symbol info at startup: symbol=%s tick_size=%s "
+                "source=%s digits=%s point=%s contract_size=%s",
                 SYMBOL,
+                symbol_info.get("tickSize"),
+                tick_size_source,
                 symbol_info.get("digits"),
                 symbol_info.get("points"),
-                symbol_info.get("tickSize"),
                 symbol_info.get("contractSize"),
             )
         else:
-            log.warning(
-                "MTAPI returned no SymbolParams for resolved symbol=%s; "
-                "order-time broker validation will still be required",
+            log.error(
+                "MTAPI startup SymbolParams check failed for resolved symbol=%s; "
+                "no valid tick-size metadata or fallback is available",
                 SYMBOL,
             )
 
