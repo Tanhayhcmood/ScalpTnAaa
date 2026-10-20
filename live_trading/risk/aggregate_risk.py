@@ -7,11 +7,17 @@ closed rather than guessing a conversion rate.
 """
 
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_FLOOR
 import json
 import math
 from typing import Iterable, Mapping, Optional
 
 from live_trading.logger import get_logger
+from live_trading.mt5.volume_units import (
+    configured_mtapi_volume_scale,
+    extended_volume_to_lots,
+    volume_constraint_sanity_error,
+)
 
 
 log = get_logger()
@@ -45,6 +51,10 @@ class SymbolRiskSpec:
     volume_max_source: str = "unknown"
     symbol: str = ""
     raw_symbol_fields: Optional[Mapping[str, Mapping[str, object]]] = None
+    volume_scale: float = 1.0
+    volume_min_raw: Optional[object] = None
+    volume_step_raw: Optional[object] = None
+    volume_max_raw: Optional[object] = None
 
 
 @dataclass(frozen=True)
@@ -89,26 +99,113 @@ def _currency(mappings: Iterable[object], *keys: str) -> str:
 
 def _volume_constraint(
     mappings: Iterable[object],
-    default: float,
-    *keys: str,
-) -> tuple[float, str]:
+    *,
+    field_name: str,
+    aliases: tuple[str, ...],
+    scale: float,
+    values_are_lots: bool,
+    raw_symbol_fields: Optional[Mapping[str, Mapping[str, object]]] = None,
+) -> tuple[float, str, object]:
+    def raw_value_for_field() -> Optional[object]:
+        if not isinstance(raw_symbol_fields, Mapping):
+            return None
+        for section in ("symbolInfo", "root", "symbolGroup"):
+            source = raw_symbol_fields.get(section)
+            if not isinstance(source, Mapping):
+                continue
+            for alias in aliases:
+                if alias in source and source[alias] is not None:
+                    return source[alias]
+        return None
+
     for mapping in mappings:
         if not isinstance(mapping, Mapping):
             continue
-        for key in keys:
+        for key in aliases:
             if key not in mapping or mapping[key] is None or mapping[key] == "":
                 continue
             value = mapping[key]
             if isinstance(value, bool):
-                raise RiskCalculationError(f"Broker {key} is invalid")
+                log.error(
+                    "MTAPI_VOLUME_SANITY_ERROR field=%s raw=%r scale=%g "
+                    "lots=n/a reason=boolean volume value",
+                    field_name,
+                    value,
+                    scale,
+                )
+                raise RiskCalculationError(f"Broker {field_name} is invalid")
             try:
-                number = float(value)
+                raw_number = float(value)
             except (TypeError, ValueError) as exc:
-                raise RiskCalculationError(f"Broker {key} is invalid") from exc
-            if not math.isfinite(number) or number <= 0:
-                raise RiskCalculationError(f"Broker {key} must be finite and positive")
-            return number, key
-    return default, "default"
+                log.error(
+                    "MTAPI_VOLUME_SANITY_ERROR field=%s raw=%r scale=%g "
+                    "lots=n/a reason=volume value is invalid",
+                    field_name,
+                    value,
+                    scale,
+                )
+                raise RiskCalculationError(
+                    f"Broker {field_name} is invalid"
+                ) from exc
+            if not math.isfinite(raw_number):
+                log.error(
+                    "MTAPI_VOLUME_SANITY_ERROR field=%s raw=%r scale=%g "
+                    "lots=n/a reason=raw volume value is not finite",
+                    field_name,
+                    value,
+                    scale,
+                )
+                raise RiskCalculationError(
+                    f"Broker {field_name} must be finite"
+                )
+
+            if values_are_lots:
+                lots = raw_number
+                original_value = raw_value_for_field()
+                if original_value is None:
+                    original_value = value
+                    log_scale = 1.0
+                else:
+                    log_scale = scale
+            else:
+                original_value = value
+                log_scale = scale
+                try:
+                    lots = extended_volume_to_lots(value, scale)
+                except ValueError as exc:
+                    log.error(
+                        "MTAPI_VOLUME_SANITY_ERROR field=%s raw=%r scale=%g "
+                        "lots=n/a reason=%s",
+                        field_name,
+                        value,
+                        scale,
+                        exc,
+                    )
+                    raise RiskCalculationError(
+                        f"Broker {field_name} is invalid: {exc}"
+                    ) from exc
+
+            log.info(
+                "MTAPI_VOLUME_CONVERSION field=%s raw=%s scale=%s lots=%s",
+                field_name,
+                original_value,
+                f"{log_scale:g}",
+                f"{lots:g}",
+            )
+            if not math.isfinite(lots) or lots <= 0:
+                reason = (
+                    f"converted {field_name} must be finite and positive "
+                    f"(raw={original_value!r}, scale={log_scale:g}, lots={lots:g})"
+                )
+                log.error("MTAPI_VOLUME_SANITY_ERROR %s", reason)
+                raise RiskCalculationError(reason)
+            return lots, key, original_value
+
+    reason = (
+        f"Broker {field_name} is unavailable; refusing to guess a volume constraint"
+    )
+    log.error("MTAPI_VOLUME_SANITY_ERROR field=%s reason=%s", field_name, reason)
+    raise RiskCalculationError(reason)
 
 
 _RAW_SYMBOL_FIELD_NAMES = {
@@ -161,10 +258,61 @@ def build_symbol_risk_spec(
     account_ccy = str(account_currency or "").strip().upper()
     if not account_ccy:
         raise RiskCalculationError("Account currency is unavailable")
+    volume_units_error = symbol_params.get("_mtapi_volume_units_error")
+    if volume_units_error:
+        reason = str(volume_units_error)
+        log.error(
+            "MTAPI_VOLUME_SANITY_ERROR symbol=%s reason=%s",
+            symbol_params.get("symbol", "unknown"),
+            reason,
+        )
+        raise RiskCalculationError(
+            f"MTAPI volume metadata is invalid: {reason}"
+        )
+
+    volume_units = symbol_params.get("_mtapi_volume_units")
+    values_are_lots = volume_units == "lots"
+    if values_are_lots:
+        scale_value = symbol_params.get("_mtapi_volume_scale")
+        try:
+            volume_scale = float(scale_value)
+        except (TypeError, ValueError) as exc:
+            reason = "normalized MTAPI volume fields are missing their scale"
+            log.error("MTAPI_VOLUME_SANITY_ERROR symbol=%s reason=%s", symbol_params.get("symbol", "unknown"), reason)
+            raise RiskCalculationError(reason) from exc
+        if not math.isfinite(volume_scale) or volume_scale <= 0:
+            reason = "normalized MTAPI volume scale must be finite and positive"
+            log.error(
+                "MTAPI_VOLUME_SANITY_ERROR symbol=%s scale=%r reason=%s",
+                symbol_params.get("symbol", "unknown"),
+                scale_value,
+                reason,
+            )
+            raise RiskCalculationError(reason)
+    elif volume_units in (None, "extended"):
+        try:
+            volume_scale = configured_mtapi_volume_scale()
+        except ValueError as exc:
+            reason = str(exc)
+            log.error(
+                "MTAPI_VOLUME_SANITY_ERROR symbol=%s reason=%s",
+                symbol_params.get("symbol", "unknown"),
+                reason,
+            )
+            raise RiskCalculationError(reason) from exc
+    else:
+        reason = f"unknown MTAPI volume units marker: {volume_units!r}"
+        log.error(
+            "MTAPI_VOLUME_SANITY_ERROR symbol=%s reason=%s",
+            symbol_params.get("symbol", "unknown"),
+            reason,
+        )
+        raise RiskCalculationError(reason)
 
     info = symbol_params.get("symbolInfo")
     group = symbol_params.get("symbolGroup")
     mappings = (info, symbol_params, group)
+    raw_symbol_fields = _raw_symbol_field_snapshot(symbol_params)
     tick_size = _positive_number(
         mappings, "tickSize", "tick_size", "tradeTickSize", "trade_tick_size"
     )
@@ -230,22 +378,62 @@ def build_symbol_risk_spec(
             else "contract_size_same_currency"
         )
 
-    volume_min, volume_min_source = _volume_constraint(
-        mappings, 0.01, "volumeMin", "volume_min", "minVolume", "min_volume"
-    )
-    volume_step, volume_step_source = _volume_constraint(
+    volume_min, volume_min_source, volume_min_raw = _volume_constraint(
         mappings,
-        0.01,
-        "volumeStep",
-        "volume_step",
-        "volumeIncrement",
-        "volume_increment",
+        field_name="volumeMin",
+        aliases=("volumeMin", "volume_min", "minVolume", "min_volume"),
+        scale=volume_scale,
+        values_are_lots=values_are_lots,
+        raw_symbol_fields=raw_symbol_fields,
     )
-    volume_max, volume_max_source = _volume_constraint(
-        mappings, 50.0, "volumeMax", "volume_max", "maxVolume", "max_volume"
+    volume_step, volume_step_source, volume_step_raw = _volume_constraint(
+        mappings,
+        field_name="volumeStep",
+        aliases=(
+            "volumeStep",
+            "volume_step",
+            "volumeIncrement",
+            "volume_increment",
+        ),
+        scale=volume_scale,
+        values_are_lots=values_are_lots,
+        raw_symbol_fields=raw_symbol_fields,
     )
-    if volume_step <= 0 or volume_max < volume_min:
-        raise RiskCalculationError("Broker volume constraints are invalid")
+    volume_max, volume_max_source, volume_max_raw = _volume_constraint(
+        mappings,
+        field_name="volumeMax",
+        aliases=("volumeMax", "volume_max", "maxVolume", "max_volume"),
+        scale=volume_scale,
+        values_are_lots=values_are_lots,
+        raw_symbol_fields=raw_symbol_fields,
+    )
+    sanity_error = volume_constraint_sanity_error(
+        volume_min, volume_step, volume_max
+    )
+    if sanity_error:
+        log.error(
+            "MTAPI_VOLUME_SANITY_ERROR symbol=%s min_lots=%g step_lots=%g "
+            "max_lots=%g scale=%g reason=%s",
+            symbol_params.get("symbol", "unknown"),
+            volume_min,
+            volume_step,
+            volume_max,
+            volume_scale,
+            sanity_error,
+        )
+        raise RiskCalculationError(f"MTAPI volume sanity check failed: {sanity_error}")
+    if volume_max < volume_min:
+        reason = (
+            f"converted maximum lot {volume_max:g} is below minimum lot "
+            f"{volume_min:g}"
+        )
+        log.error(
+            "MTAPI_VOLUME_SANITY_ERROR symbol=%s scale=%g reason=%s",
+            symbol_params.get("symbol", "unknown"),
+            volume_scale,
+            reason,
+        )
+        raise RiskCalculationError(reason)
 
     return SymbolRiskSpec(
         tick_size=tick_size,
@@ -264,7 +452,11 @@ def build_symbol_risk_spec(
         volume_step_source=volume_step_source,
         volume_max_source=volume_max_source,
         symbol=symbol,
-        raw_symbol_fields=_raw_symbol_field_snapshot(symbol_params),
+        raw_symbol_fields=raw_symbol_fields,
+        volume_scale=volume_scale,
+        volume_min_raw=volume_min_raw,
+        volume_step_raw=volume_step_raw,
+        volume_max_raw=volume_max_raw,
     )
 
 
@@ -380,6 +572,9 @@ def size_order_for_aggregate_risk(
     minimum_lot_risk: Optional[float] = None
     status = "ERROR"
 
+    sized_lots: Optional[float] = None
+    sized_risk: Optional[float] = None
+
     def emit_guard_log() -> None:
         equity = account_equity if account_equity is not None else balance
         try:
@@ -401,9 +596,10 @@ def size_order_for_aggregate_risk(
             "PRE_ORDER_RISK_GUARD status=%s symbol=%s equity=%s "
             "budget_balance=%s risk_percent=%s total_budget=%s "
             "aggregate_budget=%s used_risk=%s remaining_budget=%s "
-            "sl_distance_price=%s volume_min=%s volume_min_source=%s "
-            "volume_step=%s volume_step_source=%s volume_max=%s "
-            "volume_max_source=%s raw_mtapi_fields=%s contract_size=%s "
+            "sl_distance_price=%s volume_min=%s volume_min_raw=%s "
+            "volume_min_source=%s volume_step=%s volume_step_raw=%s "
+            "volume_step_source=%s volume_max=%s volume_max_raw=%s "
+            "volume_max_source=%s volume_scale=%s raw_mtapi_fields=%s contract_size=%s "
             "tick_size=%s tick_size_source=%s tick_value_per_lot=%s "
             "tick_value_source=%s value_per_price_unit=%s "
             "formula=abs(entry-stop)/tick_size*tick_value_per_lot*lots "
@@ -419,11 +615,15 @@ def size_order_for_aggregate_risk(
             f"{risk_budget:.2f}" if risk_budget is not None else "n/a",
             f"{sl_distance:.6f}" if sl_distance is not None else "n/a",
             f"{spec.volume_min:g}",
+            spec.volume_min_raw,
             spec.volume_min_source,
             f"{spec.volume_step:g}",
+            spec.volume_step_raw,
             spec.volume_step_source,
             f"{spec.volume_max:g}",
+            spec.volume_max_raw,
             spec.volume_max_source,
+            f"{spec.volume_scale:g}",
             raw_fields,
             f"{spec.contract_size:g}" if spec.contract_size is not None else "n/a",
             f"{spec.tick_size:g}",
@@ -461,30 +661,48 @@ def size_order_for_aggregate_risk(
         per_lot_risk = risk_per_lot(direction, entry_price, stop_loss, spec)
         minimum_lot_risk = per_lot_risk * spec.volume_min
         raw_volume = min(risk_budget / per_lot_risk, spec.volume_max)
-        if raw_volume + 1e-12 < spec.volume_min:
+        if raw_volume < spec.volume_min:
             status = "BLOCKED_MINIMUM_LOT"
             raise AggregateRiskLimitError(
                 f"Remaining risk budget {risk_budget:.2f} {spec.account_currency} "
                 "is below the minimum-lot risk"
             )
 
-        step_count = math.floor(
-            (raw_volume - spec.volume_min) / spec.volume_step + 1e-9
+        minimum_decimal = Decimal(str(spec.volume_min))
+        step_decimal = Decimal(str(spec.volume_step))
+        raw_decimal = Decimal(str(raw_volume))
+        step_count = int(
+            ((raw_decimal - minimum_decimal) / step_decimal).to_integral_value(
+                rounding=ROUND_FLOOR
+            )
         )
-        volume = round(spec.volume_min + step_count * spec.volume_step, 8)
+        volume_decimal = minimum_decimal + step_count * step_decimal
+        volume = float(volume_decimal)
         if volume < spec.volume_min or volume > spec.volume_max:
             status = "BLOCKED_VOLUME_CONSTRAINT"
             raise AggregateRiskLimitError(
                 "Risk-sized volume violates broker limits"
             )
         new_risk = per_lot_risk * volume
-        if existing_risk + new_risk > aggregate_limit + 1e-8:
+        while new_risk > risk_budget and volume_decimal > minimum_decimal:
+            volume_decimal -= step_decimal
+            volume = float(volume_decimal)
+            new_risk = per_lot_risk * volume
+        if new_risk > risk_budget:
+            status = "BLOCKED_MINIMUM_LOT"
+            raise AggregateRiskLimitError(
+                f"Remaining risk budget {risk_budget:.2f} {spec.account_currency} "
+                "is below the minimum-lot risk"
+            )
+        if existing_risk + new_risk > aggregate_limit:
             status = "BLOCKED_AGGREGATE_BUDGET"
             raise AggregateRiskLimitError(
                 "Broker volume step would exceed the aggregate risk limit"
             )
 
         status = "ALLOWED"
+        sized_lots = volume
+        sized_risk = new_risk
         return AggregateRiskSizing(
             lot_size=volume,
             existing_risk=round(existing_risk, 8),
@@ -497,3 +715,11 @@ def size_order_for_aggregate_risk(
         )
     finally:
         emit_guard_log()
+        if status == "ALLOWED" and sized_lots is not None and sized_risk is not None:
+            log.info(
+                "PRE_ORDER_RISK_GUARD_RESULT status=ALLOWED sized_lots=%.8f "
+                "risk_amount=%.2f risk_currency=%s",
+                sized_lots,
+                sized_risk,
+                spec.account_currency,
+            )

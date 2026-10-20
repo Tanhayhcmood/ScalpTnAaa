@@ -5,6 +5,7 @@ import pytest
 from live_trading.risk.aggregate_risk import (
     AggregateRiskLimitError,
     OpenPositionRiskError,
+    RiskCalculationError,
     aggregate_open_risk,
     build_symbol_risk_spec,
     position_risk_amount,
@@ -15,6 +16,8 @@ from live_trading.risk.aggregate_risk import (
 
 def _symbol_params(**symbol_info):
     return {
+        "_mtapi_volume_units": "lots",
+        "_mtapi_volume_scale": 1.0,
         "symbolInfo": {
             "tickSize": 0.01,
             "tickValue": 1.0,
@@ -124,6 +127,9 @@ def test_contract_size_fallback_requires_matching_account_currency():
                 "tickSize": 0.01,
                 "contractSize": 100.0,
                 "currencyProfit": "USD",
+                "volumeMin": 0.01,
+                "volumeStep": 0.01,
+                "volumeMax": 50.0,
             }
         },
         "USD",
@@ -195,6 +201,8 @@ def _xauusd_zero_tick_value_params(minimum_lot: float) -> dict:
     return {
         "symbol": "XAUUSD",
         "_tick_size_source": "env:XAUUSD_TICK_SIZE",
+        "_mtapi_volume_units": "lots",
+        "_mtapi_volume_scale": 1.0,
         "symbolInfo": {
             "tickSize": 0.01,
             "tickValue": 0,
@@ -230,10 +238,16 @@ def test_xauusd_zero_tick_value_derives_contract_risk_and_allows_minimum_lot():
     assert sizing.lot_size == pytest.approx(0.08)
     assert sizing.new_risk == pytest.approx(86.088)
     assert sizing.risk_budget == pytest.approx(91.7144)
-    assert guard_log.call_count == 1
-    assert "PRE_ORDER_RISK_GUARD" in guard_log.call_args.args[0]
-    assert '"tickValue":0' in guard_log.call_args.args[17]
-    assert "minimum_lot_risk=%s %s" in guard_log.call_args.args[0]
+    assert guard_log.call_count == 2
+    assert "PRE_ORDER_RISK_GUARD" in guard_log.call_args_list[0].args[0]
+    assert '"tickValue":0' in guard_log.call_args_list[0].args[21]
+    assert "minimum_lot_risk=%s %s" in guard_log.call_args_list[0].args[0]
+    assert guard_log.call_args_list[-1].args[0].startswith(
+        "PRE_ORDER_RISK_GUARD_RESULT status=ALLOWED"
+    )
+    assert guard_log.call_args_list[-1].args[1] == pytest.approx(0.08)
+    assert guard_log.call_args_list[-1].args[2] == pytest.approx(86.088)
+    assert guard_log.call_args_list[-1].args[3] == "USD"
 
 
 def test_xauusd_zero_tick_value_blocks_when_minimum_lot_exceeds_budget():
@@ -257,4 +271,127 @@ def test_xauusd_zero_tick_value_blocks_when_minimum_lot_exceeds_budget():
 
     assert guard_log.call_count == 1
     assert guard_log.call_args.args[1] == "BLOCKED_MINIMUM_LOT"
-    assert guard_log.call_args.args[24] == "107.61"
+    assert guard_log.call_args.args[28] == "107.61"
+
+
+def _extended_xauusd_params(
+    *,
+    raw_min: float = 1_000_000,
+    raw_step: float = 1_000_000,
+    raw_max: float = 10_000_000_000,
+) -> dict:
+    return {
+        "symbol": "XAUUSD",
+        "symbolInfo": {
+            "tickSize": 0.01,
+            "tickValue": 0,
+            "contractSize": 100.0,
+            "currencyProfit": "USD",
+        },
+        "symbolGroup": {
+            "volumeMin": raw_min,
+            "volumeStep": raw_step,
+            "volumeMax": raw_max,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("sl_distance", "expected_lots", "expected_risk"),
+    [
+        (17.20, 0.05, 86.00),
+        (14.93, 0.06, 89.58),
+        (20.95, 0.04, 83.80),
+    ],
+)
+def test_extended_mtapi_volume_fields_size_to_lots_without_exceeding_budget(
+    monkeypatch, sl_distance, expected_lots, expected_risk
+):
+    monkeypatch.setenv("MTAPI_VOLUME_SCALE", "100000000")
+    spec = build_symbol_risk_spec(_extended_xauusd_params(), "USD")
+
+    assert spec.volume_min == pytest.approx(0.01)
+    assert spec.volume_step == pytest.approx(0.01)
+    assert spec.volume_max == pytest.approx(100.0)
+    assert spec.volume_scale == pytest.approx(100_000_000)
+
+    with patch("live_trading.risk.aggregate_risk.log.info") as guard_log:
+        sizing = size_order_for_aggregate_risk(
+            positions=[],
+            direction="SELL",
+            entry_price=2300.0,
+            stop_loss=2300.0 + sl_distance,
+            account_balance=9171.44,
+            per_trade_risk_percent=1.0,
+            aggregate_risk_percent=2.0,
+            spec=spec,
+            account_equity=9171.44,
+        )
+
+    assert sizing.risk_budget == pytest.approx(91.7144)
+    assert sizing.lot_size == pytest.approx(expected_lots)
+    assert sizing.new_risk == pytest.approx(expected_risk)
+    assert sizing.new_risk <= sizing.risk_budget
+    assert sizing.lot_size <= spec.volume_max
+    assert guard_log.call_args_list[-1].args[0].startswith(
+        "PRE_ORDER_RISK_GUARD_RESULT status=ALLOWED"
+    )
+    assert guard_log.call_args_list[-1].args[1] == pytest.approx(expected_lots)
+    assert guard_log.call_args_list[-1].args[2] == pytest.approx(expected_risk)
+    assert guard_log.call_args_list[-1].args[3] == "USD"
+    if sl_distance == 17.20:
+        assert spec.volume_min * (sl_distance / spec.tick_size) == pytest.approx(17.20)
+
+
+def test_extended_mtapi_volume_blocks_when_budget_is_below_minimum_lot_risk(
+    monkeypatch,
+):
+    monkeypatch.setenv("MTAPI_VOLUME_SCALE", "100000000")
+    spec = build_symbol_risk_spec(_extended_xauusd_params(), "USD")
+
+    with pytest.raises(AggregateRiskLimitError, match="below the minimum-lot risk"):
+        size_order_for_aggregate_risk(
+            positions=[],
+            direction="SELL",
+            entry_price=2300.0,
+            stop_loss=2317.20,
+            account_balance=1000.0,
+            per_trade_risk_percent=1.0,
+            aggregate_risk_percent=2.0,
+            spec=spec,
+        )
+
+
+def test_absurd_converted_volume_metadata_logs_sanity_error_and_blocks(monkeypatch):
+    monkeypatch.setenv("MTAPI_VOLUME_SCALE", "100000000")
+    params = _extended_xauusd_params(
+        raw_min=200_000_000,
+        raw_step=1_000_000,
+        raw_max=2_000_000_000_000,
+    )
+
+    with (
+        patch("live_trading.risk.aggregate_risk.log.error") as error_log,
+        pytest.raises(RiskCalculationError, match="sanity limit"),
+    ):
+        build_symbol_risk_spec(params, "USD")
+
+    logged = " ".join(
+        str(arg) for call in error_log.call_args_list for arg in call.args
+    )
+    assert "MTAPI_VOLUME_SANITY_ERROR" in logged
+    assert "minimum lot" in logged
+
+
+def test_missing_volume_constraints_do_not_use_guessed_defaults():
+    with pytest.raises(RiskCalculationError, match="refusing to guess"):
+        build_symbol_risk_spec(
+            {
+                "symbolInfo": {
+                    "tickSize": 0.01,
+                    "tickValue": 1.0,
+                    "tickValueCurrency": "USD",
+                }
+            },
+            "USD",
+        )

@@ -41,6 +41,11 @@ from live_trading.config import (
     MT5_USER, MT5_PASSWORD,
     SYNC_TIMEOUT, XAUUSD_TICK_SIZE,
 )
+from live_trading.mt5.volume_units import (
+    configured_mtapi_volume_scale,
+    extended_volume_to_lots,
+    volume_constraint_sanity_error,
+)
 from live_trading.signals.gold_engine import OHLCV
 from live_trading.logger import get_logger
 
@@ -1547,6 +1552,88 @@ def _canonical_symbol_fields(source: object) -> dict:
     return result
 
 
+_VOLUME_FIELD_ALIASES = {
+    "volumeMin": ("volumeMin", "volume_min", "minVolume", "min_volume"),
+    "volumeStep": (
+        "volumeStep", "volume_step", "volumeIncrement", "volume_increment",
+    ),
+    "volumeMax": ("volumeMax", "volume_max", "maxVolume", "max_volume"),
+}
+
+
+def _convert_normalized_volume_fields(
+    normalized: dict,
+    source_maps: tuple[tuple[str, object, dict], ...],
+    scale: float,
+) -> Optional[str]:
+    """Convert canonical SymbolParams volumes while retaining raw diagnostics."""
+    errors: list[str] = []
+    for section, source, target in source_maps:
+        if not isinstance(source, dict):
+            continue
+        for canonical, aliases in _VOLUME_FIELD_ALIASES.items():
+            raw_value = _field_value(source, *aliases)
+            if raw_value is None:
+                continue
+            try:
+                lots = extended_volume_to_lots(raw_value, scale)
+            except ValueError as exc:
+                reason = (
+                    f"{section}.{canonical} raw={raw_value!r} scale={scale:g}: {exc}"
+                )
+                log.error("MTAPI volume conversion ERROR %s", reason)
+                errors.append(reason)
+                continue
+
+            target[canonical] = lots
+            log.info(
+                "MTAPI_VOLUME_CONVERSION symbol=%s field=%s raw=%s "
+                "scale=%s lots=%s source=%s",
+                normalized.get("symbol", "unknown"),
+                canonical,
+                raw_value,
+                f"{scale:g}",
+                f"{lots:g}",
+                section,
+            )
+
+    if errors:
+        return "; ".join(errors)
+
+    values: dict[str, Optional[float]] = {
+        "volumeMin": None,
+        "volumeStep": None,
+        "volumeMax": None,
+    }
+    for canonical in values:
+        for mapping in (
+            normalized.get("symbolInfo"),
+            normalized,
+            normalized.get("symbolGroup"),
+        ):
+            if not isinstance(mapping, dict) or canonical not in mapping:
+                continue
+            try:
+                value = float(mapping[canonical])
+            except (TypeError, ValueError):
+                break
+            if math.isfinite(value):
+                values[canonical] = value
+            break
+
+    sanity_error = volume_constraint_sanity_error(
+        values["volumeMin"], values["volumeStep"], values["volumeMax"]
+    )
+    if sanity_error:
+        log.error(
+            "MTAPI volume sanity ERROR symbol=%s: %s; order sizing will be blocked",
+            normalized.get("symbol", "unknown"),
+            sanity_error,
+        )
+        return sanity_error
+    return None
+
+
 def _normalize_symbol_params(data: object, symbol: str) -> dict:
     """Normalize MTAPI's SymbolParams and common casing/envelope variants."""
     root = _symbol_params_payload(data, symbol)
@@ -1572,6 +1659,31 @@ def _normalize_symbol_params(data: object, symbol: str) -> dict:
     # Preserve a top-level form too; the risk parser supports both layouts.
     normalized = _canonical_symbol_fields(normalized)
     normalized["_raw_symbol_fields"] = _raw_symbol_field_snapshot(root)
+    try:
+        volume_scale = configured_mtapi_volume_scale()
+    except ValueError as exc:
+        reason = str(exc)
+        normalized["_mtapi_volume_units_error"] = reason
+        log.error(
+            "MTAPI volume configuration ERROR symbol=%s: %s; order sizing will be blocked",
+            normalized["symbol"],
+            reason,
+        )
+        return normalized
+
+    normalized["_mtapi_volume_units"] = "lots"
+    normalized["_mtapi_volume_scale"] = volume_scale
+    volume_error = _convert_normalized_volume_fields(
+        normalized,
+        (
+            ("root", root, normalized),
+            ("symbolInfo", info, normalized["symbolInfo"]),
+            ("symbolGroup", group, normalized["symbolGroup"]),
+        ),
+        volume_scale,
+    )
+    if volume_error:
+        normalized["_mtapi_volume_units_error"] = volume_error
     return normalized
 
 

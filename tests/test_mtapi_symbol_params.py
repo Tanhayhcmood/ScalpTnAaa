@@ -126,9 +126,9 @@ def test_raw_zero_sizing_fields_survive_canonical_tick_size_fallback():
                 "tickSize": 0,
                 "tickValue": 0,
                 "contractSize": 100,
-                "volumeMin": 0.1,
-                "volumeStep": 0.1,
-                "volumeMax": 50,
+                "volumeMin": 10_000_000,
+                "volumeStep": 10_000_000,
+                "volumeMax": 5_000_000_000,
             },
         },
         "XAUUSD",
@@ -142,14 +142,51 @@ def test_raw_zero_sizing_fields_survive_canonical_tick_size_fallback():
     )
 
     assert loaded["symbolInfo"]["tickSize"] == 0.01
+    assert loaded["symbolInfo"]["volumeMin"] == 0.1
+    assert loaded["symbolInfo"]["volumeStep"] == 0.1
+    assert loaded["symbolInfo"]["volumeMax"] == 50.0
     assert loaded["_raw_symbol_fields"]["symbolInfo"] == {
         "tickSize": 0,
         "tickValue": 0,
         "contractSize": 100,
-        "volumeMin": 0.1,
-        "volumeStep": 0.1,
-        "volumeMax": 50,
+        "volumeMin": 10_000_000,
+        "volumeStep": 10_000_000,
+        "volumeMax": 5_000_000_000,
     }
+    assert loaded["_mtapi_volume_units"] == "lots"
+    assert loaded["_mtapi_volume_scale"] == 100_000_000
+
+
+def test_symbol_params_volume_scale_is_configurable_and_logs_conversion():
+    logger = MagicMock()
+    with (
+        patch.dict("os.environ", {"MTAPI_VOLUME_SCALE": "1000"}),
+        patch.object(connector, "log", logger),
+    ):
+        params = connector._normalize_symbol_params(
+            {
+                "symbol": "XAUUSD",
+                "symbolGroup": {
+                    "volumeMin": 10,
+                    "volumeStep": 10,
+                    "volumeMax": 100_000,
+                },
+            },
+            "XAUUSD",
+        )
+
+    assert params["symbolGroup"]["volumeMin"] == 0.01
+    assert params["symbolGroup"]["volumeStep"] == 0.01
+    assert params["symbolGroup"]["volumeMax"] == 100.0
+    assert params["_mtapi_volume_scale"] == 1000.0
+    conversion_calls = [
+        call.args
+        for call in logger.info.call_args_list
+        if call.args and "MTAPI_VOLUME_CONVERSION" in call.args[0]
+    ]
+    assert any(
+        call[3:6] == (10, "1000", "0.01") for call in conversion_calls
+    )
 
 
 def test_mtapi_201_exception_is_logged_retried_and_uses_explicit_default():
@@ -179,7 +216,12 @@ def test_mtapi_201_exception_is_logged_retried_and_uses_explicit_default():
                 **params["symbolInfo"],
                 "contractSize": 100.0,
                 "currencyProfit": "USD",
+                "volumeMin": 0.01,
+                "volumeStep": 0.01,
+                "volumeMax": 50.0,
             },
+            "_mtapi_volume_units": "lots",
+            "_mtapi_volume_scale": 1.0,
         },
         "USD",
     )
