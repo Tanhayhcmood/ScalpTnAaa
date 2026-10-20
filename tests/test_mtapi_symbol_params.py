@@ -118,6 +118,40 @@ def test_symbol_params_normalizes_wrapped_snake_case_response():
     assert params["symbolInfo"]["currencyProfit"] == "USD"
 
 
+def test_raw_zero_sizing_fields_survive_canonical_tick_size_fallback():
+    params = connector._normalize_symbol_params(
+        {
+            "symbol": "XAUUSD",
+            "symbolInfo": {
+                "tickSize": 0,
+                "tickValue": 0,
+                "contractSize": 100,
+                "volumeMin": 0.1,
+                "volumeStep": 0.1,
+                "volumeMax": 50,
+            },
+        },
+        "XAUUSD",
+    )
+    loaded = connector._with_tick_size(
+        params,
+        "XAUUSD",
+        0.01,
+        "env:XAUUSD_TICK_SIZE",
+        fetched_from_broker=False,
+    )
+
+    assert loaded["symbolInfo"]["tickSize"] == 0.01
+    assert loaded["_raw_symbol_fields"]["symbolInfo"] == {
+        "tickSize": 0,
+        "tickValue": 0,
+        "contractSize": 100,
+        "volumeMin": 0.1,
+        "volumeStep": 0.1,
+        "volumeMax": 50,
+    }
+
+
 def test_mtapi_201_exception_is_logged_retried_and_uses_explicit_default():
     error_body = {
         "code": "SYMBOL_PARAMS_FAILED",

@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import pytest
 
 from live_trading.risk.aggregate_risk import (
@@ -187,3 +189,72 @@ def test_risk_sized_volume_floors_to_broker_step():
 
     assert sizing.lot_size == pytest.approx(1.01)
     assert sizing.new_risk == pytest.approx(101.0)
+
+
+def _xauusd_zero_tick_value_params(minimum_lot: float) -> dict:
+    return {
+        "symbol": "XAUUSD",
+        "_tick_size_source": "env:XAUUSD_TICK_SIZE",
+        "symbolInfo": {
+            "tickSize": 0.01,
+            "tickValue": 0,
+            "contractSize": 100.0,
+            "volumeMin": minimum_lot,
+            "volumeStep": minimum_lot,
+            "volumeMax": 50.0,
+        },
+    }
+
+
+def test_xauusd_zero_tick_value_derives_contract_risk_and_allows_minimum_lot():
+    spec = build_symbol_risk_spec(_xauusd_zero_tick_value_params(0.01), "USD")
+
+    with patch("live_trading.risk.aggregate_risk.log.info") as guard_log:
+        sizing = size_order_for_aggregate_risk(
+            positions=[],
+            direction="SELL",
+            entry_price=2300.0,
+            stop_loss=2300.0 + (3.587 * 3.0),
+            account_balance=9171.44,
+            per_trade_risk_percent=1.0,
+            aggregate_risk_percent=2.0,
+            spec=spec,
+            account_equity=9171.44,
+        )
+
+    assert spec.tick_value_source == "contract_size_xauusd_usd_assumed"
+    assert spec.tick_value_per_lot == pytest.approx(1.0)
+    assert risk_per_lot("SELL", 2300.0, 2300.0 + (3.587 * 3.0), spec) == pytest.approx(
+        1076.1
+    )
+    assert sizing.lot_size == pytest.approx(0.08)
+    assert sizing.new_risk == pytest.approx(86.088)
+    assert sizing.risk_budget == pytest.approx(91.7144)
+    assert guard_log.call_count == 1
+    assert "PRE_ORDER_RISK_GUARD" in guard_log.call_args.args[0]
+    assert '"tickValue":0' in guard_log.call_args.args[17]
+    assert "minimum_lot_risk=%s %s" in guard_log.call_args.args[0]
+
+
+def test_xauusd_zero_tick_value_blocks_when_minimum_lot_exceeds_budget():
+    spec = build_symbol_risk_spec(_xauusd_zero_tick_value_params(0.1), "USD")
+
+    with (
+        patch("live_trading.risk.aggregate_risk.log.info") as guard_log,
+        pytest.raises(AggregateRiskLimitError, match="below the minimum-lot risk"),
+    ):
+        size_order_for_aggregate_risk(
+            positions=[],
+            direction="SELL",
+            entry_price=2300.0,
+            stop_loss=2300.0 + (3.587 * 3.0),
+            account_balance=9171.44,
+            per_trade_risk_percent=1.0,
+            aggregate_risk_percent=2.0,
+            spec=spec,
+            account_equity=9171.44,
+        )
+
+    assert guard_log.call_count == 1
+    assert guard_log.call_args.args[1] == "BLOCKED_MINIMUM_LOT"
+    assert guard_log.call_args.args[24] == "107.61"

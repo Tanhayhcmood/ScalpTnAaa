@@ -2163,6 +2163,7 @@ class GoldScalperLive:
                 bar_time,
                 signal_atr,
                 account_balance=balance,
+                account_equity=float(acc_info.get("equity") or balance),
                 account_currency=str(acc_info.get("currency") or "").strip(),
             )
         )
@@ -3362,6 +3363,7 @@ class GoldScalperLive:
         bar_time: datetime,
         signal_atr: float,
         account_balance: Optional[float] = None,
+        account_equity: Optional[float] = None,
         account_currency: str = "USD",
     ) -> tuple[Optional[TradeResult], list[dict], str, str]:
         """Re-check capacity and submit one entry atomically.
@@ -3664,6 +3666,7 @@ class GoldScalperLive:
                     per_trade_risk_percent=tp_params.risk_percent,
                     aggregate_risk_percent=MAX_TOTAL_RISK_PERCENT,
                     spec=risk_spec,
+                    account_equity=account_equity,
                 )
             except OpenPositionRiskError as exc:
                 return (

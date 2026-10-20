@@ -1473,6 +1473,40 @@ def _symbol_params_payload(data: object, symbol: str) -> Optional[dict]:
     return current
 
 
+_RAW_SYMBOL_DIAGNOSTIC_FIELDS = {
+    "ticksize", "tradeticksize", "minpriceincrement", "pricestep",
+    "tickvalue", "tradetickvalue", "tickvalueloss", "tradetickvalueloss",
+    "tickvaluecurrency", "tradetickvaluecurrency", "contractsize",
+    "tradecontractsize", "currencyprofit", "profitcurrency", "digits",
+    "precision", "pricedigits", "decimalplaces", "points", "point",
+    "pointsize", "pricepoint", "volumemin", "minvolume", "volumestep",
+    "volumeincrement", "volumemax", "maxvolume",
+}
+
+
+def _raw_symbol_field_snapshot(root: dict) -> dict[str, dict]:
+    """Retain original sizing fields before canonical fallbacks overwrite them."""
+    info = _field_value(
+        root, "symbolInfo", "symbol_info", "info", "symbolDetails",
+        "symbol_details",
+    )
+    group = _field_value(root, "symbolGroup", "symbol_group", "group")
+    sources = {"root": root, "symbolInfo": info, "symbolGroup": group}
+    snapshot: dict[str, dict] = {}
+    for section, fields in sources.items():
+        if not isinstance(fields, dict):
+            continue
+        selected = {
+            str(key): value
+            for key, value in fields.items()
+            if str(key).replace("_", "").casefold()
+            in _RAW_SYMBOL_DIAGNOSTIC_FIELDS
+        }
+        if selected:
+            snapshot[section] = selected
+    return snapshot
+
+
 def _canonical_symbol_fields(source: object) -> dict:
     """Copy broker aliases into stable MT5-style names without dropping fields."""
     if not isinstance(source, dict):
@@ -1537,6 +1571,7 @@ def _normalize_symbol_params(data: object, symbol: str) -> dict:
     normalized["symbolGroup"] = _canonical_symbol_fields(group)
     # Preserve a top-level form too; the risk parser supports both layouts.
     normalized = _canonical_symbol_fields(normalized)
+    normalized["_raw_symbol_fields"] = _raw_symbol_field_snapshot(root)
     return normalized
 
 
