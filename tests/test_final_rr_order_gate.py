@@ -91,6 +91,8 @@ def _patch_order_dependencies(monkeypatch, order_calls):
 
     async def fake_get_symbol_params(_symbol):
         return {
+            "_mtapi_volume_units": "lots",
+            "_mtapi_volume_scale": 1.0,
             "symbolInfo": {
                 "digits": 2,
                 "points": 0.01,
