@@ -320,6 +320,22 @@ if TRADE_WINDOW_UTC_START >= TRADE_WINDOW_UTC_END:
 FRIDAY_LAST_ENTRY_UTC_HOUR = _int(
     "FRIDAY_LAST_ENTRY_UTC_HOUR", 19, lo=0, hi=23
 )
+H1_GATE_MODE = os.getenv("H1_GATE_MODE", "shadow").strip().lower()
+if H1_GATE_MODE not in {"off", "shadow", "enforce"}:
+    print(
+        "ERROR: H1_GATE_MODE must be off, shadow, or enforce. "
+        "Fix it in the Render dashboard and redeploy.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+H1_GATE_STRICTNESS = os.getenv("H1_GATE_STRICTNESS", "counter").strip().lower()
+if H1_GATE_STRICTNESS not in {"counter", "aligned"}:
+    print(
+        "ERROR: H1_GATE_STRICTNESS must be counter or aligned. "
+        "Fix it in the Render dashboard and redeploy.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 # ENABLED_STRATEGIES remains as a compatibility name for callers and old
 # Render variables. Its value is deliberately fixed so an old environment
 # setting cannot re-enable SMC or Wyckoff for live entries.
