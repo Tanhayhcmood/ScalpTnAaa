@@ -12,6 +12,7 @@ Required:
 """
 import os
 import sys
+import math
 
 # ── Bounded env-var helpers ───────────────────────────────────────────────────
 
@@ -69,6 +70,29 @@ def _float(name: str, default: float, lo: float | None = None, hi: float | None 
         )
         sys.exit(1)
     return val
+
+
+def _broker_utc_offset_hours() -> str | float:
+    raw = os.getenv("BROKER_UTC_OFFSET_HOURS", "auto").strip()
+    if raw.lower() == "auto":
+        return "auto"
+    try:
+        value = float(raw)
+    except ValueError:
+        print(
+            f"ERROR: BROKER_UTC_OFFSET_HOURS={raw!r} must be 'auto' or a number. "
+            "Fix it in the Render dashboard and redeploy.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not math.isfinite(value):
+        print(
+            "ERROR: BROKER_UTC_OFFSET_HOURS must be 'auto' or a finite number. "
+            "Fix it in the Render dashboard and redeploy.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return value
 
 
 def _locked_float(
@@ -225,6 +249,7 @@ MT5_HOST       = os.getenv("MT5_HOST", "AMarkets-Demo").strip()
 MT5_PORT      = _int("MT5_PORT", 443, lo=1, hi=65535)
 MT5_USER      = os.getenv("MT5_USER", "").strip()
 MT5_PASSWORD  = os.getenv("MT5_PASSWORD", "").strip()
+BROKER_UTC_OFFSET_HOURS = _broker_utc_offset_hours()
 # Deprecated compatibility aliases. They stay empty and are not used by the
 # direct MTAPI connector.
 METAAPI_TOKEN      = ""
