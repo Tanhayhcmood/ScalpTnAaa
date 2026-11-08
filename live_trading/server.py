@@ -106,6 +106,26 @@ def _command_authorized(req: web.Request) -> tuple[bool, int, str]:
     return True, 200, ""
 
 
+async def _trade_features(req: web.Request) -> web.Response:
+    """GET /trade-features — return persisted decision features for recent trades."""
+    authorized, status, message = _command_authorized(req)
+    if not authorized:
+        return web.json_response({"error": message}, status=status)
+
+    try:
+        from live_trading.redis_ipc import redis_read_trade_features
+
+        features = redis_read_trade_features()
+    except Exception:
+        features = None
+    if features is None:
+        return web.json_response(
+            {"error": "trade features are unavailable"},
+            status=503,
+        )
+    return web.json_response({"trade_features": features})
+
+
 def _read_local_state() -> dict | None:
     """Read the local state file when cross-service Redis is unavailable."""
     try:
@@ -506,7 +526,7 @@ async def _force_resume(request):
         return web.Response(status=500, text=f"server error: {exc}")
 
 
-async def _run_health_server():
+def _create_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", _health)
     app.router.add_get("/health", _health)
@@ -516,6 +536,12 @@ async def _run_health_server():
     app.router.add_post("/force-resume", _force_resume)
     app.router.add_get("/snapshot", _snapshot)
     app.router.add_post("/command", _command)
+    app.router.add_get("/trade-features", _trade_features)
+    return app
+
+
+async def _run_health_server():
+    app = _create_app()
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
