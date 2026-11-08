@@ -495,8 +495,8 @@ async def _connect_unlocked() -> bool:
     previous_conn_id = _conn_id
     previous_connected = _connected
     _base_url = base
-    sess = _get_session()
     try:
+        sess = _get_session()
         log.info(
             "MTAPI /ConnectEx request prepared: "
             f"account={user[:3]}*** host={host} port={MT5_PORT} "
