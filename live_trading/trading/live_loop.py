@@ -41,6 +41,7 @@ from live_trading.config import (
     ENTRY_GATES_MODE, MAX_SPREAD_PRICE,
     TRADE_WINDOW_UTC_START, TRADE_WINDOW_UTC_END,
     FRIDAY_LAST_ENTRY_UTC_HOUR,
+    H1_GATE_MODE, H1_GATE_STRICTNESS,
     BAR_CHECK_INTERVAL, RECONNECT_DELAY, SYNC_TIMEOUT, RPC_CALL_TIMEOUT,
     MIN_CONFIRMATIONS, TREND_MIN_CONFIRMATIONS,
     ENTRY_CONFIRMATION_FLOOR,
@@ -96,6 +97,12 @@ from live_trading.signals.mtf_filter import (
     MtfBias,
 )
 from live_trading.signals.h1_validator import validate_h1_candles
+from live_trading.signals.h1_trend_gate import (
+    H1_BIAS_UNAVAILABLE,
+    H1_MIN_CANDLES,
+    detect_h1_bias,
+    evaluate_h1_trend_gate,
+)
 from live_trading.signals.wyckoff_engine import calibrate_wyckoff, set_calibrated_config
 from live_trading.mt5.connector import (
     connect, disconnect, ensure_connected,
@@ -579,8 +586,7 @@ class GoldScalperLive:
             tf: None for tf in TRADE_TIMEFRAMES
         }
         # Latest completed bar time observed for non-trade context timeframes
-        # (currently H1).  It lets the MTF analysis cache refresh exactly once
-        # per new HTF bar instead of once per M5/M10/M15/M20 entry event.
+        # (currently H1). It lets the HTF caches refresh once per new H1 bar.
         self._latest_completed_bar_times: dict[str, Optional[datetime]] = {}
         self._sl_atr_cache_bar_time: Optional[datetime] = None
         self._sl_atr_cache_value: float = 0.0
@@ -590,6 +596,12 @@ class GoldScalperLive:
         self._mtf_cache_bias: Optional[MtfBias] = None
         self._mtf_cache_reason: str = ""
         self._mtf_cache_failure_at: float = 0.0
+        self._h1_gate_bias: str = H1_BIAS_UNAVAILABLE
+        self._h1_gate_reason: str = "H1 trend data has not been fetched"
+        self._h1_gate_cache_bar_time: Optional[datetime] = None
+        self._h1_gate_cache_failure_at: float = 0.0
+        self._h1_gate_cache_attempted: bool = False
+        self._h1_gate_shadow_logged_bar: dict[str, datetime] = {}
         # Guard against opening multiple trades in the same tick when several
         # timeframes close simultaneously (e.g. M20+M10+M5 all fire at :20).
         # Without this, _on_new_bar() is called N times in one iteration of
@@ -1163,7 +1175,10 @@ class GoldScalperLive:
         Never raises — individual TF errors are logged and skipped."""
         results: list[tuple[str, datetime]] = []
         poll_timeframes = list(TRADE_TIMEFRAMES)
-        if MTF_ENABLED and MTF_TIMEFRAME not in poll_timeframes:
+        if (
+            (MTF_ENABLED or H1_GATE_MODE != "off")
+            and MTF_TIMEFRAME not in poll_timeframes
+        ):
             # Poll the HTF timestamp alongside entry timeframes so the cache
             # knows when a new H1 context is available, without fetching the
             # full H1 candle window on every lower-timeframe bar.
@@ -1325,6 +1340,86 @@ class GoldScalperLive:
             self._mtf_cache_failure_at = asyncio.get_event_loop().time()
             return None, reason
 
+    def _h1_gate_cache_needs_refresh(self) -> bool:
+        """Refresh the independent entry-gate bias only when H1 context changes."""
+        if H1_GATE_MODE == "off":
+            return False
+        current_bar = self._latest_completed_bar_times.get(MTF_TIMEFRAME)
+        if (
+            self._h1_gate_cache_attempted
+            and current_bar == self._h1_gate_cache_bar_time
+            and self._h1_gate_bias != H1_BIAS_UNAVAILABLE
+        ):
+            return False
+        if (
+            self._h1_gate_cache_attempted
+            and current_bar == self._h1_gate_cache_bar_time
+            and self._h1_gate_bias == H1_BIAS_UNAVAILABLE
+            and asyncio.get_event_loop().time() - self._h1_gate_cache_failure_at < 30.0
+        ):
+            return False
+        return True
+
+    async def _refresh_h1_gate_cache(self) -> tuple[str, str]:
+        """Fetch closed H1 candles using the existing MTF window settings."""
+        cache_bar = self._latest_completed_bar_times.get(MTF_TIMEFRAME)
+        try:
+            if MTF_TIMEFRAME.strip().lower() not in {"h1", "1h"}:
+                reason = (
+                    "H1 trend gate requires MTF_TIMEFRAME=H1 "
+                    f"(configured {MTF_TIMEFRAME})"
+                )
+                self._h1_gate_bias = H1_BIAS_UNAVAILABLE
+                self._h1_gate_reason = reason
+                self._h1_gate_cache_bar_time = cache_bar
+                self._h1_gate_cache_failure_at = asyncio.get_event_loop().time()
+                self._h1_gate_cache_attempted = True
+                return H1_BIAS_UNAVAILABLE, reason
+
+            # fetch_candles returns completed bars only; keep the existing MTF
+            # timeframe/window as the single source for this H1 context.
+            h1_candles = await fetch_candles(
+                SYMBOL, MTF_TIMEFRAME, MTF_CANDLE_WINDOW
+            )
+            _log_candle_window(MTF_TIMEFRAME, h1_candles, "h1_trend_gate")
+            if len(h1_candles) < H1_MIN_CANDLES:
+                reason = (
+                    f"H1 trend candles insufficient ({len(h1_candles)}; "
+                    f"need {H1_MIN_CANDLES} closed bars)"
+                )
+                self._h1_gate_bias = H1_BIAS_UNAVAILABLE
+                self._h1_gate_reason = reason
+                self._h1_gate_cache_bar_time = cache_bar
+                self._h1_gate_cache_failure_at = asyncio.get_event_loop().time()
+                self._h1_gate_cache_attempted = True
+                return H1_BIAS_UNAVAILABLE, reason
+
+            bias = detect_h1_bias(h1_candles)
+            if bias == H1_BIAS_UNAVAILABLE:
+                reason = "H1 trend candle data is invalid"
+                self._h1_gate_bias = H1_BIAS_UNAVAILABLE
+                self._h1_gate_reason = reason
+                self._h1_gate_cache_bar_time = cache_bar
+                self._h1_gate_cache_failure_at = asyncio.get_event_loop().time()
+                self._h1_gate_cache_attempted = True
+                return H1_BIAS_UNAVAILABLE, reason
+
+            self._h1_gate_bias = bias
+            self._h1_gate_reason = ""
+            self._h1_gate_cache_bar_time = cache_bar
+            self._h1_gate_cache_failure_at = 0.0
+            self._h1_gate_cache_attempted = True
+            return bias, ""
+        except Exception as exc:
+            reason = f"H1 trend fetch/analysis error: {exc}"
+            log.exception("H1 trend gate refresh failed")
+            self._h1_gate_bias = H1_BIAS_UNAVAILABLE
+            self._h1_gate_reason = reason
+            self._h1_gate_cache_bar_time = cache_bar
+            self._h1_gate_cache_failure_at = asyncio.get_event_loop().time()
+            self._h1_gate_cache_attempted = True
+            return H1_BIAS_UNAVAILABLE, reason
+
     def _sl_atr_cache_needs_refresh(self) -> bool:
         current_bar = self._latest_completed_bar_times.get(SL_ATR_TIMEFRAME)
         if (
@@ -1399,6 +1494,11 @@ class GoldScalperLive:
             if self._mtf_cache_needs_refresh()
             else None
         )
+        h1_gate_task = (
+            asyncio.create_task(self._refresh_h1_gate_cache())
+            if self._h1_gate_cache_needs_refresh()
+            else None
+        )
         sl_atr_task = (
             asyncio.create_task(self._refresh_sl_atr_cache())
             if self._sl_atr_cache_needs_refresh()
@@ -1407,6 +1507,8 @@ class GoldScalperLive:
         tasks = [candles_task, account_task]
         if mtf_task is not None:
             tasks.append(mtf_task)
+        if h1_gate_task is not None:
+            tasks.append(h1_gate_task)
         if sl_atr_task is not None:
             tasks.append(sl_atr_task)
         results = await asyncio.gather(*tasks)
@@ -1418,6 +1520,8 @@ class GoldScalperLive:
         else:
             htf_bias = self._mtf_cache_bias if MTF_ENABLED else None
             htf_data_reason = self._mtf_cache_reason if MTF_ENABLED else ""
+        if h1_gate_task is not None:
+            result_index += 1
         if sl_atr_task is not None:
             sl_atr, sl_atr_reason = results[result_index]
         else:
@@ -3589,6 +3693,31 @@ class GoldScalperLive:
                             confirm_dicts,
                             "ENTRY_GATES_BLOCKED",
                             gate_reason_text,
+                        )
+            if H1_GATE_MODE != "off":
+                h1_allowed, h1_reasons = evaluate_h1_trend_gate(
+                    decision.direction,
+                    self._h1_gate_bias,
+                    H1_GATE_STRICTNESS,
+                    unavailable_reason=self._h1_gate_reason,
+                )
+                if not h1_allowed:
+                    h1_reason_text = "; ".join(h1_reasons)
+                    if H1_GATE_MODE == "shadow":
+                        if self._h1_gate_shadow_logged_bar.get(timeframe) != bar_time:
+                            log.warning(
+                                "SHADOW_BLOCK h1_trend %s", h1_reason_text
+                            )
+                            self._h1_gate_shadow_logged_bar[timeframe] = bar_time
+                    else:
+                        log.warning(
+                            "ENTRY_GATE_BLOCK h1_trend %s", h1_reason_text
+                        )
+                        return (
+                            None,
+                            confirm_dicts,
+                            "H1_TREND_GATE_BLOCKED",
+                            h1_reason_text,
                         )
             if not quote:
                 return (
