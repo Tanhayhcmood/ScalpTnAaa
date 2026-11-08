@@ -18,6 +18,7 @@ Redis keys
   goldscalper:commands — pending commands dict in engine-key format (TTL 5 min)
   goldscalper:guardian — RiskGuardian circuit-breaker state (TTL 27 hours)
   goldscalper:entry-signal:<sha256> — atomic order dedup key (TTL 7 days)
+  goldscalper:trade_features — latest 500 trade decision-feature records
 """
 
 import hashlib
@@ -40,6 +41,8 @@ _CMD_TTL      = 300   # 5 min — stale commands become irrelevant
 _GUARDIAN_TTL = 97200  # 27h — covers the 26h freshness window after a restart
 _ENTRY_SIGNAL_PREFIX = "goldscalper:entry-signal:"
 _ENTRY_SIGNAL_TTL = 7 * 24 * 60 * 60  # retain dedup keys across process restarts
+_TRADE_FEATURES_KEY = "goldscalper:trade_features"
+_MAX_TRADE_FEATURES = 500
 
 _client              = None
 _last_failure_time: float = 0.0   # monotonic timestamp of last connection failure
@@ -449,4 +452,78 @@ def redis_update_snapshot_trades(trades: list) -> bool:
         logger.warning("Redis update_snapshot_trades: %s", exc)
         _reset_client()
         return False
+
+
+def redis_append_trade_feature(record: dict) -> bool:
+    """Keep a newest-first Redis list of at most 500 opened-trade snapshots."""
+    if not isinstance(record, dict) or record.get("ticket") is None:
+        return False
+    r = _get_client()
+    if r is None:
+        return False
+    try:
+        r.lpush(_TRADE_FEATURES_KEY, json.dumps(record, default=str))
+        r.ltrim(_TRADE_FEATURES_KEY, 0, _MAX_TRADE_FEATURES - 1)
+        return True
+    except Exception as exc:
+        logger.warning("Redis append_trade_feature: %s", exc)
+        _reset_client()
+        return False
+
+
+def redis_update_trade_feature(
+    ticket: object,
+    exit_type: str,
+    net_profit: float,
+) -> bool:
+    """Attach broker-confirmed close data to the matching ticket snapshot."""
+    if ticket is None:
+        return False
+    r = _get_client()
+    if r is None:
+        return False
+    try:
+        for index, raw in enumerate(r.lrange(_TRADE_FEATURES_KEY, 0, -1)):
+            try:
+                record = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("ticket")) != str(ticket):
+                continue
+            record["exit_type"] = exit_type
+            record["net_profit"] = net_profit
+            r.lset(
+                _TRADE_FEATURES_KEY,
+                index,
+                json.dumps(record, default=str),
+            )
+            return True
+        return False
+    except Exception as exc:
+        logger.warning("Redis update_trade_feature: %s", exc)
+        _reset_client()
+        return False
+
+
+def redis_read_trade_features() -> Optional[list[dict]]:
+    """Return newest-first trade-feature records, or None when Redis is down."""
+    r = _get_client()
+    if r is None:
+        return None
+    try:
+        records = []
+        for raw in r.lrange(_TRADE_FEATURES_KEY, 0, -1):
+            try:
+                record = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+        return records
+    except Exception as exc:
+        logger.warning("Redis read_trade_features: %s", exc)
+        _reset_client()
+        return None
 
