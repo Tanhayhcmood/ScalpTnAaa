@@ -60,6 +60,23 @@ from live_trading.config import (
 # 1.3 = profitable in expectancy even at 45% win rate (1.3 × 0.45 > 0.55).
 CONF_MARGINAL_RR = 1.3
 
+
+def _rr_requirements(
+    regime: str,
+    regime_min_rr: float,
+    range_min_rr: float,
+    tp_rr: float = FIXED_TP_RR,
+) -> tuple[float, float]:
+    """Resolve main and marginal R:R floors without changing RANGE policy."""
+    is_range = str(regime).upper() == "RANGE"
+    required_rr = float(range_min_rr if is_range else regime_min_rr)
+    marginal_required_rr = CONF_MARGINAL_RR
+    if not is_range and tp_rr < 2.0:
+        required_rr = min(required_rr, tp_rr)
+        marginal_required_rr = min(marginal_required_rr, tp_rr)
+    return required_rr, marginal_required_rr
+
+
 # Trend and Price Action can each select the candidate direction through their
 # own standalone gate. Agreement is stronger; SMC and Wyckoff remain diagnostic.
 # RANGE keeps its separate structural safeguards.
@@ -859,17 +876,24 @@ def run_decision_engine(
             range_context=range_context,
         )
 
+    required_rr, marginal_required_rr = _rr_requirements(
+        regime.regime,
+        regime.rules.min_rr,
+        range_min_rr,
+        FIXED_TP_RR,
+    )
+
     # Marginal confidence check
     min_conf = regime.rules.min_confidence
     if conf_result.confidence < min_conf:
-        if trade_params.risk_reward_ratio < CONF_MARGINAL_RR:
+        if trade_params.risk_reward_ratio < marginal_required_rr:
             return DecisionResult(
                 allowed=False, direction=candidate,  # type: ignore
                 confidence=conf_result.confidence, components=conf_result.components,
                 grade="MARGINAL", regime=regime.regime, regime_label=regime.rules.label,
                 regime_rules=regime.rules, quality_filter=quality,
                 blocked_reasons=[
-                    f"Marginal conf {conf_result.confidence:.1f}% requires R:R ≥ {CONF_MARGINAL_RR} "
+                    f"Marginal conf {conf_result.confidence:.1f}% requires R:R ≥ {marginal_required_rr} "
                     f"(got {trade_params.risk_reward_ratio:.2f})"
                 ],
                 reasoning=conf_result.reasoning, trade_params=None,
@@ -878,7 +902,6 @@ def run_decision_engine(
             )
 
     # R:R gate
-    required_rr = range_min_rr if regime.regime == "RANGE" else regime.rules.min_rr
     if trade_params.risk_reward_ratio < required_rr:
         return DecisionResult(
             allowed=False, direction=candidate,  # type: ignore
