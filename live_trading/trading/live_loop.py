@@ -107,6 +107,7 @@ from live_trading.mt5.connector import (
 from live_trading.mt5.executor import (
     place_market_order, close_position, modify_position, TradeResult
 )
+from live_trading.utils.broker_time import broker_time_to_utc
 from live_trading.trading.strategy_slots import (
     strategy_order_comment,
     strategy_slots_for_decision,
@@ -1981,18 +1982,26 @@ class GoldScalperLive:
         # the persisted trade history, so a Render restart cannot reset the
         # limit and over-trade a choppy market.
         if decision.regime == "RANGE":
-            session_date = bar_time.date()
+            session_date = broker_time_to_utc(bar_time).date()
             range_entries = 0
             for trade in self.trade_history:
                 if not isinstance(trade, dict) or trade.get("regime") != "RANGE":
                     continue
-                raw_time = trade.get("bar_time") or trade.get("logged_at")
+                raw_bar_time = trade.get("bar_time")
+                raw_time = raw_bar_time or trade.get("logged_at")
                 try:
-                    trade_date = datetime.fromisoformat(
+                    trade_datetime = datetime.fromisoformat(
                         str(raw_time).replace("Z", "+00:00")
-                    ).date()
+                    )
                 except (TypeError, ValueError):
                     continue
+                if raw_bar_time:
+                    trade_datetime = broker_time_to_utc(trade_datetime)
+                elif trade_datetime.tzinfo is None:
+                    trade_datetime = trade_datetime.replace(tzinfo=timezone.utc)
+                else:
+                    trade_datetime = trade_datetime.astimezone(timezone.utc)
+                trade_date = trade_datetime.date()
                 if trade_date == session_date:
                     range_entries += 1
             if range_entries >= MAX_RANGE_TRADES_PER_SESSION:

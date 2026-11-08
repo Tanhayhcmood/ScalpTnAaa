@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from live_trading.signals.gold_engine import OHLCV
 from live_trading.signals.market_regime import calc_adx
 from live_trading.config import CONF_HARD_MIN, QUALITY_ADX_MIN, STRUCTURE_MAX_AGE_BARS
+from live_trading.utils.broker_time import broker_time_to_utc
 
 # The robot may evaluate valid setups throughout the full UTC day.  Session
 # quality remains useful for confidence scoring, but it is informational only:
@@ -45,7 +46,7 @@ def get_session_quality(timestamp: object) -> Literal["PRIME", "MODERATE", "BLOC
     """Classify a candle timestamp in UTC without rejecting valid datetime objects."""
     try:
         if isinstance(timestamp, datetime):
-            dt = timestamp
+            dt = broker_time_to_utc(timestamp)
         elif isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
             epoch = float(timestamp)
             if epoch > 100_000_000_000:
@@ -55,11 +56,9 @@ def get_session_quality(timestamp: object) -> Literal["PRIME", "MODERATE", "BLOC
             text = str(timestamp).strip()
             if not text:
                 return "BLOCKED"
-            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        else:
-            dt = dt.astimezone(timezone.utc)
+            dt = broker_time_to_utc(
+                datetime.fromisoformat(text.replace("Z", "+00:00"))
+            )
     except (TypeError, ValueError, OverflowError, OSError):
         return "BLOCKED"
     hour = dt.hour

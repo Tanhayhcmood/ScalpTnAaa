@@ -48,6 +48,7 @@ from live_trading.mt5.volume_units import (
 )
 from live_trading.signals.gold_engine import OHLCV
 from live_trading.logger import get_logger
+from live_trading.utils.broker_time import observe_broker_server_time
 
 log = get_logger()
 
@@ -1410,7 +1411,10 @@ async def get_current_quote(symbol: str) -> dict:
                         server_time_raw = _field_value(
                             data, "time", "serverTime", "timeCurrent", "brokerTime"
                         )
-                        server_time, _ = _parse_broker_server_time(server_time_raw)
+                        server_time, server_wall_time = _parse_broker_server_time(
+                            server_time_raw
+                        )
+                        observe_broker_server_time(server_wall_time)
                         return {
                             "bid": float(bid),
                             "ask": float(ask),
