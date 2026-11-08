@@ -576,6 +576,90 @@ def classify_close_reason(
     return "Manual"
 
 
+def _trade_directional_pa_flag(
+    pa,
+    direction: str,
+    bullish_attribute: str,
+    bearish_attribute: str,
+) -> bool:
+    if direction == "BUY":
+        return bool(getattr(pa, bullish_attribute, False))
+    if direction == "SELL":
+        return bool(getattr(pa, bearish_attribute, False))
+    return False
+
+
+def _build_trade_feature_record(
+    ticket: object,
+    decision: DecisionResult,
+    h1_bias: str,
+    spread_at_entry: Optional[float],
+    stop_loss: Optional[float],
+    take_profit: Optional[float],
+    opened_at: Optional[datetime] = None,
+) -> dict:
+    """Snapshot decision inputs for a successful order without affecting entry."""
+    opened_at = opened_at or datetime.now(timezone.utc)
+    if opened_at.tzinfo is None:
+        opened_at = opened_at.replace(tzinfo=timezone.utc)
+    else:
+        opened_at = opened_at.astimezone(timezone.utc)
+
+    direction = str(getattr(decision, "direction", "")).upper()
+    trend = getattr(decision, "trend", None)
+    pa = getattr(decision, "pa", None)
+    quality_filter = getattr(decision, "quality_filter", None)
+    entry_filter = getattr(decision, "entry_filter", None)
+
+    return {
+        "ticket": str(ticket),
+        "time_utc": opened_at.isoformat(),
+        "direction": getattr(decision, "direction", None),
+        "regime": getattr(decision, "regime", None),
+        "trend": {
+            "score": getattr(trend, "score", None),
+            "strength": getattr(trend, "strength", None),
+        },
+        "pa_flags": {
+            "engulf": _trade_directional_pa_flag(
+                pa, direction, "bullish_engulf", "bearish_engulf"
+            ),
+            "inside_bar_breakout": _trade_directional_pa_flag(
+                pa, direction, "bullish_inside_breakout", "bearish_inside_breakout"
+            ),
+            "valid_breakout": _trade_directional_pa_flag(
+                pa, direction, "valid_bull_breakout", "valid_bear_breakout"
+            ),
+            "pullback": _trade_directional_pa_flag(
+                pa, direction, "bullish_pullback", "bearish_pullback"
+            ),
+        },
+        "pa_score": getattr(pa, "pa_score", None),
+        "confidence": getattr(decision, "confidence", None),
+        "adx": getattr(
+            quality_filter,
+            "adx",
+            getattr(trend, "adx", None),
+        ),
+        "session": getattr(quality_filter, "session_quality", None),
+        "h1_bias": h1_bias,
+        "entry_filter": {
+            "trend": bool(getattr(entry_filter, "trend", False)),
+            "price_action": bool(getattr(entry_filter, "price_action", False)),
+        },
+        "spread_at_entry": spread_at_entry,
+        "sl": stop_loss,
+        "tp": take_profit,
+    }
+
+
+def _trade_feature_exit_type(close_reason: str) -> str:
+    return {
+        "Trailing": "trailing",
+        "Manual": "manual",
+    }.get(close_reason, close_reason)
+
+
 class GoldScalperLive:
     def __init__(self):
         self.running: bool = True
@@ -619,6 +703,7 @@ class GoldScalperLive:
         # shared atomic claim when configured; this local set is the fallback
         # for single-process development and a fast duplicate check.
         self._attempted_entry_signal_ids: set[str] = set()
+        self._entry_spread_at_order: Optional[float] = None
         # tracks the last successfully placed trade (direction + bar_time)
         # so the post-SL cooldown gate can detect same-direction re-entry.
         self._last_entry_bar_time: Optional[datetime] = None
@@ -2277,6 +2362,7 @@ class GoldScalperLive:
         # opposite orders before the bridge exposes the first fill.
         signal_id = entry_signal_id(SYMBOL, tf, bar_time)
         tp_params = decision.trade_params
+        self._entry_spread_at_order = None
         result, _confirm_pos_dicts, _entry_stage, _entry_reason = (
             await self._safe_entry_order(
                 decision,
@@ -2308,6 +2394,33 @@ class GoldScalperLive:
             return
 
         if result.success:
+            if result.position_id is None:
+                log.warning(
+                    "Trade feature snapshot skipped: successful order has no ticket"
+                )
+            else:
+                feature_record = _build_trade_feature_record(
+                    ticket=result.position_id,
+                    decision=decision,
+                    h1_bias=self._h1_gate_bias,
+                    spread_at_entry=self._entry_spread_at_order,
+                    stop_loss=tp_params.stop_loss,
+                    take_profit=tp_params.take_profit,
+                )
+                try:
+                    from live_trading.redis_ipc import redis_append_trade_feature
+
+                    if not redis_append_trade_feature(feature_record):
+                        log.debug(
+                            "Trade feature snapshot not persisted for ticket=%s",
+                            result.position_id,
+                        )
+                except Exception as exc:
+                    log.warning(
+                        "Trade feature snapshot failed for ticket=%s: %s",
+                        result.position_id,
+                        exc,
+                    )
             if (
                 decision.regime == "RANGE"
                 and not RANGE_REQUIRE_EDGE_POSITION
@@ -3095,6 +3208,10 @@ class GoldScalperLive:
         commission = _history_float(history, "commission") or 0.0
         swap = _history_float(history, "swap") or 0.0
         fee = _history_float(history, "fee") or 0.0
+        net_profit = gross_profit + commission + swap + fee
+        close_reason = classify_close_reason(
+            history, entry, trailing_stop=trailing_stop
+        )
         entry.update({
             "ticket": ticket_id,
             "type": entry.get("direction", entry.get("type", "UNKNOWN")),
@@ -3107,14 +3224,26 @@ class GoldScalperLive:
             "commission": commission,
             "swap": swap,
             "fee": fee,
-            "profit": gross_profit + commission + swap + fee,
-            "close_reason": classify_close_reason(
-                history, entry, trailing_stop=trailing_stop
-            ),
+            "profit": net_profit,
+            "close_reason": close_reason,
             "close_comment": _history_value(history, "closeComment", "comment"),
             "close_source": "MT5_HISTORY",
             "status": "CLOSED",
         })
+        try:
+            from live_trading.redis_ipc import redis_update_trade_feature
+
+            redis_update_trade_feature(
+                ticket_id,
+                _trade_feature_exit_type(close_reason),
+                net_profit,
+            )
+        except Exception as exc:
+            log.warning(
+                "Could not update trade feature close for ticket=%s: %s",
+                ticket_id,
+                exc,
+            )
         log.info(
             f"Trade closed ticket={ticket_id} reason={entry['close_reason']} "
             f"price={close_price:.5f} profit={entry['profit']:+.2f} "
@@ -3667,15 +3796,15 @@ class GoldScalperLive:
                     str(exc),
                 )
             quote = await get_current_quote(SYMBOL)
+            spread_price = None
+            try:
+                bid = float(quote["bid"])
+                ask = float(quote["ask"])
+                if math.isfinite(bid) and math.isfinite(ask):
+                    spread_price = ask - bid
+            except (KeyError, TypeError, ValueError):
+                pass
             if ENTRY_GATES_MODE != "off":
-                spread_price = None
-                try:
-                    bid = float(quote["bid"])
-                    ask = float(quote["ask"])
-                    if math.isfinite(bid) and math.isfinite(ask):
-                        spread_price = ask - bid
-                except (KeyError, TypeError, ValueError):
-                    pass
                 gates_allowed, gate_reasons = evaluate_entry_gates(
                     datetime.now(timezone.utc),
                     spread_price,
@@ -4009,6 +4138,8 @@ class GoldScalperLive:
                 volume_step=risk_spec.volume_step,
                 volume_max=risk_spec.volume_max,
             )
+            if result.success:
+                self._entry_spread_at_order = spread_price
             if shared_claim_required and redis_ipc is not None:
                 try:
                     redis_ipc.redis_mark_entry_signal(
