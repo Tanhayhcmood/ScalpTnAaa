@@ -297,6 +297,9 @@ if ENTRY_GATES_MODE not in {"off", "shadow", "enforce"}:
         file=sys.stderr,
     )
     sys.exit(1)
+# Trade history persistence retains the latest 50 records.
+LOSS_STREAK_PAUSE_COUNT = _int("LOSS_STREAK_PAUSE_COUNT", 3, lo=1, hi=50)
+LOSS_STREAK_PAUSE_MINUTES = _int("LOSS_STREAK_PAUSE_MINUTES", 60, lo=1)
 MAX_SPREAD_PRICE = _float("MAX_SPREAD_PRICE", 0.50, lo=0.0)
 if not math.isfinite(MAX_SPREAD_PRICE):
     print(

@@ -4,6 +4,7 @@ Ported from capitalManager.ts
 """
 from dataclasses import dataclass
 import math
+import os
 from typing import Optional
 
 DEFAULT_RISK_PCT    = 1.0
@@ -11,7 +12,20 @@ ATR_BUFFER_MULT     = 0.25
 DEFAULT_SL_ATR_MULT = 3.00
 MIN_SL_ATR_MULT     = 1.50
 MAX_SL_ATR_MULT     = 3.50
-FIXED_TP_RR         = 2.00
+
+
+def _tp_rr_from_env() -> float:
+    raw = os.getenv("TP_RR", "2.0")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("TP_RR must be a number between 0.8 and 3.0") from exc
+    if not math.isfinite(value) or not 0.8 <= value <= 3.0:
+        raise ValueError("TP_RR must be a number between 0.8 and 3.0")
+    return value
+
+
+FIXED_TP_RR         = _tp_rr_from_env()
 LOT_DOLLAR_PER_UNIT = 100
 MIN_LOT             = 0.01
 LOT_STEP            = 0.01

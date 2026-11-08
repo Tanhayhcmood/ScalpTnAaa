@@ -42,6 +42,7 @@ from live_trading.config import (
     TRADE_WINDOW_UTC_START, TRADE_WINDOW_UTC_END,
     FRIDAY_LAST_ENTRY_UTC_HOUR,
     H1_GATE_MODE, H1_GATE_STRICTNESS,
+    LOSS_STREAK_PAUSE_COUNT, LOSS_STREAK_PAUSE_MINUTES,
     BAR_CHECK_INTERVAL, RECONNECT_DELAY, SYNC_TIMEOUT, RPC_CALL_TIMEOUT,
     MIN_CONFIRMATIONS, TREND_MIN_CONFIRMATIONS,
     ENTRY_CONFIRMATION_FLOOR,
@@ -134,6 +135,7 @@ from live_trading.trading.entry_guard import (
     validate_entry_price_distance,
 )
 from live_trading.trading.entry_gates import evaluate_entry_gates
+from live_trading.trading.loss_streak import evaluate_loss_streak_pause
 from live_trading.trading.active_entry_policy import (
     evaluate_active_entry,
     strong_trend_validation_reason,
@@ -638,6 +640,7 @@ class GoldScalperLive:
             "reasons": ["No live entry gate evaluation yet"],
         }
         self._entry_gate_shadow_logged_bar: dict[str, datetime] = {}
+        self._loss_streak_shadow_logged_bar: dict[str, datetime] = {}
         self._close_history_checked_at: dict[str, float] = {}
         self._open_position_snapshot_initialized = False
         self._last_history_sync_at: float = 0.0
@@ -736,10 +739,11 @@ class GoldScalperLive:
                  f"Slippage: ≤{SLIPPAGE_POINTS}pts")
         log.info("=" * 60)
 
-        self._write_state("STARTING")
-
         # Restore trade history from previous session (survives restarts)
+        # Do this before the first state write so an empty in-memory list does
+        # not replace persisted Redis recent_trades on process startup.
         self.trade_history = self._load_trade_history()
+        self._write_state("STARTING")
         # Restore per-ticket entry/initial-SL baselines before the first broker
         # sync.  These are persisted separately from trade history because the
         # live SL changes while the original R baseline must never change.
@@ -3693,6 +3697,29 @@ class GoldScalperLive:
                             confirm_dicts,
                             "ENTRY_GATES_BLOCKED",
                             gate_reason_text,
+                        )
+                loss_pause = evaluate_loss_streak_pause(
+                    self.trade_history,
+                    pause_count=LOSS_STREAK_PAUSE_COUNT,
+                    pause_minutes=LOSS_STREAK_PAUSE_MINUTES,
+                    now_utc=datetime.now(timezone.utc),
+                )
+                if loss_pause.active:
+                    if ENTRY_GATES_MODE == "shadow":
+                        if self._loss_streak_shadow_logged_bar.get(timeframe) != bar_time:
+                            log.warning(
+                                "SHADOW_BLOCK loss_streak %s", loss_pause.reason
+                            )
+                            self._loss_streak_shadow_logged_bar[timeframe] = bar_time
+                    else:
+                        log.warning(
+                            "ENTRY_GATE_BLOCK loss_streak %s", loss_pause.reason
+                        )
+                        return (
+                            None,
+                            confirm_dicts,
+                            "LOSS_STREAK_PAUSED",
+                            loss_pause.reason,
                         )
             if H1_GATE_MODE != "off":
                 h1_allowed, h1_reasons = evaluate_h1_trend_gate(
