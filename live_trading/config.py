@@ -289,6 +289,34 @@ STALENESS_LIMIT_RANGE = _float(
 
 # ── Risk & Trade Rules ───────────────────────────────────────────────────────
 # Production defaults — override via Render env vars if needed.
+ENTRY_GATES_MODE = os.getenv("ENTRY_GATES_MODE", "shadow").strip().lower()
+if ENTRY_GATES_MODE not in {"off", "shadow", "enforce"}:
+    print(
+        "ERROR: ENTRY_GATES_MODE must be off, shadow, or enforce. "
+        "Fix it in the Render dashboard and redeploy.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+MAX_SPREAD_PRICE = _float("MAX_SPREAD_PRICE", 0.50, lo=0.0)
+if not math.isfinite(MAX_SPREAD_PRICE):
+    print(
+        "ERROR: MAX_SPREAD_PRICE must be a finite number. "
+        "Fix it in the Render dashboard and redeploy.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+TRADE_WINDOW_UTC_START = _int("TRADE_WINDOW_UTC_START", 7, lo=0, hi=23)
+TRADE_WINDOW_UTC_END = _int("TRADE_WINDOW_UTC_END", 20, lo=1, hi=24)
+if TRADE_WINDOW_UTC_START >= TRADE_WINDOW_UTC_END:
+    print(
+        "ERROR: TRADE_WINDOW_UTC_START must be earlier than "
+        "TRADE_WINDOW_UTC_END.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+FRIDAY_LAST_ENTRY_UTC_HOUR = _int(
+    "FRIDAY_LAST_ENTRY_UTC_HOUR", 19, lo=0, hi=23
+)
 # ENABLED_STRATEGIES remains as a compatibility name for callers and old
 # Render variables. Its value is deliberately fixed so an old environment
 # setting cannot re-enable SMC or Wyckoff for live entries.
