@@ -126,6 +126,21 @@ async def _trade_features(req: web.Request) -> web.Response:
     return web.json_response({"trade_features": features})
 
 
+async def _connection_health(req: web.Request) -> web.Response:
+    """GET /connection-health — return authenticated broker connection history."""
+    authorized, status, message = _command_authorized(req)
+    if not authorized:
+        return web.json_response({"error": message}, status=status)
+    try:
+        from live_trading.mt5.connector import get_connection_health
+        return web.json_response(get_connection_health())
+    except Exception:
+        return web.json_response(
+            {"error": "connection health is unavailable"},
+            status=503,
+        )
+
+
 def _read_local_state() -> dict | None:
     """Read the local state file when cross-service Redis is unavailable."""
     try:
@@ -537,6 +552,7 @@ def _create_app() -> web.Application:
     app.router.add_get("/snapshot", _snapshot)
     app.router.add_post("/command", _command)
     app.router.add_get("/trade-features", _trade_features)
+    app.router.add_get("/connection-health", _connection_health)
     return app
 
 
