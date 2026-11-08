@@ -38,6 +38,9 @@ from live_trading.config import (
     STALENESS_LIMIT_WEAK_TREND, STALENESS_LIMIT_RANGE,
     LOW_VOLATILITY_SL_ATR_ADD,
     MAX_OPEN_TRADES, COMMENT,
+    ENTRY_GATES_MODE, MAX_SPREAD_PRICE,
+    TRADE_WINDOW_UTC_START, TRADE_WINDOW_UTC_END,
+    FRIDAY_LAST_ENTRY_UTC_HOUR,
     BAR_CHECK_INTERVAL, RECONNECT_DELAY, SYNC_TIMEOUT, RPC_CALL_TIMEOUT,
     MIN_CONFIRMATIONS, TREND_MIN_CONFIRMATIONS,
     ENTRY_CONFIRMATION_FLOOR,
@@ -123,6 +126,7 @@ from live_trading.trading.entry_guard import (
     staleness_limit_for_regime,
     validate_entry_price_distance,
 )
+from live_trading.trading.entry_gates import evaluate_entry_gates
 from live_trading.trading.active_entry_policy import (
     evaluate_active_entry,
     strong_trend_validation_reason,
@@ -621,6 +625,7 @@ class GoldScalperLive:
             "stage": "NOT_EVALUATED",
             "reasons": ["No live entry gate evaluation yet"],
         }
+        self._entry_gate_shadow_logged_bar: dict[str, datetime] = {}
         self._close_history_checked_at: dict[str, float] = {}
         self._open_position_snapshot_initialized = False
         self._last_history_sync_at: float = 0.0
@@ -3554,6 +3559,37 @@ class GoldScalperLive:
                     str(exc),
                 )
             quote = await get_current_quote(SYMBOL)
+            if ENTRY_GATES_MODE != "off":
+                spread_price = None
+                try:
+                    bid = float(quote["bid"])
+                    ask = float(quote["ask"])
+                    if math.isfinite(bid) and math.isfinite(ask):
+                        spread_price = ask - bid
+                except (KeyError, TypeError, ValueError):
+                    pass
+                gates_allowed, gate_reasons = evaluate_entry_gates(
+                    datetime.now(timezone.utc),
+                    spread_price,
+                    max_spread_price=MAX_SPREAD_PRICE,
+                    trade_window_utc_start=TRADE_WINDOW_UTC_START,
+                    trade_window_utc_end=TRADE_WINDOW_UTC_END,
+                    friday_last_entry_utc_hour=FRIDAY_LAST_ENTRY_UTC_HOUR,
+                )
+                if not gates_allowed:
+                    gate_reason_text = "; ".join(gate_reasons)
+                    if ENTRY_GATES_MODE == "shadow":
+                        if self._entry_gate_shadow_logged_bar.get(timeframe) != bar_time:
+                            log.warning("SHADOW_BLOCK %s", gate_reason_text)
+                            self._entry_gate_shadow_logged_bar[timeframe] = bar_time
+                    else:
+                        log.warning("ENTRY_GATE_BLOCK %s", gate_reason_text)
+                        return (
+                            None,
+                            confirm_dicts,
+                            "ENTRY_GATES_BLOCKED",
+                            gate_reason_text,
+                        )
             if not quote:
                 return (
                     None,
