@@ -540,6 +540,21 @@ COMMENT = "GSPv4"
 BAR_CHECK_INTERVAL = _int("BAR_CHECK_INTERVAL", 5, lo=1, hi=60)
 RECONNECT_DELAY    = 30       # seconds before reconnect attempt
 SYNC_TIMEOUT       = 120      # seconds to wait for initial connect
+# MTAPI connection retry policy. The cap prevents an invalid environment value
+# from producing an unbounded wait; authentication/trial failures use a separate
+# long interval because rapid retries cannot resolve them.
+MT5_CONNECT_RETRY_BASE_S = _int(
+    "MT5_CONNECT_RETRY_BASE_S", 5, lo=1, hi=120
+)
+MT5_CONNECT_RETRY_MAX_S = _int(
+    "MT5_CONNECT_RETRY_MAX_S", 120, lo=1, hi=3600
+)
+MT5_CONNECT_AUTH_RETRY_S = _int(
+    "MT5_CONNECT_AUTH_RETRY_S", 900, lo=60, hi=86400
+)
+MT5_CONNECT_RETRY_JITTER = _float(
+    "MT5_CONNECT_RETRY_JITTER", 0.2, lo=0.0, hi=0.5
+)
 # Bound individual broker HTTP calls so one stalled request cannot freeze the
 # trading loop and its heartbeat indefinitely.
 RPC_CALL_TIMEOUT   = _int("RPC_CALL_TIMEOUT", 30, lo=5, hi=120)

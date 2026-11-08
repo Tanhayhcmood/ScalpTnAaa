@@ -99,7 +99,10 @@ async def test_connectex_failure_records_event(clean_connection_health, monkeypa
     health = connector.get_connection_health()
     assert health["consecutive_failures"] == 1
     assert health["events"][-1]["event"] == "connect_failure"
-    assert health["events"][-1]["error_text"] == "ConnectEx returned HTTP 503"
+    assert health["events"][-1]["error_text"].startswith(
+        "ConnectEx returned HTTP 503"
+    )
+    assert health["events"][-1]["classification"] == "BRIDGE_DOWN"
 
 
 @pytest.mark.asyncio
