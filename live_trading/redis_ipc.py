@@ -43,6 +43,7 @@ _ENTRY_SIGNAL_PREFIX = "goldscalper:entry-signal:"
 _ENTRY_SIGNAL_TTL = 7 * 24 * 60 * 60  # retain dedup keys across process restarts
 _TRADE_FEATURES_KEY = "goldscalper:trade_features"
 _MAX_TRADE_FEATURES = 500
+_CONNECTION_EVENTS_KEY = "goldscalper:connection_events"
 
 _client              = None
 _last_failure_time: float = 0.0   # monotonic timestamp of last connection failure
@@ -267,6 +268,35 @@ def redis_read_snapshot() -> Optional[dict]:
         return json.loads(raw) if raw else None
     except Exception as exc:
         logger.warning("Redis read_snapshot: %s", exc)
+        _reset_client()
+        return None
+
+
+def redis_write_connection_events(data: dict) -> bool:
+    """Persist bounded MT5 connection-health history without an expiry."""
+    r = _get_client()
+    if r is None:
+        return False
+    try:
+        r.set(_CONNECTION_EVENTS_KEY, json.dumps(data, default=str))
+        return True
+    except Exception:
+        logger.warning("Redis write_connection_events failed")
+        _reset_client()
+        return False
+
+
+def redis_read_connection_events() -> Optional[dict]:
+    """Read persisted MT5 connection-health history, or None if unavailable."""
+    r = _get_client()
+    if r is None:
+        return None
+    try:
+        raw = r.get(_CONNECTION_EVENTS_KEY)
+        value = json.loads(raw) if raw else None
+        return value if isinstance(value, dict) else None
+    except Exception:
+        logger.warning("Redis read_connection_events failed")
         _reset_client()
         return None
 

@@ -28,7 +28,9 @@ MTAPI endpoints used:
 import asyncio
 import json
 import math
+import re
 import time as _time
+from collections import deque
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -80,9 +82,157 @@ _MT5_KEEPALIVE_INTERVAL_S: float = 180.0
 _MT5_SESSION_REFRESH_AGE_S: float = 14400.0
 _CANDLE_FETCH_CONNECT_TIMEOUT_S: float = 30.0
 _CANDLE_FETCH_HTTP_TIMEOUT_S: float = 60.0
+_CONNECTION_EVENT_LIMIT = 50
+_connection_events: deque[dict] = deque(maxlen=_CONNECTION_EVENT_LIMIT)
+_connection_health: dict = {
+    "last_success_utc": None,
+    "consecutive_failures": 0,
+    "total_reconnects": 0,
+    "last_error_class": None,
+    "last_error_text": None,
+}
+_connection_history_loaded = False
 _SYMBOL_PARAMS_RETRY_ATTEMPTS = 3
 _SYMBOL_PARAMS_RETRY_DELAY_S = 0.5
 _SYMBOL_TICK_SIZE_CACHE: dict[str, float] = {}
+
+
+def _redact_connection_text(value: object, *, limit: int = 200) -> str:
+    """Remove known credentials and common account/session fields from diagnostics."""
+    text = str(value or "")
+    for secret in (MT5_PASSWORD, _conn_id, MT5_USER):
+        secret = str(secret or "").strip()
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+            for encoded in {quote(secret, safe=""), quote_plus(secret, safe="")}:
+                if encoded:
+                    text = text.replace(encoded, "[REDACTED]")
+    text = re.sub(
+        r"""(?i)(["']?(?:password|passwd|token|conn[_-]?id|account(?:[_ -]?number)?|login|user|id)["']?\s*[:=]\s*["']?)[^&,\s"'}]+""",
+        r"\1[REDACTED]",
+        text,
+    )
+    return text[:limit]
+
+
+def _load_connection_history() -> None:
+    """Restore health counters and events once Redis is reachable."""
+    global _connection_history_loaded
+    if _connection_history_loaded:
+        return
+    try:
+        from live_trading.redis_ipc import (
+            redis_available,
+            redis_read_connection_events,
+        )
+        if not redis_available():
+            return
+        saved = redis_read_connection_events()
+    except Exception:
+        return
+
+    _connection_history_loaded = True
+    if not isinstance(saved, dict):
+        return
+
+    counters = saved.get("counters")
+    if isinstance(counters, dict):
+        _connection_health["last_success_utc"] = counters.get("last_success_utc")
+        for key in ("consecutive_failures", "total_reconnects"):
+            try:
+                _connection_health[key] = max(0, int(counters.get(key, 0)))
+            except (TypeError, ValueError):
+                _connection_health[key] = 0
+        error_class = counters.get("last_error_class")
+        _connection_health["last_error_class"] = (
+            _redact_connection_text(error_class, limit=80) if error_class else None
+        )
+        error_text = counters.get("last_error_text")
+        _connection_health["last_error_text"] = (
+            _redact_connection_text(error_text) if error_text else None
+        )
+
+    events = saved.get("events")
+    if isinstance(events, list):
+        _connection_events.clear()
+        for event in events[-_CONNECTION_EVENT_LIMIT:]:
+            if not isinstance(event, dict):
+                continue
+            restored = {
+                "timestamp_utc": str(event.get("timestamp_utc", ""))[:40],
+                "event": _redact_connection_text(event.get("event", "unknown"), limit=80),
+            }
+            if event.get("source"):
+                restored["source"] = _redact_connection_text(event["source"], limit=80)
+            if event.get("error_class"):
+                restored["error_class"] = _redact_connection_text(
+                    event["error_class"], limit=80
+                )
+            if event.get("error_text"):
+                restored["error_text"] = _redact_connection_text(event["error_text"])
+            _connection_events.append(restored)
+
+
+def _persist_connection_history() -> None:
+    try:
+        from live_trading.redis_ipc import redis_write_connection_events
+        redis_write_connection_events({
+            "counters": dict(_connection_health),
+            "events": list(_connection_events),
+        })
+    except Exception:
+        # Connection telemetry must never interrupt broker or trading work.
+        pass
+
+
+def _record_connection_event(
+    event: str,
+    *,
+    source: str | None = None,
+    error: BaseException | None = None,
+    message: object | None = None,
+    failure: bool = False,
+) -> None:
+    """Append a redacted event and persist the bounded health snapshot."""
+    _load_connection_history()
+    now = datetime.now(timezone.utc).isoformat()
+    event_record: dict = {
+        "timestamp_utc": now,
+        "event": _redact_connection_text(event, limit=80),
+    }
+    if source:
+        event_record["source"] = _redact_connection_text(source, limit=80)
+
+    if event == "connect_success":
+        if _connection_health["last_success_utc"] is not None:
+            _connection_health["total_reconnects"] += 1
+        _connection_health["last_success_utc"] = now
+        _connection_health["consecutive_failures"] = 0
+
+    if failure:
+        error_class = type(error).__name__ if error is not None else "ConnectionError"
+        error_text = _redact_connection_text(
+            message if message is not None else (error or event)
+        )
+        _connection_health["consecutive_failures"] += 1
+        _connection_health["last_error_class"] = _redact_connection_text(
+            error_class, limit=80
+        )
+        _connection_health["last_error_text"] = error_text
+        event_record["error_class"] = _connection_health["last_error_class"]
+        event_record["error_text"] = error_text
+
+    _connection_events.append(event_record)
+    _persist_connection_history()
+
+
+def get_connection_health() -> dict:
+    """Return a copy of counters and the most recent redacted connection events."""
+    _load_connection_history()
+    return {
+        **_connection_health,
+        "events": [dict(event) for event in _connection_events],
+    }
 
 
 def _connect_params(
@@ -284,8 +434,21 @@ async def _wait_for_broker_ready(
                 data = await resp.json(content_type=None)
                 if _connection_status_is_alive(data):
                     return True
+                _record_connection_event(
+                    "connection_status_not_alive",
+                    source="connectex_readiness",
+                    error=ConnectionError("ConnectionStatus reported not alive"),
+                    message=f"ConnectionStatus reported not alive (HTTP {resp.status})",
+                    failure=True,
+                )
                 last_status = str(data)[:180] if resp.status < 500 else f"HTTP {resp.status}"
         except Exception as exc:
+            _record_connection_event(
+                "connection_status_error",
+                source="connectex_readiness",
+                error=exc,
+                failure=True,
+            )
             last_status = str(exc)[:180]
         remaining = deadline - _time.monotonic()
         if remaining <= 0:
@@ -314,16 +477,26 @@ async def _connect_unlocked() -> bool:
     password = MT5_PASSWORD.strip() if MT5_PASSWORD else ""
     if not base:
         log.error("MTAPI_URL is not set. Set it to the MTAPI REST base URL.")
+        _record_connection_event(
+            "connect_failure",
+            error=ValueError("MTAPI_URL is not configured"),
+            failure=True,
+        )
         return False
     if not user or not password or not host:
         log.error("MT5_USER, MT5_PASSWORD, and MT5_HOST must be set for MTAPI /ConnectEx.")
+        _record_connection_event(
+            "connect_failure",
+            error=ValueError("MT5 connection configuration is incomplete"),
+            failure=True,
+        )
         return False
 
     previous_conn_id = _conn_id
     previous_connected = _connected
     _base_url = base
-    sess = _get_session()
     try:
+        sess = _get_session()
         log.info(
             "MTAPI /ConnectEx request prepared: "
             f"account={user[:3]}*** host={host} port={MT5_PORT} "
@@ -343,11 +516,21 @@ async def _connect_unlocked() -> bool:
             if resp.status != 200:
                 log.error(f"MTAPI /ConnectEx failed (status={resp.status}): {raw[:300]}")
                 _connected = False
+                _record_connection_event(
+                    "connect_failure",
+                    error=ConnectionError(f"ConnectEx returned HTTP {resp.status}"),
+                    failure=True,
+                )
                 return False
             conn_id = raw.strip().strip('"')
             if not conn_id or len(conn_id) < 10:
                 log.error(f"MTAPI /ConnectEx returned an unexpected token: {raw[:200]}")
                 _connected = False
+                _record_connection_event(
+                    "connect_failure",
+                    error=ConnectionError("ConnectEx returned an invalid session token"),
+                    failure=True,
+                )
                 return False
             if not await _wait_for_broker_ready(base, conn_id):
                 try:
@@ -361,10 +544,16 @@ async def _connect_unlocked() -> bool:
                     pass
                 _connected = previous_connected
                 _conn_id = previous_conn_id
+                _record_connection_event(
+                    "connect_failure",
+                    error=ConnectionError("broker session was not ready after ConnectEx"),
+                    failure=True,
+                )
                 return False
             _conn_id = conn_id
             _connected = True
             _last_connect_time = _time.monotonic()
+            _record_connection_event("connect_success", source="ConnectEx")
             log.info(
                 f"MTAPI connection success: MT5 account connected "
                 f"(host={host}, port={MT5_PORT}, account={user[:3]}***)"
@@ -383,6 +572,7 @@ async def _connect_unlocked() -> bool:
     except Exception as exc:
         log.error(f"MTAPI connection failure: {exc}")
         _connected = False
+        _record_connection_event("connect_failure", source="ConnectEx", error=exc, failure=True)
         return False
 
 
@@ -438,9 +628,27 @@ async def keepalive_mtapi() -> bool:
             ok = resp.status == 200 and _connection_status_is_alive(data)
             if not ok:
                 log.warning(f"MTAPI broker-session keepalive returned {resp.status}")
+                if not _connection_status_is_alive(data):
+                    _record_connection_event(
+                        "connection_status_not_alive",
+                        source="keepalive",
+                        error=ConnectionError("ConnectionStatus reported not alive"),
+                        message=f"ConnectionStatus reported not alive (HTTP {resp.status})",
+                        failure=True,
+                    )
+                else:
+                    _record_connection_event(
+                        "connection_status_error",
+                        source="keepalive",
+                        error=ConnectionError(f"ConnectionStatus returned HTTP {resp.status}"),
+                        failure=True,
+                    )
             return ok
     except Exception as exc:
         log.warning(f"MTAPI broker-session keepalive failed: {exc}")
+        _record_connection_event(
+            "connection_status_error", source="keepalive", error=exc, failure=True
+        )
         return False
 
 
@@ -481,6 +689,12 @@ async def connect_with_retry(max_attempts: int = 5, retry_delay: float = 60.0) -
 def _invalidate_connection() -> None:
     global _connected, _conn_id
     log.warning("MT5 conn_id is stale — invalidating connection (will reconnect on retry)")
+    _record_connection_event(
+        "connection_invalidated",
+        source="invalidate",
+        error=ConnectionError("MT5 connection was invalidated"),
+        failure=True,
+    )
     _connected = False
     _conn_id = ""
 
@@ -503,8 +717,20 @@ async def ensure_connected(*args, **kwargs) -> bool:
                 if _connection_status_is_alive(data):
                     _connected = True
                     return True
-        except Exception:
-            pass
+                _record_connection_event(
+                    "connection_status_not_alive",
+                    source="ensure_connected",
+                    error=ConnectionError("ConnectionStatus reported not alive"),
+                    message=f"ConnectionStatus reported not alive (HTTP {resp.status})",
+                    failure=True,
+                )
+        except Exception as exc:
+            _record_connection_event(
+                "connection_status_error",
+                source="ensure_connected",
+                error=exc,
+                failure=True,
+            )
     _connected = False
     # connect() owns the lock and rechecks state after waiting for any other
     # handshake to finish. Avoid holding the lock across retry sleeps.
@@ -514,15 +740,26 @@ async def ensure_connected(*args, **kwargs) -> bool:
 async def start_connection_watchdog(interval_seconds: float = 30.0) -> None:
     global _watchdog_task
     log.info(f"[watchdog] MT5 connection watchdog started (interval={interval_seconds}s)")
+    _record_connection_event("watchdog_started", source="watchdog")
     failures = 0
     try:
         while True:
             await asyncio.sleep(interval_seconds)
             if _connected and _time.monotonic() - _last_connect_time < _CONNECT_GRACE_PERIOD:
+                _record_connection_event("watchdog_skipped_grace_period", source="watchdog")
                 continue
             if not _connected or not _conn_id:
+                _record_connection_event("watchdog_reconnect_attempt", source="watchdog")
                 if await ensure_connected():
                     log.info("[watchdog] MT5 proactive reconnect succeeded")
+                    _record_connection_event("watchdog_reconnect_success", source="watchdog")
+                else:
+                    _record_connection_event(
+                        "watchdog_reconnect_failure",
+                        source="watchdog",
+                        error=ConnectionError("watchdog reconnect failed"),
+                        failure=True,
+                    )
                 continue
             try:
                 async with _get_session().get(
@@ -533,17 +770,43 @@ async def start_connection_watchdog(interval_seconds: float = 30.0) -> None:
                     data = await resp.json(content_type=None)
                     if _connection_status_is_alive(data):
                         failures = 0
+                        _record_connection_event(
+                            "watchdog_connection_status_alive", source="watchdog"
+                        )
                     else:
                         failures += 1
+                        _record_connection_event(
+                            "connection_status_not_alive",
+                            source="watchdog",
+                            error=ConnectionError("ConnectionStatus reported not alive"),
+                            message=f"ConnectionStatus reported not alive (HTTP {resp.status})",
+                            failure=True,
+                        )
             except Exception as exc:
                 failures += 1
                 log.warning(f"[watchdog] ConnectionStatus check failed ({failures}/2): {exc}")
+                _record_connection_event(
+                    "watchdog_status_check_error",
+                    source="watchdog",
+                    error=exc,
+                    failure=True,
+                )
             if failures >= 2:
                 failures = 0
                 _invalidate_connection()
-                await ensure_connected()
+                _record_connection_event("watchdog_reconnect_attempt", source="watchdog")
+                if await ensure_connected():
+                    _record_connection_event("watchdog_reconnect_success", source="watchdog")
+                else:
+                    _record_connection_event(
+                        "watchdog_reconnect_failure",
+                        source="watchdog",
+                        error=ConnectionError("watchdog reconnect failed"),
+                        failure=True,
+                    )
     except asyncio.CancelledError:
         log.info("[watchdog] MT5 connection watchdog stopped")
+        _record_connection_event("watchdog_stopped", source="watchdog")
         raise
 
 
