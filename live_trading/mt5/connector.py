@@ -26,8 +26,10 @@ MTAPI endpoints used:
 """
 
 import asyncio
+import errno
 import json
 import math
+import random
 import re
 import time as _time
 from collections import deque
@@ -42,6 +44,8 @@ from live_trading.config import (
     MTAPI_URL, MT5_HOST, MT5_PORT,
     MT5_USER, MT5_PASSWORD,
     SYNC_TIMEOUT, XAUUSD_TICK_SIZE,
+    MT5_CONNECT_RETRY_BASE_S, MT5_CONNECT_RETRY_MAX_S,
+    MT5_CONNECT_AUTH_RETRY_S, MT5_CONNECT_RETRY_JITTER,
 )
 from live_trading.mt5.volume_units import (
     configured_mtapi_volume_scale,
@@ -76,6 +80,9 @@ _CONNECT_READY_POLL_INITIAL_S: float = 2.0
 _CONNECT_READY_POLL_MAX_S: float = 15.0
 
 _reconnect_lock: asyncio.Lock | None = None
+_connect_retry_lock: asyncio.Lock | None = None
+_connect_retry_attempt = 0
+_connect_retry_transient_attempt = 0
 _watchdog_task: asyncio.Task | None = None
 _MT5_KEEPALIVE_TASK: asyncio.Task | None = None
 _MT5_KEEPALIVE_INTERVAL_S: float = 180.0
@@ -113,6 +120,98 @@ def _redact_connection_text(value: object, *, limit: int = 200) -> str:
         text,
     )
     return text[:limit]
+
+
+def _classify_connection_error(
+    error: object | None = None,
+    message: object | None = None,
+    status: int | None = None,
+) -> str:
+    """Map MTAPI response and transport failures to stable operator categories."""
+    parts = [str(value) for value in (message, error) if value is not None]
+    text = " ".join(parts).casefold()
+    if status is None:
+        match = re.search(r"\bhttp(?:/\d(?:\.\d)?)?\s+(\d{3})\b", text)
+        if match:
+            status = int(match.group(1))
+
+    if "trial expired" in text:
+        return "TRIAL_EXPIRED"
+    if "service_not_available" in text or "service not available" in text:
+        return "BROKER_UNAVAILABLE"
+    if any(
+        phrase in text
+        for phrase in (
+            "invalid account",
+            "account is invalid",
+            "invalid password",
+            "password is invalid",
+            "wrong password",
+            "incorrect password",
+            "authentication failed",
+            "unauthorized",
+            "bad credentials",
+        )
+    ) or status in {401, 403}:
+        return "AUTH_ERROR"
+
+    current = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ConnectionRefusedError) or getattr(
+            current, "errno", None
+        ) == errno.ECONNREFUSED:
+            return "BRIDGE_DOWN"
+        if isinstance(current, (asyncio.TimeoutError, TimeoutError)):
+            return "BROKER_UNAVAILABLE"
+        current = (
+            getattr(current, "os_error", None)
+            or getattr(current, "__cause__", None)
+            or getattr(current, "__context__", None)
+        )
+
+    if status in {502, 503, 504} or any(
+        phrase in text for phrase in ("connection refused", "econnrefused")
+    ):
+        return "BRIDGE_DOWN"
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError)) or any(
+        phrase in text
+        for phrase in (
+            "timeout",
+            "timed out",
+            "timedout",
+            "connect timeout",
+            "connection timeout",
+        )
+    ):
+        return "BROKER_UNAVAILABLE"
+    return "UNKNOWN"
+
+
+def _retry_backoff_delay(classification: str, attempt: int) -> float:
+    """Return a bounded exponential delay, with jitter for transient failures."""
+    if classification in {"AUTH_ERROR", "TRIAL_EXPIRED"}:
+        return float(MT5_CONNECT_AUTH_RETRY_S)
+
+    base = max(1, MT5_CONNECT_RETRY_BASE_S)
+    ceiling = max(base, MT5_CONNECT_RETRY_MAX_S)
+    nominal = base
+    for _ in range(max(0, attempt - 1)):
+        if nominal >= ceiling:
+            break
+        nominal = min(nominal * 2, ceiling)
+    configured_jitter = float(MT5_CONNECT_RETRY_JITTER)
+    jitter = (
+        min(max(configured_jitter, 0.0), 0.5)
+        if math.isfinite(configured_jitter)
+        else 0.2
+    )
+    if jitter == 0.0:
+        return float(nominal)
+    # Positive-only jitter preserves the configured minimum wait and avoids a
+    # low random draw recreating the rapid retry pattern this policy prevents.
+    return random.uniform(float(nominal), min(float(ceiling), nominal * (1 + jitter)))
 
 
 def _load_connection_history() -> None:
@@ -170,6 +269,10 @@ def _load_connection_history() -> None:
                 )
             if event.get("error_text"):
                 restored["error_text"] = _redact_connection_text(event["error_text"])
+            if event.get("classification"):
+                restored["classification"] = _redact_connection_text(
+                    event["classification"], limit=40
+                )
             _connection_events.append(restored)
 
 
@@ -191,6 +294,8 @@ def _record_connection_event(
     source: str | None = None,
     error: BaseException | None = None,
     message: object | None = None,
+    status: int | None = None,
+    classification: str | None = None,
     failure: bool = False,
 ) -> None:
     """Append a redacted event and persist the bounded health snapshot."""
@@ -221,6 +326,28 @@ def _record_connection_event(
         _connection_health["last_error_text"] = error_text
         event_record["error_class"] = _connection_health["last_error_class"]
         event_record["error_text"] = error_text
+        classified = classification or _classify_connection_error(
+            error=error,
+            message=message if message is not None else error_text,
+            status=status,
+        )
+        event_record["classification"] = classified
+        if classified == "AUTH_ERROR":
+            log.error(
+                "MTAPI %s failed with AUTH_ERROR (invalid account/password or "
+                "authentication rejected); retrying every %ss. Verify the "
+                "broker credentials.",
+                source or event,
+                MT5_CONNECT_AUTH_RETRY_S,
+            )
+        elif classified == "TRIAL_EXPIRED":
+            log.error(
+                "MTAPI %s failed with TRIAL_EXPIRED; automatic retries cannot "
+                "restore an expired trial. Purchase/activate the full version; "
+                "the next retry is in %ss.",
+                source or event,
+                MT5_CONNECT_AUTH_RETRY_S,
+            )
 
     _connection_events.append(event_record)
     _persist_connection_history()
@@ -233,6 +360,24 @@ def get_connection_health() -> dict:
         **_connection_health,
         "events": [dict(event) for event in _connection_events],
     }
+
+
+def _record_data_call_failure(
+    source: str,
+    *,
+    error: BaseException | None = None,
+    message: object | None = None,
+    status: int | None = None,
+) -> None:
+    """Record an endpoint failure with its normalized connection classification."""
+    _record_connection_event(
+        "data_call_failure",
+        source=source,
+        error=error,
+        message=message,
+        status=status,
+        failure=True,
+    )
 
 
 def _connect_params(
@@ -264,6 +409,14 @@ def _get_reconnect_lock() -> asyncio.Lock:
     if _reconnect_lock is None:
         _reconnect_lock = asyncio.Lock()
     return _reconnect_lock
+
+
+def _get_connect_retry_lock() -> asyncio.Lock:
+    """Ensure concurrent callers share one unbounded reconnect loop."""
+    global _connect_retry_lock
+    if _connect_retry_lock is None:
+        _connect_retry_lock = asyncio.Lock()
+    return _connect_retry_lock
 
 
 _TF_MAP = {
@@ -432,15 +585,25 @@ async def _wait_for_broker_ready(
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 data = await resp.json(content_type=None)
-                if _connection_status_is_alive(data):
+                if resp.status == 200 and _connection_status_is_alive(data):
                     return True
                 _record_connection_event(
                     "connection_status_not_alive",
                     source="connectex_readiness",
                     error=ConnectionError("ConnectionStatus reported not alive"),
-                    message=f"ConnectionStatus reported not alive (HTTP {resp.status})",
+                    message=(
+                        f"ConnectionStatus reported not alive (HTTP {resp.status}): "
+                        f"{data!s}"
+                    ),
+                    status=resp.status,
                     failure=True,
                 )
+                classification = _classify_connection_error(
+                    message=data,
+                    status=resp.status,
+                )
+                if classification in {"AUTH_ERROR", "TRIAL_EXPIRED"}:
+                    return False
                 last_status = str(data)[:180] if resp.status < 500 else f"HTTP {resp.status}"
         except Exception as exc:
             _record_connection_event(
@@ -454,11 +617,49 @@ async def _wait_for_broker_ready(
         if remaining <= 0:
             log.error(
                 "MT5 session was created but broker was not ready within "
-                f"{timeout_s:.0f}s (last status: {last_status})"
+                f"{timeout_s:.0f}s (last status: "
+                f"{_redact_connection_text(last_status, limit=180)})"
             )
             return False
         await asyncio.sleep(min(delay, remaining))
         delay = min(delay * 1.5, _CONNECT_READY_POLL_MAX_S)
+
+
+async def _previous_connection_is_alive(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    conn_id: str,
+) -> bool:
+    """Only preserve an older session after MTAPI confirms it is still alive."""
+    try:
+        async with session.get(
+            f"{base_url}/ConnectionStatus",
+            params={"id": conn_id},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            data = await resp.json(content_type=None)
+            alive = resp.status == 200 and _connection_status_is_alive(data)
+            if not alive:
+                _record_connection_event(
+                    "connection_status_not_alive",
+                    source="previous_session_validation",
+                    error=ConnectionError("previous ConnectionStatus was not alive"),
+                    message=(
+                        f"Previous ConnectionStatus reported not alive "
+                        f"(HTTP {resp.status}): {data!s}"
+                    ),
+                    status=resp.status,
+                    failure=True,
+                )
+            return alive
+    except Exception as exc:
+        _record_connection_event(
+            "connection_status_error",
+            source="previous_session_validation",
+            error=exc,
+            failure=True,
+        )
+        return False
 
 
 async def _connect_unlocked() -> bool:
@@ -493,7 +694,7 @@ async def _connect_unlocked() -> bool:
         return False
 
     previous_conn_id = _conn_id
-    previous_connected = _connected
+    previous_base_url = _base_url
     _base_url = base
     try:
         sess = _get_session()
@@ -513,18 +714,33 @@ async def _connect_unlocked() -> bool:
         ) as resp:
             raw = await resp.text()
             log.debug(f"MTAPI /ConnectEx response ({resp.status}): [response received]")
-            if resp.status != 200:
-                log.error(f"MTAPI /ConnectEx failed (status={resp.status}): {raw[:300]}")
+            classification = _classify_connection_error(
+                message=raw, status=resp.status
+            )
+            if resp.status != 200 or classification != "UNKNOWN":
+                safe_body = _redact_connection_text(raw, limit=300)
+                if classification not in {"AUTH_ERROR", "TRIAL_EXPIRED"}:
+                    log.error(
+                        "MTAPI /ConnectEx failed (status=%s, classification=%s): %s",
+                        resp.status,
+                        classification,
+                        safe_body,
+                    )
                 _connected = False
                 _record_connection_event(
                     "connect_failure",
                     error=ConnectionError(f"ConnectEx returned HTTP {resp.status}"),
+                    message=f"ConnectEx returned HTTP {resp.status}: {raw}",
+                    status=resp.status,
                     failure=True,
                 )
                 return False
             conn_id = raw.strip().strip('"')
             if not conn_id or len(conn_id) < 10:
-                log.error(f"MTAPI /ConnectEx returned an unexpected token: {raw[:200]}")
+                log.error(
+                    "MTAPI /ConnectEx returned an unexpected session token "
+                    "(response body redacted)"
+                )
                 _connected = False
                 _record_connection_event(
                     "connect_failure",
@@ -533,6 +749,15 @@ async def _connect_unlocked() -> bool:
                 )
                 return False
             if not await _wait_for_broker_ready(base, conn_id):
+                readiness_classification = next(
+                    (
+                        event.get("classification", "UNKNOWN")
+                        for event in reversed(_connection_events)
+                        if event.get("source") == "connectex_readiness"
+                        and event.get("classification")
+                    ),
+                    "UNKNOWN",
+                )
                 try:
                     async with sess.get(
                         f"{base}/Disconnect",
@@ -542,11 +767,23 @@ async def _connect_unlocked() -> bool:
                         pass
                 except Exception:
                     pass
-                _connected = previous_connected
-                _conn_id = previous_conn_id
+                previous_alive = bool(
+                    previous_conn_id
+                    and await _previous_connection_is_alive(
+                        sess, previous_base_url or base, previous_conn_id
+                    )
+                )
+                if previous_alive:
+                    _base_url = previous_base_url or base
+                    _connected = True
+                    _conn_id = previous_conn_id
+                else:
+                    _connected = False
+                    _conn_id = ""
                 _record_connection_event(
                     "connect_failure",
                     error=ConnectionError("broker session was not ready after ConnectEx"),
+                    classification=readiness_classification,
                     failure=True,
                 )
                 return False
@@ -570,7 +807,7 @@ async def _connect_unlocked() -> bool:
                     log.debug(f"Previous MT5 session cleanup skipped: {exc}")
             return True
     except Exception as exc:
-        log.error(f"MTAPI connection failure: {exc}")
+        log.error("MTAPI connection failure: %s", _redact_connection_text(exc))
         _connected = False
         _record_connection_event("connect_failure", source="ConnectEx", error=exc, failure=True)
         return False
@@ -633,7 +870,11 @@ async def keepalive_mtapi() -> bool:
                         "connection_status_not_alive",
                         source="keepalive",
                         error=ConnectionError("ConnectionStatus reported not alive"),
-                        message=f"ConnectionStatus reported not alive (HTTP {resp.status})",
+                        message=(
+                            f"ConnectionStatus reported not alive "
+                            f"(HTTP {resp.status}): {data!s}"
+                        ),
+                        status=resp.status,
                         failure=True,
                     )
                 else:
@@ -641,6 +882,8 @@ async def keepalive_mtapi() -> bool:
                         "connection_status_error",
                         source="keepalive",
                         error=ConnectionError(f"ConnectionStatus returned HTTP {resp.status}"),
+                        message=f"ConnectionStatus HTTP {resp.status}: {data!s}",
+                        status=resp.status,
                         failure=True,
                     )
             return ok
@@ -675,15 +918,46 @@ async def keepalive_metaapi() -> bool:
 
 
 async def connect_with_retry(max_attempts: int = 5, retry_delay: float = 60.0) -> bool:
-    for attempt in range(1, max_attempts + 1):
-        log.info(f"MT5 connect attempt {attempt}/{max_attempts} ...")
-        if await connect():
-            return True
-        if attempt < max_attempts:
-            log.warning(f"MT5 connect failed (attempt {attempt}). Waiting {retry_delay}s ...")
-            await asyncio.sleep(retry_delay)
-    log.error(f"MT5 connect failed after {max_attempts} attempts.")
-    return False
+    """Retry until a session is established; legacy arguments remain accepted.
+
+    ``max_attempts`` and ``retry_delay`` are retained for call-site compatibility,
+    but no longer cap retries or override the environment-configured policy.
+    """
+    global _connect_retry_attempt, _connect_retry_transient_attempt
+    async with _get_connect_retry_lock():
+        while True:
+            _connect_retry_attempt += 1
+            log.info(f"MT5 connect attempt {_connect_retry_attempt} ...")
+            if await connect():
+                _connect_retry_attempt = 0
+                _connect_retry_transient_attempt = 0
+                return True
+            classification = (
+                _connection_events[-1].get("classification", "UNKNOWN")
+                if _connection_events
+                else "UNKNOWN"
+            )
+            if classification in {"AUTH_ERROR", "TRIAL_EXPIRED"}:
+                delay = _retry_backoff_delay(
+                    classification, _connect_retry_attempt
+                )
+                log.info(
+                    "MT5 connection remains unavailable (%s); retrying in %.0f seconds.",
+                    classification,
+                    delay,
+                )
+            else:
+                _connect_retry_transient_attempt += 1
+                delay = _retry_backoff_delay(
+                    classification, _connect_retry_transient_attempt
+                )
+                log.warning(
+                    "MT5 connection failed (%s, attempt %d); retrying in %.1f seconds.",
+                    classification,
+                    _connect_retry_attempt,
+                    delay,
+                )
+            await asyncio.sleep(delay)
 
 
 def _invalidate_connection() -> None:
@@ -714,14 +988,18 @@ async def ensure_connected(*args, **kwargs) -> bool:
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 data = await resp.json(content_type=None)
-                if _connection_status_is_alive(data):
+                if resp.status == 200 and _connection_status_is_alive(data):
                     _connected = True
                     return True
                 _record_connection_event(
                     "connection_status_not_alive",
                     source="ensure_connected",
                     error=ConnectionError("ConnectionStatus reported not alive"),
-                    message=f"ConnectionStatus reported not alive (HTTP {resp.status})",
+                    message=(
+                        f"ConnectionStatus reported not alive (HTTP {resp.status}): "
+                        f"{data!s}"
+                    ),
+                    status=resp.status,
                     failure=True,
                 )
         except Exception as exc:
@@ -734,7 +1012,7 @@ async def ensure_connected(*args, **kwargs) -> bool:
     _connected = False
     # connect() owns the lock and rechecks state after waiting for any other
     # handshake to finish. Avoid holding the lock across retry sleeps.
-    return await connect_with_retry(max_attempts=3, retry_delay=30.0)
+    return await connect_with_retry()
 
 
 async def start_connection_watchdog(interval_seconds: float = 30.0) -> None:
@@ -768,7 +1046,7 @@ async def start_connection_watchdog(interval_seconds: float = 30.0) -> None:
                     timeout=aiohttp.ClientTimeout(total=8),
                 ) as resp:
                     data = await resp.json(content_type=None)
-                    if _connection_status_is_alive(data):
+                    if resp.status == 200 and _connection_status_is_alive(data):
                         failures = 0
                         _record_connection_event(
                             "watchdog_connection_status_alive", source="watchdog"
@@ -776,10 +1054,18 @@ async def start_connection_watchdog(interval_seconds: float = 30.0) -> None:
                     else:
                         failures += 1
                         _record_connection_event(
-                            "connection_status_not_alive",
+                            (
+                                "connection_status_not_alive"
+                                if not _connection_status_is_alive(data)
+                                else "connection_status_error"
+                            ),
                             source="watchdog",
                             error=ConnectionError("ConnectionStatus reported not alive"),
-                            message=f"ConnectionStatus reported not alive (HTTP {resp.status})",
+                            message=(
+                                f"ConnectionStatus reported not alive "
+                                f"(HTTP {resp.status}): {data!s}"
+                            ),
+                            status=resp.status,
                             failure=True,
                         )
             except Exception as exc:
@@ -849,7 +1135,14 @@ async def resolve_symbol_name(symbol: str) -> Optional[str]:
             ) as resp:
                 data = await resp.json(content_type=None)
                 if resp.status >= 400:
-                    raise RuntimeError(f"HTTP {resp.status}: {str(data)[:160]}")
+                    failure_message = f"HTTP {resp.status}: {str(data)[:160]}"
+                    raise RuntimeError(failure_message)
+                if isinstance(data, dict) and _field_value(
+                    data, "error", "exception", "stackTrace", "message"
+                ) is not None:
+                    raise RuntimeError(
+                        f"MTAPI Symbols error: {str(data)[:160]}"
+                    )
                 if isinstance(data, list):
                     names = [str(item) for item in data]
                 elif isinstance(data, dict):
@@ -885,6 +1178,12 @@ async def resolve_symbol_name(symbol: str) -> Optional[str]:
                 )
                 return None
         except Exception as exc:
+            _record_connection_event(
+                "data_call_failure",
+                source="Symbols",
+                error=exc,
+                failure=True,
+            )
             if attempt == 0:
                 _invalidate_connection()
                 continue
@@ -974,11 +1273,13 @@ async def fetch_candles(
     for attempt in range(2):
         if not _conn_id:
             try:
-                connected = await asyncio.wait_for(
-                    ensure_connected(),
-                    timeout=_CANDLE_FETCH_CONNECT_TIMEOUT_S,
-                )
+                connected = await ensure_connected()
             except Exception as exc:
+                _record_data_call_failure(
+                    "PriceHistory_connect",
+                    error=exc,
+                    message="fetch_candles connection check failed",
+                )
                 log.error(
                     "fetch_candles connection check failed endpoint=%s "
                     "status=unavailable body='' exception=%s: %s "
@@ -992,6 +1293,11 @@ async def fetch_candles(
                 )
                 return []
             if not connected:
+                _record_data_call_failure(
+                    "PriceHistory_connect",
+                    error=ConnectionError("No active MTAPI session"),
+                    message="No active MTAPI session before PriceHistory request",
+                )
                 log.error(
                     "fetch_candles connection unavailable endpoint=%s "
                     "status=unavailable body='' exception=NoActiveSession "
@@ -1077,6 +1383,12 @@ async def fetch_candles(
                     status = resp.status
                     raw_body = await resp.text()
             except Exception as exc:
+                _record_data_call_failure(
+                    "PriceHistory",
+                    error=exc,
+                    message=f"PriceHistory request failed: {raw_body}",
+                    status=status,
+                )
                 log.error(
                     "fetch_candles request failed endpoint=%s status=%s params=%s "
                     "body=%s exception=%s: %s (attempt=%d)",
@@ -1103,6 +1415,11 @@ async def fetch_candles(
             )
 
             if status != 200:
+                _record_data_call_failure(
+                    endpoint_path.lstrip("/"),
+                    message=f"HTTP {status}: {raw_body}",
+                    status=status,
+                )
                 if endpoint_path == "/PriceHistory" and status in {404, 405}:
                     try_legacy_endpoint = True
                     log.warning(
@@ -1130,6 +1447,12 @@ async def fetch_candles(
             try:
                 data = json.loads(raw_body)
             except (TypeError, ValueError) as exc:
+                _record_data_call_failure(
+                    endpoint_path.lstrip("/"),
+                    error=exc,
+                    message=f"Invalid JSON response: {raw_body}",
+                    status=status,
+                )
                 log.error(
                     "fetch_candles invalid JSON endpoint=%s status=%d params=%s "
                     "body=%s exception=%s: %s (attempt=%d)",
@@ -1144,6 +1467,12 @@ async def fetch_candles(
                 continue
 
             if not isinstance(data, list):
+                _record_data_call_failure(
+                    endpoint_path.lstrip("/"),
+                    error=TypeError(f"Unexpected payload type {type(data).__name__}"),
+                    message=f"Unexpected payload: {raw_body}",
+                    status=status,
+                )
                 log.error(
                     "fetch_candles returned non-list payload endpoint=%s "
                     "status=%d params=%s body=%s "
@@ -1295,6 +1624,14 @@ async def get_account_info() -> dict:
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 data = await resp.json(content_type=None)
+                if resp.status >= 400 or not (
+                    isinstance(data, dict) and "balance" in data
+                ):
+                    _record_data_call_failure(
+                        "AccountSummary",
+                        message=f"HTTP {resp.status}: {data!s}",
+                        status=resp.status,
+                    )
                 if isinstance(data, dict) and "balance" in data:
                     return {
                         "balance": float(data.get("balance", 0.0)),
@@ -1318,6 +1655,7 @@ async def get_account_info() -> dict:
                     continue
                 return {}
         except Exception as exc:
+            _record_data_call_failure("AccountSummary", error=exc)
             if attempt == 0:
                 _invalidate_connection()
                 continue
@@ -1358,15 +1696,22 @@ async def get_open_positions(
             ) as resp:
                 data = await resp.json(content_type=None)
                 if attempt == 0 and isinstance(data, dict) and "stackTrace" in data:
+                    _record_data_call_failure(
+                        "OpenedOrders",
+                        message=f"API error response: {data!s}",
+                        status=resp.status,
+                    )
                     _invalidate_connection()
                     continue
                 positions, dropped = _parse_open_positions_response(
                     data, resp.status, known_positions
                 )
                 return (positions, dropped) if return_diagnostics else positions
-        except RuntimeError:
+        except RuntimeError as exc:
+            _record_data_call_failure("OpenedOrders", error=exc)
             raise
         except Exception as exc:
+            _record_data_call_failure("OpenedOrders", error=exc)
             if attempt == 0:
                 _invalidate_connection()
                 continue
@@ -1416,6 +1761,11 @@ async def get_closed_position_history(position_id: str) -> Optional[dict]:
             ) as resp:
                 data = await resp.json(content_type=None)
                 if attempt == 0 and isinstance(data, dict) and "stackTrace" in data:
+                    _record_data_call_failure(
+                        "HistoryPositions",
+                        message=f"API error response: {data!s}",
+                        status=resp.status,
+                    )
                     _invalidate_connection()
                     continue
                 if resp.status >= 400:
@@ -1435,9 +1785,11 @@ async def get_closed_position_history(position_id: str) -> Optional[dict]:
                     if ticket is not None and str(ticket) == wanted:
                         return record
                 return None
-        except RuntimeError:
+        except RuntimeError as exc:
+            _record_data_call_failure("HistoryPositions", error=exc)
             raise
         except Exception as exc:
+            _record_data_call_failure("HistoryPositions", error=exc)
             if attempt == 0:
                 _invalidate_connection()
                 continue
@@ -1479,6 +1831,11 @@ async def get_deals_by_time_range(
             ) as resp:
                 data = await resp.json(content_type=None)
                 if attempt == 0 and isinstance(data, dict) and "stackTrace" in data:
+                    _record_data_call_failure(
+                        "OrderHistory",
+                        message=f"API error response: {data!s}",
+                        status=resp.status,
+                    )
                     _invalidate_connection()
                     continue
                 if resp.status >= 400:
@@ -1511,9 +1868,11 @@ async def get_deals_by_time_range(
                         or []
                     )
                 return [row for row in rows if isinstance(row, dict)]
-        except RuntimeError:
+        except RuntimeError as exc:
+            _record_data_call_failure("OrderHistory", error=exc)
             raise
         except Exception as exc:
+            _record_data_call_failure("OrderHistory", error=exc)
             if attempt == 0:
                 _invalidate_connection()
                 continue
@@ -1667,6 +2026,13 @@ async def get_current_quote(symbol: str) -> dict:
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 data = await resp.json(content_type=None)
+                failure_recorded = resp.status >= 400
+                if failure_recorded:
+                    _record_data_call_failure(
+                        "GetQuote",
+                        message=f"HTTP {resp.status}: {data!s}",
+                        status=resp.status,
+                    )
                 if isinstance(data, dict) and not _is_error_quote(data):
                     bid = _field_value(data, "bid")
                     ask = _field_value(data, "ask")
@@ -1684,11 +2050,18 @@ async def get_current_quote(symbol: str) -> dict:
                             "server_time": server_time,
                             "server_time_raw": server_time_raw,
                         }
+                if not failure_recorded:
+                    _record_data_call_failure(
+                        "GetQuote",
+                        message=f"Invalid quote response (HTTP {resp.status}): {data!s}",
+                        status=resp.status,
+                    )
                 if attempt == 0:
                     _invalidate_connection()
                     continue
                 return {}
         except Exception as exc:
+            _record_data_call_failure("GetQuote", error=exc)
             if attempt == 0:
                 _invalidate_connection()
                 continue
@@ -2106,6 +2479,12 @@ async def get_symbol_params(symbol: str) -> dict:
             # The request did not yield a response. The empty body and
             # unavailable status are still included in the failure diagnostic.
 
+        status_code = status if isinstance(status, int) else None
+        _record_data_call_failure(
+            "SymbolParams",
+            message=f"{last_failure}: {raw_body}",
+            status=status_code,
+        )
         log.warning(
             "MTAPI SymbolParams tick-size lookup failed request=%s status=%s "
             "body=%s reason=%s attempt=%d/%d",
