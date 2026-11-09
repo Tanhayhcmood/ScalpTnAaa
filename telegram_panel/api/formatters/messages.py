@@ -120,6 +120,32 @@ class MessageFormatter:
                 f"📉 <b>Drawdown:</b> {dd_pct:.1f}%\n"
             )
 
+        session_edge = robot_state.get("session_edge") or {}
+        vwap_filter = robot_state.get("vwap_filter") or {}
+        context_lines = ""
+        if isinstance(session_edge, dict) or isinstance(vwap_filter, dict):
+            edge_label = str(
+                session_edge.get("signal") or session_edge.get("status") or "—"
+            ).upper()
+            if session_edge.get("signal") and not session_edge.get("active"):
+                edge_label += " (INACTIVE)"
+            mode_label = str(
+                vwap_filter.get("mode") or session_edge.get("mode") or "off"
+            ).upper()
+            vwap_label = str(
+                vwap_filter.get("action") or vwap_filter.get("status") or "—"
+            ).upper()
+            vwap_value = vwap_filter.get("vwap")
+            try:
+                vwap_label += f" · {float(vwap_value):.2f}" if vwap_value is not None else ""
+            except (TypeError, ValueError):
+                pass
+            context_lines = (
+                f"<code>{_DIVIDER}</code>\n"
+                f"🧭 <b>Session edge:</b> {edge_label} · {mode_label}\n"
+                f"📍 <b>Daily VWAP:</b> {vwap_label}\n"
+            )
+
         cpu = system_stats.get("cpu_percent", 0)
         ram = system_stats.get("ram_percent", 0)
 
@@ -135,6 +161,7 @@ class MessageFormatter:
             f"<code>{_DIVIDER}</code>\n"
             f"📈 <b>Open Trades:</b>   {active_trades}\n"
             f"⏳ <b>Pending Orders:</b> {pending_orders}\n"
+            f"{context_lines}"
             f"<code>{_DIVIDER}</code>\n"
             f"🖥️ <b>CPU:</b>  {cpu:.1f}%\n"
             f"🧮 <b>RAM:</b>  {ram:.1f}%\n"

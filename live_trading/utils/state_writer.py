@@ -198,6 +198,8 @@ def write_robot_state(
                 if hasattr(decision, "pa") and hasattr(decision, "quality_filter")
                 else None
             ),
+            "session_edge": getattr(decision, "session_edge", None),
+            "vwap_filter": getattr(decision, "vwap_filter", None),
         }
 
     # Derive connection/MT5 status from the ACTUAL connector state.
@@ -296,6 +298,8 @@ def write_robot_state(
         "open_position":    pos_data,
         "open_positions":   positions_data,
         "last_decision":    dec_data,
+        "session_edge": (dec_data or {}).get("session_edge"),
+        "vwap_filter": (dec_data or {}).get("vwap_filter"),
         # Kept separate from last_decision.allowed so panel consumers cannot
         # confuse a signal with a fully evaluated, live entry permission.
         "trade_permission": trade_permission or {

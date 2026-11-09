@@ -132,6 +132,7 @@ from live_trading.mt5.executor import (
     place_market_order, close_position, modify_position, TradeResult
 )
 from live_trading.utils.broker_time import broker_time_to_utc
+from live_trading.signals.session_edge import evaluate_entry_context
 from live_trading.trading.strategy_slots import (
     strategy_order_comment,
     strategy_slots_for_decision,
@@ -1969,6 +1970,49 @@ class GoldScalperLive:
         )
         self.last_decision = decision
 
+        # Session Edge is a separate context gate; shadow mode only records
+        # WOULD_ALLOW/WOULD_BLOCK and never changes this decision.
+        session_candles = (
+            candles
+            if _is_m5_timeframe(tf)
+            else next(
+                (window for timeframe, window in self._last_candles_by_timeframe.items()
+                 if _is_m5_timeframe(timeframe) and window),
+                [],
+            )
+        )
+        session_edge_trade_dates = {
+            str(trade.get("session_edge_trade_date_utc"))
+            for trade in self.trade_history
+            if isinstance(trade, dict) and trade.get("session_edge_trade_date_utc")
+        }
+        entry_filter = decision.entry_filter
+        session_edge_applicable = bool(
+            entry_filter and (entry_filter.trend or entry_filter.price_action)
+        )
+        session_context = evaluate_entry_context(
+            session_candles,
+            decision.direction,
+            applicable=session_edge_applicable,
+            session_edge_trade_dates=session_edge_trade_dates,
+        )
+        decision.session_edge = session_context["session_edge"]
+        decision.vwap_filter = session_context["vwap_filter"]
+        if (
+            decision.vwap_filter["mode"] == "enforce"
+            and decision.allowed
+            and session_edge_applicable
+            and not decision.vwap_filter["would_allow"]
+        ):
+            reason = (
+                "Session Edge blocked entry: price is not on the directional side of daily VWAP, "
+                "and no unused matching Asian signal is active"
+            )
+            decision.allowed = False
+            decision.blocked_reasons.append(reason)
+            decision.reasoning.append(reason)
+            decision.trade_params = None
+
         # 6. Write MT5 snapshot for Telegram panel
         last_c = candles[-1]
         _strategy_telemetry = describe_strategy(decision)
@@ -2561,6 +2605,15 @@ class GoldScalperLive:
                     scalp_baseline.get("reached_half_r", False)
                 ),
             }
+            edge_state = decision.session_edge or {}
+            if (
+                decision.vwap_filter
+                and decision.vwap_filter.get("mode") == "enforce"
+                and edge_state.get("available_to_trade")
+                and edge_state.get("signal") == decision.direction
+                and edge_state.get("date_utc")
+            ):
+                entry_log["session_edge_trade_date_utc"] = edge_state["date_utc"]
             log_trade(self.trade_history, entry_log)
             # Publish the "why" behind this trade, keyed by ticket, so the
             # Telegram panel's TRADE OPENED notification can explain the

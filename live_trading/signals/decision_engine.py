@@ -376,6 +376,8 @@ class DecisionResult:
     regime_strength: str                         = ""
     policy_regime: str                           = ""
     minimum_rr: Optional[float]                  = None
+    session_edge: Optional[dict]                  = None
+    vwap_filter: Optional[dict]                   = None
 
 
 def _candidate_direction(
