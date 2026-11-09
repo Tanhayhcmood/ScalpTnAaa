@@ -70,6 +70,9 @@ from live_trading.config import (
     MTF_OPPOSITION_THRESHOLD, MTF_REQUIRE_ALIGNMENT, MTF_DRY_RUN,
     TRADE_TIMEFRAMES,
     ALLOW_HEDGED_POSITIONS,
+    SCALP_PROFILE, SCALP_SL_MIN_ATR, SCALP_SL_MAX_ATR,
+    SCALP_TIME_STOP_BARS, SCALP_TP1_RR, SCALP_TP2_RR,
+    SCALP_MIN_NET_RR,
 )
 from live_trading.logger import get_logger
 from live_trading.risk.guardian import RiskGuardian, GuardianStatus
@@ -85,6 +88,13 @@ from live_trading.risk.aggregate_risk import (
     RiskCalculationError,
     build_symbol_risk_spec,
     size_order_for_aggregate_risk,
+)
+from live_trading.risk.scalp_exit import (
+    breakeven_stop_price,
+    closed_m5_bars_since_entry,
+    best_favorable_price_since_entry,
+    scalp_time_stop_due,
+    split_close_volume,
 )
 from live_trading.signals.decision_engine import (
     run_decision_engine,
@@ -215,6 +225,10 @@ def _normalize_bar_time(value: object) -> Optional[datetime]:
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
     return parsed
+
+
+def _is_m5_timeframe(value: object) -> bool:
+    return str(value or "").strip().upper() in {"M5", "5M"}
 
 
 def _numeric_field(mapping: object, *keys: str) -> Optional[float]:
@@ -677,6 +691,7 @@ class GoldScalperLive:
         self._last_bar_times: dict[str, Optional[datetime]] = {
             tf: None for tf in TRADE_TIMEFRAMES
         }
+        self._scalp_m5_bar_time: Optional[datetime] = None
         # Latest completed bar time observed for non-trade context timeframes
         # (currently H1). It lets the HTF caches refresh once per new H1 bar.
         self._latest_completed_bar_times: dict[str, Optional[datetime]] = {}
@@ -1305,10 +1320,18 @@ class GoldScalperLive:
             # knows when a new H1 context is available, without fetching the
             # full H1 candle window on every lower-timeframe bar.
             poll_timeframes.append(MTF_TIMEFRAME)
-        if SL_ATR_TIMEFRAME not in poll_timeframes:
+        if SL_ATR_TIMEFRAME not in poll_timeframes and not (
+            SCALP_PROFILE == "on"
+            and _is_m5_timeframe(SL_ATR_TIMEFRAME)
+            and any(_is_m5_timeframe(tf) for tf in poll_timeframes)
+        ):
             # Keep the higher-timeframe ATR cache aligned with the completed
             # bar that produced it; do not fetch M5 ATR on every M1 signal.
             poll_timeframes.append(SL_ATR_TIMEFRAME)
+        if SCALP_PROFILE == "on" and not any(
+            _is_m5_timeframe(tf) for tf in poll_timeframes
+        ):
+            poll_timeframes.append("M5")
 
         async def _poll(tf: str):
             try:
@@ -1381,6 +1404,33 @@ class GoldScalperLive:
                     results.append((tf, _bt_naive))
             except Exception as _bar_err:
                 log.warning(f"[{tf}] Bar time check failed: {_bar_err}")
+        if SCALP_PROFILE == "on":
+            m5_timeframe = next(
+                (tf for tf in poll_timeframes if _is_m5_timeframe(tf)),
+                "M5",
+            )
+            if m5_timeframe not in trade_timeframes:
+                m5_bar_time = self._latest_completed_bar_times.get(m5_timeframe)
+                has_cached_m5 = any(
+                    _is_m5_timeframe(tf) and candles
+                    for tf, candles in self._last_candles_by_timeframe.items()
+                )
+                if m5_bar_time is not None and (
+                    not has_cached_m5
+                    or self._scalp_m5_bar_time is None
+                    or m5_bar_time > self._scalp_m5_bar_time
+                ):
+                    try:
+                        m5_candles = await fetch_candles(
+                            SYMBOL, m5_timeframe, CANDLE_WINDOW
+                        )
+                        if m5_candles:
+                            self._last_candles_by_timeframe[m5_timeframe] = list(
+                                m5_candles
+                            )
+                            self._scalp_m5_bar_time = m5_bar_time
+                    except Exception as exc:
+                        log.warning("Scalp M5 candle refresh failed: %s", exc)
         return results
 
     # ── Per-bar handler ───────────────────────────────────────────────────────
@@ -2403,6 +2453,7 @@ class GoldScalperLive:
                 tf,
                 bar_time,
                 signal_atr,
+                protective_atr=sl_atr,
                 account_balance=balance,
                 account_equity=float(acc_info.get("equity") or balance),
                 account_currency=str(acc_info.get("currency") or "").strip(),
@@ -2475,6 +2526,9 @@ class GoldScalperLive:
             self._last_entry_bar_time   = bar_time
             self._last_entry_direction  = decision.direction
             strategy = describe_strategy(decision)
+            scalp_baseline = self._trail_baselines.get(
+                str(result.position_id), {}
+            )
             entry_log = {
                 "position_id": result.position_id,
                 "direction":   decision.direction,
@@ -2491,6 +2545,21 @@ class GoldScalperLive:
                 "signal_id":   signal_id,
                 "strategy":    strategy,
                 "strategy_slots": list(candidate_strategy_slots),
+                "opened_at": scalp_baseline.get("opened_at"),
+                "scalp_profile": bool(scalp_baseline.get("scalp_profile", False)),
+                "initial_volume": scalp_baseline.get("initial_volume"),
+                "volume_min": scalp_baseline.get("volume_min"),
+                "volume_step": scalp_baseline.get("volume_step"),
+                "spread_buffer": scalp_baseline.get("spread_buffer"),
+                "price_digits": scalp_baseline.get("price_digits"),
+                "tp1_price": scalp_baseline.get("tp1_price"),
+                "tp1_done": bool(scalp_baseline.get("tp1_done", False)),
+                "scalp_be_done": bool(
+                    scalp_baseline.get("scalp_be_done", False)
+                ),
+                "reached_half_r": bool(
+                    scalp_baseline.get("reached_half_r", False)
+                ),
             }
             log_trade(self.trade_history, entry_log)
             # Publish the "why" behind this trade, keyed by ticket, so the
@@ -2507,7 +2576,8 @@ class GoldScalperLive:
             # exactly once, at open, and never touched again — the staircase
             # always measures its R-multiples from here, never from wherever
             # the stop has since been trailed to.
-            self._trail_baselines[str(result.position_id)] = {
+            baseline = self._trail_baselines.get(str(result.position_id), {})
+            baseline.update({
                 "id":            result.position_id,
                 "direction":     decision.direction,
                 "entry":         tp_params.entry_price,
@@ -2517,7 +2587,8 @@ class GoldScalperLive:
                 "highest_price_since_entry": tp_params.entry_price,
                 "lowest_price_since_entry": tp_params.entry_price,
                 "breakeven_armed": False,
-            }
+            })
+            self._trail_baselines[str(result.position_id)] = baseline
             # Build a synthetic position so the Telegram panel reflects the
             # newly opened trade immediately rather than waiting up to 5 min
             # for the next bar to re-fetch live positions.
@@ -2608,6 +2679,20 @@ class GoldScalperLive:
                     "highest_price_since_entry": float(entry["entry"]),
                     "lowest_price_since_entry": float(entry["entry"]),
                     "breakeven_armed": False,
+                    "scalp_profile": bool(entry.get("scalp_profile", False)),
+                    "opened_at": entry.get("opened_at") or pos.get("open_time"),
+                    "initial_volume": float(
+                        entry.get("initial_volume", entry.get("lot", pos.get("volume", 0.0)))
+                        or 0.0
+                    ),
+                    "volume_min": entry.get("volume_min"),
+                    "volume_step": entry.get("volume_step"),
+                    "spread_buffer": float(entry.get("spread_buffer") or 0.0),
+                    "price_digits": int(entry.get("price_digits") or 2),
+                    "tp1_price": entry.get("tp1_price"),
+                    "tp1_done": bool(entry.get("tp1_done", False)),
+                    "scalp_be_done": bool(entry.get("scalp_be_done", False)),
+                    "reached_half_r": bool(entry.get("reached_half_r", False)),
                     }
                 break
         # Fallback: derive from the position's live snapshot.
@@ -2627,6 +2712,8 @@ class GoldScalperLive:
                 "highest_price_since_entry": float(pos.get("open_price", 0.0)),
                 "lowest_price_since_entry": float(pos.get("open_price", 0.0)),
                 "breakeven_armed": False,
+                    "scalp_profile": False,
+                    "opened_at": pos.get("open_time"),
             }
         return None
 
@@ -2636,6 +2723,220 @@ class GoldScalperLive:
         log.info("Trailing sync: reason=%s", reason)
         await self._manage_trailing_stop()
 
+    async def _manage_scalp_exit(
+        self,
+        pos: dict,
+        baseline: dict,
+        current_price: float,
+        quote: dict,
+        m5_candles: list,
+    ) -> bool:
+        if not baseline.get("scalp_profile"):
+            return False
+        direction = str(baseline["direction"]).upper()
+        position_id = str(pos["id"])
+        entry = float(baseline["entry"])
+        risk_distance = float(baseline.get("risk_distance") or 0.0)
+        if risk_distance <= 0 or not math.isfinite(risk_distance):
+            return False
+        opened_at = baseline.get("opened_at") or pos.get("open_time")
+        best_price = best_favorable_price_since_entry(
+            m5_candles,
+            opened_at,
+            direction,
+            entry,
+            current_price,
+        )
+        if best_price is not None:
+            if direction == "BUY":
+                baseline["highest_price_since_entry"] = max(
+                    float(baseline.get("highest_price_since_entry", entry)),
+                    entry,
+                    best_price,
+                )
+                favorable_move = float(baseline["highest_price_since_entry"]) - entry
+            else:
+                baseline["lowest_price_since_entry"] = min(
+                    float(baseline.get("lowest_price_since_entry", entry)),
+                    entry,
+                    best_price,
+                )
+                favorable_move = entry - float(baseline["lowest_price_since_entry"])
+            if favorable_move >= risk_distance * 0.5:
+                baseline["reached_half_r"] = True
+        else:
+            favorable_move = (
+                current_price - entry
+                if direction == "BUY"
+                else entry - current_price
+            )
+            if favorable_move >= risk_distance * 0.5:
+                baseline["reached_half_r"] = True
+
+        bars_since_entry = closed_m5_bars_since_entry(m5_candles, opened_at)
+        if scalp_time_stop_due(
+            bars_since_entry,
+            bool(baseline.get("reached_half_r", False)),
+            SCALP_TIME_STOP_BARS,
+        ):
+            result = await close_position(position_id)
+            self._last_trailing_statuses[position_id] = {
+                "active": True,
+                "action": "TIME_STOP_CLOSED" if result.success else "ERROR",
+                "reason": (
+                    f"SCALP_TIME_STOP after {bars_since_entry} closed M5 bars"
+                    if result.success
+                    else result.message
+                ),
+            }
+            log.info(
+                "Scalp time stop: ticket=%s bars=%d reached_half_r=%s action=%s",
+                position_id,
+                bars_since_entry,
+                baseline.get("reached_half_r", False),
+                "CLOSED" if result.success else "ERROR",
+            )
+            return True
+
+        if (
+            favorable_move + 1e-9 < risk_distance * SCALP_TP1_RR
+            and not baseline.get("tp1_done")
+        ):
+            return False
+
+        if not baseline.get("tp1_done"):
+            initial_volume = float(
+                baseline.get("initial_volume") or pos.get("volume") or 0.0
+            )
+            current_volume = float(pos.get("volume") or 0.0)
+            volume_min = baseline.get("volume_min")
+            volume_step = baseline.get("volume_step")
+            partial_volume = split_close_volume(
+                initial_volume,
+                volume_min,
+                volume_step,
+            )
+            if partial_volume is None:
+                result = await close_position(position_id)
+                self._last_trailing_statuses[position_id] = {
+                    "active": True,
+                    "action": "TP1_FULL_CLOSED" if result.success else "ERROR",
+                    "reason": (
+                        "volume cannot be split within broker constraints"
+                        if result.success
+                        else result.message
+                    ),
+                }
+                log.info(
+                    "Scalp TP1: ticket=%s volume=unsplittable action=%s",
+                    position_id,
+                    "FULL_CLOSE" if result.success else "ERROR",
+                )
+                return True
+
+            expected_remaining = initial_volume - partial_volume
+            try:
+                step_tolerance = max(float(volume_step) * 0.5, 1e-8)
+            except (TypeError, ValueError):
+                step_tolerance = 1e-8
+            if current_volume <= expected_remaining + step_tolerance:
+                baseline["tp1_done"] = True
+                baseline["partial_close_volume"] = partial_volume
+            else:
+                result = await close_position(
+                    position_id,
+                    volume=partial_volume,
+                )
+                if not result.success:
+                    self._last_trailing_statuses[position_id] = {
+                        "active": True,
+                        "action": "ERROR",
+                        "reason": f"TP1 partial close failed: {result.message}",
+                    }
+                    log.warning(
+                        "Scalp TP1: ticket=%s partial=%s action=ERROR reason=%s",
+                        position_id,
+                        partial_volume,
+                        result.message,
+                    )
+                    return True
+                baseline["tp1_done"] = True
+                baseline["partial_close_volume"] = partial_volume
+
+        if not baseline.get("scalp_be_done"):
+            try:
+                live_spread = max(
+                    0.0,
+                    float(quote["ask"]) - float(quote["bid"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                live_spread = 0.0
+            spread_buffer = max(
+                live_spread,
+                float(baseline.get("spread_buffer") or 0.0),
+            )
+            be_stop = breakeven_stop_price(
+                entry,
+                direction,
+                spread_buffer,
+                int(baseline.get("price_digits") or 2),
+            )
+            if be_stop is None:
+                self._last_trailing_statuses[position_id] = {
+                    "active": True,
+                    "action": "ERROR",
+                    "reason": "invalid breakeven stop inputs",
+                }
+                return True
+            crossed_be = (
+                current_price <= be_stop
+                if direction == "BUY"
+                else current_price >= be_stop
+            )
+            if crossed_be:
+                result = await close_position(position_id)
+                self._last_trailing_statuses[position_id] = {
+                    "active": True,
+                    "action": "TP1_REMAINDER_CLOSED" if result.success else "ERROR",
+                    "reason": (
+                        "price crossed the spread-buffered breakeven level"
+                        if result.success
+                        else result.message
+                    ),
+                }
+                return True
+
+            result = await modify_position(position_id, be_stop, pos["tp"])
+            if not result.success:
+                self._last_trailing_statuses[position_id] = {
+                    "active": True,
+                    "action": "ERROR",
+                    "reason": f"breakeven move failed: {result.message}",
+                }
+                log.warning(
+                    "Scalp breakeven: ticket=%s action=ERROR reason=%s",
+                    position_id,
+                    result.message,
+                )
+                return True
+            baseline["scalp_be_done"] = True
+            baseline["breakeven_armed"] = True
+            baseline["be_stop"] = be_stop
+            self._last_trailing_statuses[position_id] = {
+                "active": True,
+                "action": "BREAKEVEN_MOVED",
+                "reason": "TP1 reached; 50% closed and SL moved beyond entry",
+            }
+            log.info(
+                "Scalp TP1: ticket=%s partial=%s SL=%s TP=%s",
+                position_id,
+                baseline.get("partial_close_volume"),
+                be_stop,
+                pos["tp"],
+            )
+            return True
+        return False
+
     async def _manage_trailing_stop(self) -> None:
         """Manage every open ticket independently on every loop tick.
 
@@ -2643,7 +2944,7 @@ class GoldScalperLive:
         ``return_exceptions=True``.  A broker error for one ticket therefore
         cannot prevent the other open positions from receiving their update.
         """
-        if not self.trailing_enabled:
+        if not self.trailing_enabled and SCALP_PROFILE != "on":
             return
 
         try:
@@ -2674,6 +2975,24 @@ class GoldScalperLive:
         quote = await get_current_quote(SYMBOL)
         if not quote:
             return
+        m5_candles = next(
+            (
+                candles
+                for timeframe, candles in self._last_candles_by_timeframe.items()
+                if _is_m5_timeframe(timeframe) and candles
+            ),
+            [],
+        )
+        if SCALP_PROFILE == "on" and not m5_candles:
+            try:
+                m5_candles = await fetch_candles(
+                    SYMBOL, "M5", max(CANDLE_WINDOW, SCALP_TIME_STOP_BARS + 2)
+                )
+                if m5_candles:
+                    self._last_candles_by_timeframe["M5"] = list(m5_candles)
+            except Exception as exc:
+                log.warning("Scalp M5 candle fetch failed: %s", exc)
+                m5_candles = []
 
         async def update_ticket(raw_position: dict) -> None:
             pos = mt5_pos_to_dict(raw_position)
@@ -2693,6 +3012,8 @@ class GoldScalperLive:
                     "Trailing update: ticket=%s action=SKIP reason=missing baseline",
                     pos_id,
                 )
+                return
+            if not self.trailing_enabled and not baseline.get("scalp_profile"):
                 return
 
             direction = str(baseline["direction"]).upper()
@@ -2724,6 +3045,15 @@ class GoldScalperLive:
                     "action": "SKIP",
                     "reason": "invalid quote or entry price",
                 }
+                return
+
+            if SCALP_PROFILE == "on" and await self._manage_scalp_exit(
+                pos,
+                baseline,
+                current_price,
+                quote,
+                m5_candles,
+            ):
                 return
 
             decision = compute_adaptive_trail(
@@ -3652,6 +3982,7 @@ class GoldScalperLive:
         account_balance: Optional[float] = None,
         account_equity: Optional[float] = None,
         account_currency: str = "USD",
+        protective_atr: Optional[float] = None,
     ) -> tuple[Optional[TradeResult], list[dict], str, str]:
         """Re-check capacity and submit one entry atomically.
 
@@ -4050,6 +4381,76 @@ class GoldScalperLive:
                     f"Could not produce valid broker-side SL/TP for {SYMBOL}",
                 )
 
+            if SCALP_PROFILE == "on":
+                try:
+                    scalp_atr = float(protective_atr)
+                    scalp_risk = abs(
+                        float(rebased["entry_price"])
+                        - float(rebased["stop_loss"])
+                    )
+                    digits = int(stop_constraints["digits"])
+                    direction_sign = 1 if decision.direction == "BUY" else -1
+                    target_2 = round(
+                        float(rebased["entry_price"])
+                        + direction_sign * scalp_risk * SCALP_TP2_RR,
+                        digits,
+                    )
+                    target_reference = float(
+                        quote["ask"]
+                        if decision.direction == "BUY"
+                        else quote["bid"]
+                    )
+                    target_distance = (
+                        target_2 - target_reference
+                        if decision.direction == "BUY"
+                        else target_reference - target_2
+                    )
+                    minimum_target_distance = (
+                        float(stop_constraints["tp_required_price"])
+                        + float(stop_constraints["point"])
+                    )
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    return (
+                        None,
+                        confirm_dicts,
+                        "SCALP_EXIT_DATA_UNAVAILABLE",
+                        "Could not calculate M5 ATR or executable scalp targets",
+                    )
+                if not math.isfinite(scalp_atr) or scalp_atr <= 0:
+                    return (
+                        None,
+                        confirm_dicts,
+                        "SCALP_EXIT_DATA_UNAVAILABLE",
+                        "M5 ATR is unavailable for the scalp exit profile",
+                    )
+                scalp_stop_atr = float(rebased["sl_distance"]) / scalp_atr
+                if (
+                    scalp_stop_atr < SCALP_SL_MIN_ATR - 1e-9
+                    or scalp_stop_atr > SCALP_SL_MAX_ATR + 1e-9
+                ):
+                    return (
+                        None,
+                        confirm_dicts,
+                        "SCALP_SL_OUTSIDE_ATR_BOUNDS",
+                        f"Executable SL is {scalp_stop_atr:.2f} M5 ATR; "
+                        f"required {SCALP_SL_MIN_ATR:.2f}–{SCALP_SL_MAX_ATR:.2f}",
+                    )
+                if (
+                    target_distance < minimum_target_distance
+                    or target_distance <= 0
+                ):
+                    return (
+                        None,
+                        confirm_dicts,
+                        "SCALP_TP_DISTANCE_BLOCKED",
+                        "TP2 is inside the broker's minimum TP distance",
+                    )
+                rebased["take_profit"] = target_2
+                rebased["tp_distance"] = target_distance
+                rebased["tp_distance_pips"] = (
+                    target_distance / float(stop_constraints["pip_size"])
+                )
+
             # Keep all post-order telemetry/trailing state aligned with the
             # exact prices sent to MTAPI, not the stale decision snapshot.
             tp_params.entry_price = rebased["entry_price"]
@@ -4070,10 +4471,20 @@ class GoldScalperLive:
                     "Could not calculate R:R from executable entry, stop-loss, and take-profit prices",
                 )
             tp_params.risk_reward_ratio = round(final_rr, 2)
-            minimum_rr = getattr(decision, "minimum_rr", None)
-            if minimum_rr is None:
-                minimum_rr = decision.regime_rules.min_rr
-            minimum_rr = float(minimum_rr)
+            if SCALP_PROFILE == "on":
+                minimum_rr = SCALP_MIN_NET_RR
+                if final_rr + 1e-9 < SCALP_MIN_NET_RR:
+                    return (
+                        None,
+                        confirm_dicts,
+                        "SCALP_NET_RR_BELOW_MINIMUM",
+                        f"Net R:R {final_rr:.2f} < {SCALP_MIN_NET_RR:.2f} after spread",
+                    )
+            else:
+                minimum_rr = getattr(decision, "minimum_rr", None)
+                if minimum_rr is None:
+                    minimum_rr = decision.regime_rules.min_rr
+                minimum_rr = float(minimum_rr)
             if final_rr + 1e-9 < minimum_rr:
                 reason = (
                     f"Final R:R {final_rr:.2f} < {minimum_rr:.2f} "
@@ -4245,6 +4656,35 @@ class GoldScalperLive:
             )
             if result.success:
                 self._entry_spread_at_order = spread_price
+                if SCALP_PROFILE == "on" and result.position_id is not None:
+                    entry = float(tp_params.entry_price)
+                    risk_distance = abs(entry - float(tp_params.stop_loss))
+                    direction_sign = 1 if decision.direction == "BUY" else -1
+                    self._trail_baselines[str(result.position_id)] = {
+                        "id": result.position_id,
+                        "direction": decision.direction,
+                        "entry": entry,
+                        "risk_distance": risk_distance,
+                        "initial_sl": float(tp_params.stop_loss),
+                        "timeframe": timeframe,
+                        "highest_price_since_entry": entry,
+                        "lowest_price_since_entry": entry,
+                        "breakeven_armed": False,
+                        "scalp_profile": True,
+                        "opened_at": datetime.now(timezone.utc).isoformat(),
+                        "initial_volume": float(tp_params.lot_size),
+                        "volume_min": float(risk_spec.volume_min),
+                        "volume_step": float(risk_spec.volume_step),
+                        "spread_buffer": max(0.0, float(spread_price or 0.0)),
+                        "price_digits": int(stop_constraints["digits"]),
+                        "tp1_price": round(
+                            entry + direction_sign * risk_distance * SCALP_TP1_RR,
+                            int(stop_constraints["digits"]),
+                        ),
+                        "tp1_done": False,
+                        "scalp_be_done": False,
+                        "reached_half_r": False,
+                    }
             if shared_claim_required and redis_ipc is not None:
                 try:
                     redis_ipc.redis_mark_entry_signal(
@@ -4304,6 +4744,27 @@ class GoldScalperLive:
                     ),
                     "breakeven_armed": bool(
                         baseline.get("breakeven_armed", False)
+                    ),
+                    "scalp_profile": bool(baseline.get("scalp_profile", False)),
+                    "opened_at": baseline.get("opened_at"),
+                    "initial_volume": float(
+                        baseline.get("initial_volume", 0.0) or 0.0
+                    ),
+                    "volume_min": baseline.get("volume_min"),
+                    "volume_step": baseline.get("volume_step"),
+                    "spread_buffer": float(
+                        baseline.get("spread_buffer", 0.0) or 0.0
+                    ),
+                    "price_digits": int(baseline.get("price_digits", 2) or 2),
+                    "tp1_price": baseline.get("tp1_price"),
+                    "tp1_done": bool(baseline.get("tp1_done", False)),
+                    "partial_close_volume": baseline.get("partial_close_volume"),
+                    "scalp_be_done": bool(
+                        baseline.get("scalp_be_done", False)
+                    ),
+                    "be_stop": baseline.get("be_stop"),
+                    "reached_half_r": bool(
+                        baseline.get("reached_half_r", False)
                     ),
                 }
             except (KeyError, TypeError, ValueError):
