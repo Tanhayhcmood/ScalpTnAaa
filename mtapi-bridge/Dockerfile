@@ -40,7 +40,9 @@ FROM timurila/mt5rest:26.09.10-15.08@sha256:e0129efc592c845f16b57900e427ed014407
 # shared container limit can exhaust inotify instances during Wine/.NET
 # restarts, which otherwise crashes the bridge before it can expose /Ping.
 # Polling removes that host-level dependency without changing MT5 behaviour.
-ENV DOTNET_USE_POLLING_FILE_WATCHER=1
+ENV DOTNET_USE_POLLING_FILE_WATCHER=1 \
+    Logging__LogLevel__Microsoft.AspNetCore=Warning \
+    Logging__LogLevel__Microsoft.AspNetCore.Hosting.Diagnostics=Warning
 
 # Copy socat binary and its one missing runtime dependency (libwrap.so.0).
 # Paths are from ubuntu:20.04 where libs live under /lib, not /usr/lib.

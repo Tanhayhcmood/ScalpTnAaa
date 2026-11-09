@@ -39,10 +39,52 @@ async def _health(_req: web.Request) -> web.Response:
     return web.Response(text="OK", content_type="text/plain")
 
 
+async def _connection_status(_req: web.Request) -> web.Response:
+    """Expose only broker state and its most recent disconnect timestamp."""
+    robot_url = os.environ.get("ROBOT_BASE_URL", "").rstrip("/")
+    token = os.environ.get("ROBOT_COMMAND_TOKEN", "").strip()
+    if not robot_url or not token:
+        return web.json_response(
+            {"connection_status": "unknown", "last_disconnect_utc": None},
+            status=503,
+        )
+
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{robot_url}/connection-health",
+                headers={"X-Robot-Command-Token": token},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as response:
+                if response.status != 200:
+                    return web.json_response(
+                        {"connection_status": "unknown", "last_disconnect_utc": None},
+                        status=503,
+                    )
+                data = await response.json(content_type=None)
+    except Exception:
+        return web.json_response(
+            {"connection_status": "unknown", "last_disconnect_utc": None},
+            status=503,
+        )
+
+    if not isinstance(data, dict):
+        data = {}
+    status = str(data.get("connection_status", "unknown")).lower()
+    if status not in {"connected", "disconnected"}:
+        status = "unknown"
+    return web.json_response({
+        "connection_status": status,
+        "last_disconnect_utc": data.get("last_disconnect_utc"),
+    })
+
+
 async def _run_health_server() -> None:
     app = web.Application()
     app.router.add_get("/", _health)
     app.router.add_get("/health", _health)
+    app.router.add_get("/connection-status", _connection_status)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)

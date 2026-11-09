@@ -199,6 +199,27 @@ class RobotService:
         except ValueError:
             return ConnectionStatus.DISCONNECTED
 
+    async def get_connection_health(self) -> dict[str, Any]:
+        """Read authenticated broker connection telemetry from the robot."""
+        if not self._base_url:
+            return {}
+        try:
+            import aiohttp
+            token = os.environ.get("ROBOT_COMMAND_TOKEN", "").strip()
+            if not token:
+                return {}
+            async with self._get_http_session().get(
+                f"{self._base_url}/connection-health",
+                headers={"X-Robot-Command-Token": token},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    return data if isinstance(data, dict) else {}
+        except Exception:
+            logger.debug("HTTP connection-health read failed")
+        return {}
+
     async def get_trade_permission(self) -> dict[str, Any]:
         """Return final live entry permission, never the signal's ``allowed``."""
         state = await self._read_state()

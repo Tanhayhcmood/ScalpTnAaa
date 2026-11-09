@@ -56,6 +56,8 @@ class HeartbeatMonitor:
         self._running = False
         self._last_status: Optional[RobotStatus] = None
         self._last_connection: Optional[ConnectionStatus] = None
+        self._connection_outage_since: Optional[datetime] = None
+        self._connection_lost_notified_for: Optional[str] = None
         self._last_hb_notify: Optional[datetime] = None
         # Tickets we have already published TRADE_OPENED for. This set only
         # ever grows (via |=), it is never replaced/shrunk to "this cycle's
@@ -90,10 +92,38 @@ class HeartbeatMonitor:
                 logger.error(f"Heartbeat check failed: {e}")
             await asyncio.sleep(self._interval)
 
+    @staticmethod
+    def _parse_connection_time(value: object) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
     async def _check(self) -> None:
         state = await self._robot.get_state()
         current_status = await self._robot.get_status()
         current_conn = await self._robot.get_connection_status()
+        health_reader = getattr(self._robot, "get_connection_health", None)
+        connection_health = await health_reader() if callable(health_reader) else {}
+        if not isinstance(connection_health, dict):
+            connection_health = {}
+        health_status = str(connection_health.get("connection_status", "")).lower()
+        robot_is_stale = str(getattr(current_status, "value", current_status)).lower() == "disconnected"
+        if not robot_is_stale and health_status == ConnectionStatus.CONNECTED.value:
+            current_conn = ConnectionStatus.CONNECTED
+        elif not robot_is_stale and health_status == ConnectionStatus.DISCONNECTED.value:
+            current_conn = ConnectionStatus.DISCONNECTED
+        last_disconnect = self._parse_connection_time(
+            connection_health.get("last_disconnect_utc")
+        )
+        last_success = self._parse_connection_time(
+            connection_health.get("last_success_utc")
+        )
         uptime = state.get("uptime_seconds", 0)
 
         # ── Status change events (fire ONCE on each transition) ──────────────
@@ -112,17 +142,63 @@ class HeartbeatMonitor:
             elif current_status == RobotStatus.PAUSED:
                 await self._bus.publish(Events.ROBOT_PAUSED, {"status": current_status.value})
 
-        # ── Connection change events (fire ONCE on each transition) ──────────
-        if self._last_connection is not None and current_conn != self._last_connection:
-            if current_conn == ConnectionStatus.DISCONNECTED:
+        # Broker disconnect notifications are delayed until the outage has
+        # lasted five minutes. Stable dedupe keys suppress repeats across panel
+        # restarts; the robot's persisted timestamp is the outage source.
+        now = datetime.now(timezone.utc)
+        if current_conn == ConnectionStatus.DISCONNECTED:
+            if last_disconnect and (
+                self._connection_outage_since is None
+                or last_disconnect > self._connection_outage_since
+            ):
+                self._connection_outage_since = last_disconnect
+            if self._connection_outage_since is None:
+                self._connection_outage_since = now
+            outage_since = self._connection_outage_since
+            outage_key = outage_since.isoformat()
+            duration_seconds = max(0, int((now - outage_since).total_seconds()))
+            if (
+                duration_seconds >= 300
+                and self._connection_lost_notified_for != outage_key
+            ):
                 await self._bus.publish(Events.CONNECTION_LOST, {
-                    "previous": self._last_connection.value,
+                    "previous": self._last_connection.value if self._last_connection else None,
                     "current": current_conn.value,
+                    "outage_since": outage_key,
+                    "duration_seconds": duration_seconds,
+                    "dedupe_key": f"broker-outage:{outage_key}:lost",
                 })
-            elif current_conn == ConnectionStatus.CONNECTED:
-                await self._bus.publish(Events.CONNECTION_RESTORED, {
-                    "current": current_conn.value,
-                })
+                self._connection_lost_notified_for = outage_key
+        elif self._last_connection != ConnectionStatus.CONNECTED:
+            outage_since = self._connection_outage_since or last_disconnect
+            if outage_since is not None:
+                recovered_at = (
+                    last_success
+                    if last_success is not None and last_success >= outage_since
+                    else now
+                )
+                duration_seconds = max(
+                    0, int((recovered_at - outage_since).total_seconds())
+                )
+                outage_key = outage_since.isoformat()
+                if duration_seconds >= 300:
+                    if self._connection_lost_notified_for != outage_key:
+                        await self._bus.publish(Events.CONNECTION_LOST, {
+                            "previous": ConnectionStatus.CONNECTED.value,
+                            "current": ConnectionStatus.DISCONNECTED.value,
+                            "outage_since": outage_key,
+                            "duration_seconds": duration_seconds,
+                            "dedupe_key": f"broker-outage:{outage_key}:lost",
+                        })
+                        self._connection_lost_notified_for = outage_key
+                    await self._bus.publish(Events.CONNECTION_RESTORED, {
+                        "current": current_conn.value,
+                        "outage_since": outage_key,
+                        "duration_seconds": duration_seconds,
+                        "dedupe_key": f"broker-outage:{outage_key}:restored",
+                    })
+            self._connection_outage_since = None
+            self._connection_lost_notified_for = None
 
         # ── Periodic heartbeat — ONLY while robot is actively RUNNING ────────
         # When STOPPED/PAUSED/ERROR: status-change events already notified the user.

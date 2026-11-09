@@ -45,9 +45,7 @@ def test_failure_event_buffer_includes_classification(monkeypatch):
     )
 
 
-def test_exponential_backoff_schedule_caps_at_configured_max(monkeypatch):
-    monkeypatch.setattr(connector, "MT5_CONNECT_RETRY_BASE_S", 5)
-    monkeypatch.setattr(connector, "MT5_CONNECT_RETRY_MAX_S", 120)
+def test_reconnect_backoff_schedule_caps_at_120_seconds(monkeypatch):
     monkeypatch.setattr(connector, "MT5_CONNECT_RETRY_JITTER", 0.0)
 
     delays = [
@@ -55,12 +53,10 @@ def test_exponential_backoff_schedule_caps_at_configured_max(monkeypatch):
         for attempt in range(1, 8)
     ]
 
-    assert delays == [5.0, 10.0, 20.0, 40.0, 80.0, 120.0, 120.0]
+    assert delays == [3.0, 6.0, 12.0, 30.0, 60.0, 120.0, 120.0]
 
 
 def test_transient_backoff_jitter_never_shortens_the_nominal_delay(monkeypatch):
-    monkeypatch.setattr(connector, "MT5_CONNECT_RETRY_BASE_S", 5)
-    monkeypatch.setattr(connector, "MT5_CONNECT_RETRY_MAX_S", 120)
     monkeypatch.setattr(connector, "MT5_CONNECT_RETRY_JITTER", 0.2)
     draws = []
 
@@ -70,16 +66,23 @@ def test_transient_backoff_jitter_never_shortens_the_nominal_delay(monkeypatch):
 
     monkeypatch.setattr(connector.random, "uniform", choose_upper_bound)
 
-    assert connector._retry_backoff_delay("BRIDGE_DOWN", 1) == 6.0
-    assert draws == [(5.0, 6.0)]
+    assert connector._retry_backoff_delay("BRIDGE_DOWN", 1) == 3.6
+    assert draws == [(3.0, 3.6)]
+
+
+def test_service_not_available_starts_at_thirty_seconds(monkeypatch):
+    monkeypatch.setattr(connector, "MT5_CONNECT_RETRY_JITTER", 0.0)
+
+    assert connector._retry_backoff_delay(
+        "BROKER_UNAVAILABLE", 1, message="SERVICE_NOT_AVAILABLE"
+    ) == 30.0
 
 
 @pytest.mark.parametrize("classification", ["AUTH_ERROR", "TRIAL_EXPIRED"])
-def test_auth_and_trial_errors_wait_fifteen_minutes(monkeypatch, classification):
-    monkeypatch.setattr(connector, "MT5_CONNECT_AUTH_RETRY_S", 900)
-    monkeypatch.setattr(connector, "MT5_CONNECT_RETRY_JITTER", 0.5)
+def test_auth_and_trial_errors_use_bounded_backoff(monkeypatch, classification):
+    monkeypatch.setattr(connector, "MT5_CONNECT_RETRY_JITTER", 0.0)
 
-    assert connector._retry_backoff_delay(classification, 1) == 900.0
+    assert connector._retry_backoff_delay(classification, 1) == 3.0
 
 
 @pytest.mark.asyncio
@@ -87,9 +90,7 @@ async def test_connect_with_retry_is_unbounded_and_uses_backoff(monkeypatch):
     attempts = 0
     delays = []
     monkeypatch.setattr(connector, "_connect_retry_attempt", 0)
-    monkeypatch.setattr(connector, "_connect_retry_transient_attempt", 0)
-    monkeypatch.setattr(connector, "MT5_CONNECT_RETRY_BASE_S", 5)
-    monkeypatch.setattr(connector, "MT5_CONNECT_RETRY_MAX_S", 120)
+    monkeypatch.setattr(connector, "_connect_retry_service_unavailable", False)
     monkeypatch.setattr(connector, "MT5_CONNECT_RETRY_JITTER", 0.0)
 
     async def connect_then_succeed():
@@ -113,7 +114,7 @@ async def test_connect_with_retry_is_unbounded_and_uses_backoff(monkeypatch):
 
     assert await connector.connect_with_retry(max_attempts=1, retry_delay=0) is True
     assert attempts == 4
-    assert delays == [5.0, 10.0, 20.0]
+    assert delays == [30.0, 60.0, 120.0]
 
 
 @pytest.mark.asyncio
@@ -164,6 +165,6 @@ async def test_unready_new_session_keeps_previous_only_if_alive(
     monkeypatch.setattr(connector, "_connection_history_loaded", True)
     monkeypatch.setattr(connector, "_persist_connection_history", lambda: None)
 
-    assert await connector._connect_unlocked() is False
+    assert await connector._connect_unlocked() is expected_connected
     assert connector._conn_id == expected_id
     assert connector._connected is expected_connected

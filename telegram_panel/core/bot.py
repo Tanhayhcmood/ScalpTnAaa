@@ -277,12 +277,31 @@ class BotApplication:
             await notif_svc.notify(NotificationType.HEARTBEAT, msg)
 
         async def on_connection_lost(data: dict) -> None:
-            msg = f"🔴 <b>Connection Lost</b>\nRobot lost broker connection."
-            await notif_svc.notify_all_admins(NotificationType.CONNECTION_LOST, msg)
+            duration = max(0, int(data.get("duration_seconds", 0)))
+            minutes = duration // 60
+            msg = (
+                "🔴 <b>اتصال بروکر قطع است</b>\n"
+                f"بیش از ۵ دقیقه قطعی؛ مدت فعلی: {minutes} دقیقه."
+            )
+            await notif_svc.notify_all_admins(
+                NotificationType.CONNECTION_LOST,
+                msg,
+                metadata={"dedupe_key": data.get("dedupe_key", "")},
+            )
 
         async def on_connection_restored(data: dict) -> None:
-            msg = f"🟢 <b>Connection Restored</b>\nBroker connection re-established."
-            await notif_svc.notify_all_admins(NotificationType.CONNECTION_RESTORED, msg)
+            duration = max(0, int(data.get("duration_seconds", 0)))
+            hours, remainder = divmod(duration, 3600)
+            minutes = remainder // 60
+            duration_text = (
+                f"{hours} ساعت و {minutes} دقیقه" if hours else f"{minutes} دقیقه"
+            )
+            msg = f"🟢 <b>وصل شد</b>\nمدت قطعی: {duration_text}."
+            await notif_svc.notify_all_admins(
+                NotificationType.CONNECTION_RESTORED,
+                msg,
+                metadata={"dedupe_key": data.get("dedupe_key", "")},
+            )
 
         async def on_robot_error(data: dict) -> None:
             msg = formatter.error_alert(data.get("error", "Unknown error"))

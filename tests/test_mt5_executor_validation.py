@@ -55,6 +55,7 @@ def test_order_send_passes_standard_lots_without_extended_volume_scaling():
                 executor, "get_connection", return_value="https://mt5.mtapi.io"
             ),
             patch.object(executor, "get_conn_id", return_value="test-session"),
+            patch.object(executor, "is_connected", return_value=True),
             patch.object(executor, "_get_session", return_value=session),
             patch.object(executor, "log", MagicMock()),
         ):
@@ -84,6 +85,7 @@ def test_order_send_blocks_when_volume_constraints_are_missing():
                 executor, "get_connection", return_value="https://mt5.mtapi.io"
             ),
             patch.object(executor, "get_conn_id", return_value="test-session"),
+            patch.object(executor, "is_connected", return_value=True),
         ):
             return await executor.place_market_order(
                 symbol="XAUUSD",
@@ -97,3 +99,30 @@ def test_order_send_blocks_when_volume_constraints_are_missing():
 
     assert not result.success
     assert "refusing to guess lot limits" in result.message
+
+
+def test_order_send_blocks_without_confirmed_connection():
+    session = _FakeSession()
+
+    async def run():
+        with (
+            patch.object(executor, "get_connection", return_value="https://mt5.mtapi.io"),
+            patch.object(executor, "get_conn_id", return_value="test-session"),
+            patch.object(executor, "is_connected", return_value=False),
+            patch.object(executor, "_get_session", return_value=session),
+        ):
+            return await executor.place_market_order(
+                symbol="XAUUSD",
+                direction="BUY",
+                lot_size=0.05,
+                sl=2300.0,
+                tp=2310.0,
+                volume_min=0.01,
+                volume_step=0.01,
+                volume_max=100.0,
+            )
+
+    result = asyncio.run(run())
+    assert not result.success
+    assert "connection is not confirmed" in result.message
+    assert session.url is None

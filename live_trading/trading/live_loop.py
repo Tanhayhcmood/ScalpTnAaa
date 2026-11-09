@@ -113,6 +113,7 @@ from live_trading.mt5.connector import (
     get_open_positions, get_last_completed_bar_time,
     get_current_quote, get_closed_position_history, get_deals_by_time_range,
     get_symbol_params,
+    get_connection_generation,
     mt5_pos_to_dict,
 )
 from live_trading.mt5.executor import (
@@ -750,6 +751,7 @@ class GoldScalperLive:
 
         # Exponential backoff state
         self._reconnect_attempts: int = 0
+        self._last_connection_generation: int | None = None
         self._watchdog_task: asyncio.Task | None = None
 
         # Consecutive account-info failures before writing DISCONNECTED state.
@@ -931,8 +933,7 @@ class GoldScalperLive:
                 self._last_acc_info = acc_info
                 log.info(
                     "MT5 account connection status: CONNECTED "
-                    f"(account={str(acc_info.get('login') or 'unknown')[:3]}***, "
-                    f"host={acc_info.get('server') or 'unknown'}, "
+                    f"(host={acc_info.get('server') or 'unknown'}, "
                     f"balance={float(acc_info.get('balance', 0.0)):.2f}, "
                     f"equity={float(acc_info.get('equity', 0.0)):.2f})"
                 )
@@ -1130,6 +1131,33 @@ class GoldScalperLive:
                     self._write_state("DISCONNECTED")
                     await asyncio.sleep(backoff)
                     continue
+
+                # A fresh MTAPI session must pass a broker-side OpenedOrders
+                # read and reconcile internal trade history before any entry is
+                # evaluated. This also catches reconnects performed by watchdog.
+                generation = get_connection_generation()
+                if self._last_connection_generation is None or generation != self._last_connection_generation:
+                    try:
+                        raw_positions, _ = await get_open_positions(
+                            SYMBOL, self._known_open_tickets(), return_diagnostics=True
+                        )
+                    except RuntimeError as exc:
+                        self._set_trade_permission(
+                            False,
+                            "RECONNECT_RECONCILIATION_FAILED",
+                            ["Broker open orders could not be confirmed"],
+                        )
+                        log.warning("Post-reconnect OpenedOrders reconciliation failed: %s", exc)
+                        self._write_state("DISCONNECTED", self._last_acc_info)
+                        await asyncio.sleep(BAR_CHECK_INTERVAL)
+                        continue
+
+                    self._last_open_positions = [
+                        mt5_pos_to_dict(position) for position in raw_positions
+                    ]
+                    await self._reconcile_closed_trades(raw_positions=raw_positions)
+                    await self._sync_trailing_positions("reconnect")
+                    self._last_connection_generation = generation
 
                 # Successful (re)connect — reset backoff counter
                 if self._reconnect_attempts > 0:
@@ -2897,15 +2925,18 @@ class GoldScalperLive:
                     exc_info=result,
                 )
 
-    async def _reconcile_closed_trades(self) -> None:
+    async def _reconcile_closed_trades(
+        self, raw_positions: Optional[list[dict]] = None
+    ) -> None:
         """Persist exact exit details for positions no longer open in MT5."""
-        try:
-            raw_positions, _ = await get_open_positions(
-                SYMBOL, self._known_open_tickets(), return_diagnostics=True
-            )
-        except RuntimeError as exc:
-            log.debug(f"Closed-trade reconciliation skipped: {exc}")
-            return
+        if raw_positions is None:
+            try:
+                raw_positions, _ = await get_open_positions(
+                    SYMBOL, self._known_open_tickets(), return_diagnostics=True
+                )
+            except RuntimeError as exc:
+                log.debug(f"Closed-trade reconciliation skipped: {exc}")
+                return
 
         open_ids = {
             str(mt5_pos_to_dict(position).get("id"))
@@ -3628,6 +3659,16 @@ class GoldScalperLive:
         signal_id = entry_signal_id(SYMBOL, timeframe, bar_time)
         signal_tag = entry_signal_tag(signal_id)
         async with self._entry_lock:
+            if (
+                self._last_connection_generation is not None
+                and get_connection_generation() != self._last_connection_generation
+            ):
+                return (
+                    None,
+                    [],
+                    "RECONNECT_RECONCILIATION_REQUIRED",
+                    "Broker session changed; waiting for OpenedOrders reconciliation",
+                )
             if signal_id in self._attempted_entry_signal_ids:
                 return (
                     None,
@@ -3688,6 +3729,16 @@ class GoldScalperLive:
                 return None, [], "POSITION_CHECK_FAILED", str(exc)
 
             confirm_positions, dropped_unknown = confirm_result
+            if (
+                self._last_connection_generation is not None
+                and get_connection_generation() != self._last_connection_generation
+            ):
+                return (
+                    None,
+                    [],
+                    "RECONNECT_RECONCILIATION_REQUIRED",
+                    "Broker session changed during the final OpenedOrders check",
+                )
             confirm_dicts = [
                 mt5_pos_to_dict(position) for position in confirm_positions
             ]

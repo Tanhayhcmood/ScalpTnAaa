@@ -14,6 +14,8 @@ def clean_connection_health(monkeypatch):
     connector._connection_events.clear()
     connector._connection_health.update({
         "last_success_utc": None,
+        "last_disconnect_utc": None,
+        "connection_status": "disconnected",
         "consecutive_failures": 0,
         "total_reconnects": 0,
         "last_error_class": None,
@@ -59,6 +61,8 @@ def test_connection_counters_and_error_text_are_redacted(clean_connection_health
     serialized = json.dumps(health)
 
     assert health["last_success_utc"]
+    assert health["connection_status"] == "connected"
+    assert health["last_disconnect_utc"]
     assert health["consecutive_failures"] == 0
     assert health["total_reconnects"] == 1
     assert health["last_error_class"] == "RuntimeError"
@@ -184,12 +188,15 @@ async def test_keepalive_records_connection_status_not_alive(
 def test_invalidate_connection_records_event(clean_connection_health, monkeypatch):
     monkeypatch.setattr(connector, "_connected", True)
     monkeypatch.setattr(connector, "_conn_id", "session-id-that-must-not-leak")
+    monkeypatch.setitem(connector._connection_health, "connection_status", "connected")
 
     connector._invalidate_connection()
 
     health = connector.get_connection_health()
     assert connector._connected is False
-    assert connector._conn_id == ""
+    assert connector._conn_id == "session-id-that-must-not-leak"
+    assert health["connection_status"] == "disconnected"
+    assert health["last_disconnect_utc"]
     assert health["events"][-1]["event"] == "connection_invalidated"
     assert health["consecutive_failures"] == 1
     assert "session-id-that-must-not-leak" not in json.dumps(health)
@@ -249,6 +256,8 @@ def test_connection_health_restores_counters_and_events_from_redis(
     saved = {
         "counters": {
             "last_success_utc": "2026-11-08T12:00:00+00:00",
+            "last_disconnect_utc": "2026-11-08T12:05:00+00:00",
+            "connection_status": "disconnected",
             "consecutive_failures": 2,
             "total_reconnects": 7,
             "last_error_class": "TimeoutError",
@@ -269,6 +278,8 @@ def test_connection_health_restores_counters_and_events_from_redis(
     health = connector.get_connection_health()
 
     assert health["last_success_utc"] == "2026-11-08T12:00:00+00:00"
+    assert health["last_disconnect_utc"] == "2026-11-08T12:05:00+00:00"
+    assert health["connection_status"] == "disconnected"
     assert health["consecutive_failures"] == 2
     assert health["total_reconnects"] == 7
     assert health["last_error_class"] == "TimeoutError"

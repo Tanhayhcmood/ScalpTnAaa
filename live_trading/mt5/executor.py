@@ -17,7 +17,7 @@ from typing import Optional
 import aiohttp
 
 from live_trading.logger import get_logger
-from live_trading.mt5.connector import _get_session, get_connection, get_conn_id
+from live_trading.mt5.connector import _get_session, get_connection, get_conn_id, is_connected
 
 log = get_logger()
 
@@ -85,8 +85,8 @@ async def place_market_order(
 ) -> TradeResult:
     base    = get_connection()
     conn_id = get_conn_id()
-    if not base or not conn_id:
-        return TradeResult(False, None, "Not connected to MTAPI")
+    if not base or not conn_id or not is_connected():
+        return TradeResult(False, None, "MTAPI connection is not confirmed")
 
     normalized_direction = direction.upper().strip()
     if normalized_direction not in {"BUY", "SELL"}:

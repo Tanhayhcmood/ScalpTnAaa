@@ -30,6 +30,7 @@ import errno
 import json
 import math
 import random
+import threading
 import re
 import time as _time
 from collections import deque
@@ -44,8 +45,7 @@ from live_trading.config import (
     MTAPI_URL, MT5_HOST, MT5_PORT,
     MT5_USER, MT5_PASSWORD,
     SYNC_TIMEOUT, XAUUSD_TICK_SIZE,
-    MT5_CONNECT_RETRY_BASE_S, MT5_CONNECT_RETRY_MAX_S,
-    MT5_CONNECT_AUTH_RETRY_S, MT5_CONNECT_RETRY_JITTER,
+    MT5_CONNECT_RETRY_JITTER,
 )
 from live_trading.mt5.volume_units import (
     configured_mtapi_volume_scale,
@@ -75,14 +75,16 @@ _health_lock = asyncio.Lock()
 METAAPI_TOKEN = ""
 METAAPI_ACCOUNT_ID = ""
 
-_CONNECT_GRACE_PERIOD: float = 150.0
 _CONNECT_READY_POLL_INITIAL_S: float = 2.0
 _CONNECT_READY_POLL_MAX_S: float = 15.0
+_CONNECT_READY_TIMEOUT_S: float = 150.0
 
 _reconnect_lock: asyncio.Lock | None = None
 _connect_retry_lock: asyncio.Lock | None = None
+_ensure_connected_thread_lock = threading.Lock()
 _connect_retry_attempt = 0
-_connect_retry_transient_attempt = 0
+_connect_retry_service_unavailable = False
+_connection_generation = 0
 _watchdog_task: asyncio.Task | None = None
 _MT5_KEEPALIVE_TASK: asyncio.Task | None = None
 _MT5_KEEPALIVE_INTERVAL_S: float = 180.0
@@ -93,6 +95,8 @@ _CONNECTION_EVENT_LIMIT = 50
 _connection_events: deque[dict] = deque(maxlen=_CONNECTION_EVENT_LIMIT)
 _connection_health: dict = {
     "last_success_utc": None,
+    "last_disconnect_utc": None,
+    "connection_status": "disconnected",
     "consecutive_failures": 0,
     "total_reconnects": 0,
     "last_error_class": None,
@@ -105,7 +109,7 @@ _SYMBOL_TICK_SIZE_CACHE: dict[str, float] = {}
 
 
 def _redact_connection_text(value: object, *, limit: int = 200) -> str:
-    """Remove known credentials and common account/session fields from diagnostics."""
+    """Remove credentials, broker URLs, and account/session fields from diagnostics."""
     text = str(value or "")
     for secret in (MT5_PASSWORD, _conn_id, MT5_USER):
         secret = str(secret or "").strip()
@@ -119,6 +123,7 @@ def _redact_connection_text(value: object, *, limit: int = 200) -> str:
         r"\1[REDACTED]",
         text,
     )
+    text = re.sub(r"(?i)https?://\S+", "[URL REDACTED]", text)
     return text[:limit]
 
 
@@ -189,30 +194,32 @@ def _classify_connection_error(
     return "UNKNOWN"
 
 
-def _retry_backoff_delay(classification: str, attempt: int) -> float:
-    """Return a bounded exponential delay, with jitter for transient failures."""
-    if classification in {"AUTH_ERROR", "TRIAL_EXPIRED"}:
-        return float(MT5_CONNECT_AUTH_RETRY_S)
+_RECONNECT_BACKOFF_SECONDS = (3, 6, 12, 30, 60, 120)
 
-    base = max(1, MT5_CONNECT_RETRY_BASE_S)
-    ceiling = max(base, MT5_CONNECT_RETRY_MAX_S)
-    nominal = base
-    for _ in range(max(0, attempt - 1)):
-        if nominal >= ceiling:
-            break
-        nominal = min(nominal * 2, ceiling)
+
+def _retry_backoff_delay(
+    classification: str,
+    attempt: int,
+    *,
+    message: object | None = None,
+    service_unavailable_started: bool = False,
+) -> float:
+    """Return the bounded reconnect schedule with positive-only jitter."""
+    error_text = str(message or "").casefold().replace(" ", "_")
+    starts_at_thirty = (
+        service_unavailable_started or "service_not_available" in error_text
+    )
+    index = max(0, int(attempt) - 1) + (3 if starts_at_thirty else 0)
+    nominal = _RECONNECT_BACKOFF_SECONDS[min(index, len(_RECONNECT_BACKOFF_SECONDS) - 1)]
     configured_jitter = float(MT5_CONNECT_RETRY_JITTER)
     jitter = (
-        min(max(configured_jitter, 0.0), 0.5)
+        min(max(configured_jitter, 0.0), 0.2)
         if math.isfinite(configured_jitter)
         else 0.2
     )
-    if jitter == 0.0:
+    if jitter == 0.0 or nominal >= _RECONNECT_BACKOFF_SECONDS[-1]:
         return float(nominal)
-    # Positive-only jitter preserves the configured minimum wait and avoids a
-    # low random draw recreating the rapid retry pattern this policy prevents.
-    return random.uniform(float(nominal), min(float(ceiling), nominal * (1 + jitter)))
-
+    return random.uniform(float(nominal), min(120.0, nominal * (1 + jitter)))
 
 def _load_connection_history() -> None:
     """Restore health counters and events once Redis is reachable."""
@@ -237,6 +244,11 @@ def _load_connection_history() -> None:
     counters = saved.get("counters")
     if isinstance(counters, dict):
         _connection_health["last_success_utc"] = counters.get("last_success_utc")
+        _connection_health["last_disconnect_utc"] = counters.get("last_disconnect_utc")
+        saved_status = str(counters.get("connection_status", "disconnected")).lower()
+        if saved_status == "connected":
+            _connection_health["last_disconnect_utc"] = datetime.now(timezone.utc).isoformat()
+        _connection_health["connection_status"] = "disconnected"
         for key in ("consecutive_failures", "total_reconnects"):
             try:
                 _connection_health[key] = max(0, int(counters.get(key, 0)))
@@ -312,7 +324,21 @@ def _record_connection_event(
         if _connection_health["last_success_utc"] is not None:
             _connection_health["total_reconnects"] += 1
         _connection_health["last_success_utc"] = now
+        _connection_health["connection_status"] = "connected"
         _connection_health["consecutive_failures"] = 0
+
+    outage_events = {
+        "connect_failure",
+        "connection_invalidated",
+        "connection_status_not_alive",
+        "connection_status_error",
+        "watchdog_status_check_error",
+        "watchdog_reconnect_failure",
+    }
+    if event in outage_events:
+        if _connection_health.get("connection_status") == "connected":
+            _connection_health["last_disconnect_utc"] = now
+        _connection_health["connection_status"] = "disconnected"
 
     if failure:
         error_class = type(error).__name__ if error is not None else "ConnectionError"
@@ -334,19 +360,15 @@ def _record_connection_event(
         event_record["classification"] = classified
         if classified == "AUTH_ERROR":
             log.error(
-                "MTAPI %s failed with AUTH_ERROR (invalid account/password or "
-                "authentication rejected); retrying every %ss. Verify the "
-                "broker credentials.",
+                "MTAPI %s failed with AUTH_ERROR; automatic retries continue "
+                "with bounded backoff. Verify the broker credentials.",
                 source or event,
-                MT5_CONNECT_AUTH_RETRY_S,
             )
         elif classified == "TRIAL_EXPIRED":
             log.error(
-                "MTAPI %s failed with TRIAL_EXPIRED; automatic retries cannot "
-                "restore an expired trial. Purchase/activate the full version; "
-                "the next retry is in %ss.",
+                "MTAPI %s failed with TRIAL_EXPIRED; automatic retries continue "
+                "with bounded backoff. Verify the broker trial status.",
                 source or event,
-                MT5_CONNECT_AUTH_RETRY_S,
             )
 
     _connection_events.append(event_record)
@@ -571,7 +593,7 @@ async def _wait_for_broker_ready(
     base_url: str,
     conn_id: str,
     *,
-    timeout_s: float = _CONNECT_GRACE_PERIOD,
+    timeout_s: float = _CONNECT_READY_TIMEOUT_S,
 ) -> bool:
     deadline = _time.monotonic() + timeout_s
     delay = _CONNECT_READY_POLL_INITIAL_S
@@ -629,8 +651,8 @@ async def _previous_connection_is_alive(
     session: aiohttp.ClientSession,
     base_url: str,
     conn_id: str,
-) -> bool:
-    """Only preserve an older session after MTAPI confirms it is still alive."""
+) -> Optional[bool]:
+    """Return True/False for confirmed status, or None when it is unknown."""
     try:
         async with session.get(
             f"{base_url}/ConnectionStatus",
@@ -638,20 +660,38 @@ async def _previous_connection_is_alive(
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
             data = await resp.json(content_type=None)
-            alive = resp.status == 200 and _connection_status_is_alive(data)
-            if not alive:
+            if resp.status == 200:
+                alive = _connection_status_is_alive(data)
+                if alive:
+                    _connection_health["connection_status"] = "connected"
+                    _persist_connection_history()
+                    return True
                 _record_connection_event(
                     "connection_status_not_alive",
                     source="previous_session_validation",
                     error=ConnectionError("previous ConnectionStatus was not alive"),
-                    message=(
-                        f"Previous ConnectionStatus reported not alive "
-                        f"(HTTP {resp.status}): {data!s}"
-                    ),
+                    message=f"Previous ConnectionStatus reported not alive (HTTP {resp.status}): {data!s}",
                     status=resp.status,
                     failure=True,
                 )
-            return alive
+                return False
+            if resp.status in {404, 410}:
+                _record_connection_event(
+                    "connection_status_not_alive",
+                    source="previous_session_validation",
+                    error=ConnectionError("previous MTAPI session was not found"),
+                    status=resp.status,
+                    failure=True,
+                )
+                return False
+            _record_connection_event(
+                "connection_status_error",
+                source="previous_session_validation",
+                error=ConnectionError(f"ConnectionStatus returned HTTP {resp.status}"),
+                status=resp.status,
+                failure=True,
+            )
+            return None
     except Exception as exc:
         _record_connection_event(
             "connection_status_error",
@@ -659,7 +699,7 @@ async def _previous_connection_is_alive(
             error=exc,
             failure=True,
         )
-        return False
+        return None
 
 
 async def _connect_unlocked() -> bool:
@@ -670,7 +710,7 @@ async def _connect_unlocked() -> bool:
     retry loop, or manual reconnect from replacing the same broker session
     concurrently.
     """
-    global _connected, _base_url, _conn_id, _last_connect_time
+    global _connected, _base_url, _conn_id, _last_connect_time, _connection_generation
 
     base = MTAPI_URL.rstrip("/") if MTAPI_URL else ""
     host = MT5_HOST
@@ -694,19 +734,41 @@ async def _connect_unlocked() -> bool:
         return False
 
     previous_conn_id = _conn_id
-    previous_base_url = _base_url
-    _base_url = base
+    previous_base_url = _base_url or base
     try:
         sess = _get_session()
-        log.info(
-            "MTAPI /ConnectEx request prepared: "
-            f"account={user[:3]}*** host={host} port={MT5_PORT} "
-            f"password_configured={bool(password)} (value redacted)"
-        )
-        log.info(
-            f"MTAPI connection attempt: {base}/ConnectEx "
-            f"(host={host}, port={MT5_PORT}, account={user[:3]}***)"
-        )
+        if previous_conn_id:
+            previous_alive = await _previous_connection_is_alive(
+                sess, previous_base_url, previous_conn_id
+            )
+            if previous_alive is True:
+                _base_url = previous_base_url
+                _connected = True
+                _last_connect_time = _time.monotonic()
+                _connection_health["connection_status"] = "connected"
+                _persist_connection_history()
+                log.info("MTAPI broker session is already active; reusing confirmed session")
+                return True
+            if previous_alive is None:
+                _connected = False
+                log.warning("MTAPI session status is unknown; skipping ConnectEx until it is confirmed")
+                return False
+
+            _connected = False
+            try:
+                async with sess.get(
+                    f"{previous_base_url}/Disconnect",
+                    params={"id": previous_conn_id},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ):
+                    pass
+            except Exception as exc:
+                log.warning("Previous MTAPI session cleanup failed: %s", _redact_connection_text(exc))
+            _conn_id = ""
+            previous_conn_id = ""
+
+        _base_url = base
+        log.info("MTAPI /ConnectEx connection attempt (host=%s, port=%s)", host, MT5_PORT)
         async with sess.get(
             f"{base}/ConnectEx",
             params=_connect_params(user, password, host, MT5_PORT),
@@ -790,21 +852,9 @@ async def _connect_unlocked() -> bool:
             _conn_id = conn_id
             _connected = True
             _last_connect_time = _time.monotonic()
+            _connection_generation += 1
             _record_connection_event("connect_success", source="ConnectEx")
-            log.info(
-                f"MTAPI connection success: MT5 account connected "
-                f"(host={host}, port={MT5_PORT}, account={user[:3]}***)"
-            )
-            if previous_conn_id and previous_conn_id != conn_id:
-                try:
-                    async with sess.get(
-                        f"{base}/Disconnect",
-                        params={"id": previous_conn_id},
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ):
-                        pass
-                except Exception as exc:
-                    log.debug(f"Previous MT5 session cleanup skipped: {exc}")
+            log.info("MTAPI connection success (host=%s, port=%s)", host, MT5_PORT)
             return True
     except Exception as exc:
         log.error("MTAPI connection failure: %s", _redact_connection_text(exc))
@@ -817,12 +867,6 @@ async def connect(*args, **kwargs) -> bool:
     """Connect through MTAPI with one serialized broker handshake."""
     lock = _get_reconnect_lock()
     async with lock:
-        if (
-            _connected
-            and _conn_id
-            and _time.monotonic() - _last_connect_time < _CONNECT_GRACE_PERIOD
-        ):
-            return True
         return await _connect_unlocked()
 
 
@@ -832,6 +876,8 @@ async def disconnect() -> None:
     lock = _get_reconnect_lock()
     async with lock:
         conn_id, base_url, session = _conn_id, _base_url, _session
+        if conn_id:
+            _record_connection_event("connection_invalidated", source="disconnect")
         _connected, _conn_id, _base_url = False, "", ""
         if conn_id and base_url and session and not session.closed:
             try:
@@ -843,7 +889,7 @@ async def disconnect() -> None:
                     if response.status >= 400:
                         log.warning(f"MT5 disconnect request returned HTTP {response.status}")
             except Exception as exc:
-                log.warning(f"MT5 disconnect request failed: {exc}")
+                log.warning("MT5 disconnect request failed: %s", _redact_connection_text(exc))
         if session and not session.closed:
             try:
                 await session.close()
@@ -918,51 +964,44 @@ async def keepalive_metaapi() -> bool:
 
 
 async def connect_with_retry(max_attempts: int = 5, retry_delay: float = 60.0) -> bool:
-    """Retry until a session is established; legacy arguments remain accepted.
+    """Retry forever with the bounded MTAPI reconnect schedule.
 
-    ``max_attempts`` and ``retry_delay`` are retained for call-site compatibility,
-    but no longer cap retries or override the environment-configured policy.
+    Legacy arguments remain accepted for call-site compatibility but do not
+    cap attempts or override the requested delay sequence.
     """
-    global _connect_retry_attempt, _connect_retry_transient_attempt
+    global _connect_retry_attempt, _connect_retry_service_unavailable
     async with _get_connect_retry_lock():
         while True:
             _connect_retry_attempt += 1
-            log.info(f"MT5 connect attempt {_connect_retry_attempt} ...")
+            log.info("MT5 connect attempt %d", _connect_retry_attempt)
             if await connect():
                 _connect_retry_attempt = 0
-                _connect_retry_transient_attempt = 0
+                _connect_retry_service_unavailable = False
                 return True
-            classification = (
-                _connection_events[-1].get("classification", "UNKNOWN")
-                if _connection_events
-                else "UNKNOWN"
+
+            event = _connection_events[-1] if _connection_events else {}
+            classification = str(event.get("classification", "UNKNOWN"))
+            error_text = str(event.get("error_text", _connection_health.get("last_error_text") or ""))
+            if "service_not_available" in error_text.casefold().replace(" ", "_"):
+                _connect_retry_service_unavailable = True
+            delay = _retry_backoff_delay(
+                classification,
+                _connect_retry_attempt,
+                message=error_text,
+                service_unavailable_started=_connect_retry_service_unavailable,
             )
-            if classification in {"AUTH_ERROR", "TRIAL_EXPIRED"}:
-                delay = _retry_backoff_delay(
-                    classification, _connect_retry_attempt
-                )
-                log.info(
-                    "MT5 connection remains unavailable (%s); retrying in %.0f seconds.",
-                    classification,
-                    delay,
-                )
-            else:
-                _connect_retry_transient_attempt += 1
-                delay = _retry_backoff_delay(
-                    classification, _connect_retry_transient_attempt
-                )
-                log.warning(
-                    "MT5 connection failed (%s, attempt %d); retrying in %.1f seconds.",
-                    classification,
-                    _connect_retry_attempt,
-                    delay,
-                )
+            log.warning(
+                "MT5 connection failed (%s, attempt %d); retrying in %.1f seconds.",
+                classification,
+                _connect_retry_attempt,
+                delay,
+            )
             await asyncio.sleep(delay)
 
 
 def _invalidate_connection() -> None:
-    global _connected, _conn_id
-    log.warning("MT5 conn_id is stale — invalidating connection (will reconnect on retry)")
+    global _connected
+    log.warning("MT5 conn_id is unconfirmed — retaining it until status is checked")
     _record_connection_event(
         "connection_invalidated",
         source="invalidate",
@@ -970,49 +1009,46 @@ def _invalidate_connection() -> None:
         failure=True,
     )
     _connected = False
-    _conn_id = ""
+
+
+async def _acquire_thread_lock(lock: threading.Lock) -> None:
+    """Acquire a threading lock without blocking the asyncio event loop."""
+    while not lock.acquire(blocking=False):
+        await asyncio.sleep(0.05)
 
 
 async def ensure_connected(*args, **kwargs) -> bool:
-    global _connected
-    if (
-        _conn_id and _connected
-        and _time.monotonic() - _last_connect_time < _CONNECT_GRACE_PERIOD
-    ):
-        return True
-    if _conn_id and _base_url:
-        try:
-            async with _get_session().get(
-                f"{_base_url}/ConnectionStatus",
-                params={"id": _conn_id},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                data = await resp.json(content_type=None)
-                if resp.status == 200 and _connection_status_is_alive(data):
-                    _connected = True
-                    return True
-                _record_connection_event(
-                    "connection_status_not_alive",
-                    source="ensure_connected",
-                    error=ConnectionError("ConnectionStatus reported not alive"),
-                    message=(
-                        f"ConnectionStatus reported not alive (HTTP {resp.status}): "
-                        f"{data!s}"
-                    ),
-                    status=resp.status,
-                    failure=True,
-                )
-        except Exception as exc:
-            _record_connection_event(
-                "connection_status_error",
-                source="ensure_connected",
-                error=exc,
-                failure=True,
+    global _connected, _conn_id, _base_url
+    await _acquire_thread_lock(_ensure_connected_thread_lock)
+    try:
+        if _conn_id and _base_url:
+            previous_conn_id = _conn_id
+            previous_base_url = _base_url
+            alive = await _previous_connection_is_alive(
+                _get_session(), previous_base_url, previous_conn_id
             )
-    _connected = False
-    # connect() owns the lock and rechecks state after waiting for any other
-    # handshake to finish. Avoid holding the lock across retry sleeps.
-    return await connect_with_retry()
+            if alive is True:
+                _connected = True
+                return True
+            _connected = False
+            if alive is False:
+                try:
+                    async with _get_session().get(
+                        f"{previous_base_url}/Disconnect",
+                        params={"id": previous_conn_id},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ):
+                        pass
+                except Exception as exc:
+                    log.warning(
+                        "Stale MTAPI session cleanup failed: %s",
+                        _redact_connection_text(exc),
+                    )
+                _conn_id = ""
+                _base_url = ""
+        return await connect_with_retry()
+    finally:
+        _ensure_connected_thread_lock.release()
 
 
 async def start_connection_watchdog(interval_seconds: float = 30.0) -> None:
@@ -1023,9 +1059,6 @@ async def start_connection_watchdog(interval_seconds: float = 30.0) -> None:
     try:
         while True:
             await asyncio.sleep(interval_seconds)
-            if _connected and _time.monotonic() - _last_connect_time < _CONNECT_GRACE_PERIOD:
-                _record_connection_event("watchdog_skipped_grace_period", source="watchdog")
-                continue
             if not _connected or not _conn_id:
                 _record_connection_event("watchdog_reconnect_attempt", source="watchdog")
                 if await ensure_connected():
@@ -1070,14 +1103,14 @@ async def start_connection_watchdog(interval_seconds: float = 30.0) -> None:
                         )
             except Exception as exc:
                 failures += 1
-                log.warning(f"[watchdog] ConnectionStatus check failed ({failures}/2): {exc}")
+                log.warning("[watchdog] ConnectionStatus check failed (%s/1): %s", failures, _redact_connection_text(exc))
                 _record_connection_event(
                     "watchdog_status_check_error",
                     source="watchdog",
                     error=exc,
                     failure=True,
                 )
-            if failures >= 2:
+            if failures >= 1:
                 failures = 0
                 _invalidate_connection()
                 _record_connection_event("watchdog_reconnect_attempt", source="watchdog")
@@ -1683,8 +1716,8 @@ async def get_open_positions(
             raise RuntimeError(f"MTAPI get_positions timed out: {exc}") from exc
         return []
     for attempt in range(2):
-        if not _conn_id and not await ensure_connected():
-            raise RuntimeError("get_open_positions: not connected to MTAPI")
+        if not await ensure_connected():
+            raise RuntimeError("get_open_positions: MTAPI connection is not confirmed")
         try:
             params: dict = {"id": _conn_id}
             if symbol:
@@ -2559,6 +2592,11 @@ def get_connection() -> Optional[str]:
 def get_conn_id() -> Optional[str]:
     """Return the active MTAPI session token."""
     return _conn_id if _connected else None
+
+
+def get_connection_generation() -> int:
+    """Return the count of confirmed ConnectEx sessions in this process."""
+    return _connection_generation
 
 
 def is_connected() -> bool:
