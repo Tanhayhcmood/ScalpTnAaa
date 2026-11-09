@@ -257,6 +257,14 @@ METAAPI_ACCOUNT_ID = ""
 
 # ── Symbol & Timeframe ───────────────────────────────────────────────────────
 SYMBOL        = os.getenv("SYMBOL", "XAUUSD")
+SCALP_PROFILE = os.getenv("SCALP_PROFILE", "off").strip().lower()
+if SCALP_PROFILE not in {"off", "on"}:
+    print(
+        "ERROR: SCALP_PROFILE must be off or on. "
+        "Fix it in the Render dashboard and redeploy.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 # Explicit final fallback for XAUUSD when MTAPI omits the broker tick size.
 # Keep this visible/configurable rather than silently assuming a price step.
 XAUUSD_TICK_SIZE = _float("XAUUSD_TICK_SIZE", 0.01, lo=0.00000001, hi=10.0)
@@ -270,8 +278,12 @@ if not (0 < XAUUSD_TICK_SIZE <= 10.0):
 TIMEFRAME     = _timeframe("TIMEFRAME", "5m")
 CANDLE_WINDOW = _int("CANDLE_WINDOW", 300, lo=50, hi=5000)
 # Stop-loss volatility is intentionally independent from the signal timeframe.
-# The live default uses M5 ATR while the robot scans M5 entries.
-SL_ATR_TIMEFRAME = _timeframe("SL_ATR_TIMEFRAME", "M5")
+# The scalp profile always measures protective stops and time limits from M5.
+SL_ATR_TIMEFRAME = (
+    "M5"
+    if SCALP_PROFILE == "on"
+    else _timeframe("SL_ATR_TIMEFRAME", "M5")
+)
 SL_ATR_PERIOD = _int("SL_ATR_PERIOD", 14, lo=2, hi=100)
 # A signal is only actionable while the executable broker price remains close
 # to the price that produced it. This is deliberately based on the signal
@@ -359,11 +371,30 @@ ENABLED_STRATEGIES = LIVE_ENTRY_STRATEGIES
 # MIN_CONFIRMATIONS: minimum enabled engines that must agree for ordinary
 # entries.
 # CONF_HARD_MIN: trades below this confidence % are always rejected.
-# Base protective stop distance in higher-timeframe ATR units. The floor of
-# 3x prevents a compressed M5 signal candle from producing a tight stop.
-SL_ATR_BASE_MULTIPLIER = _float(
-    "SL_ATR_BASE_MULTIPLIER", 3.0, lo=3.0, hi=3.5
+# The scalp profile uses a bounded structural stop and a paired two-target
+# exit. It is opt-in; the existing profile retains its original validation.
+SCALP_SL_MIN_ATR = _float("SCALP_SL_MIN_ATR", 1.0, lo=0.1, hi=3.5)
+SCALP_SL_MAX_ATR = _float(
+    "SCALP_SL_MAX_ATR", 1.8, lo=SCALP_SL_MIN_ATR, hi=3.5
 )
+SCALP_TIME_STOP_BARS = _int("SCALP_TIME_STOP_BARS", 6, lo=1, hi=100)
+SCALP_TP1_RR = 1.0
+SCALP_TP2_RR = 1.5
+SCALP_MIN_NET_RR = 1.2
+
+# Base protective stop distance in ATR units. The legacy profile keeps its
+# 3.0–3.5x bounds; scalp mode allows the configured lower bound.
+if SCALP_PROFILE == "on":
+    SL_ATR_BASE_MULTIPLIER = _float(
+        "SL_ATR_BASE_MULTIPLIER",
+        SCALP_SL_MAX_ATR,
+        lo=SCALP_SL_MIN_ATR,
+        hi=3.5,
+    )
+else:
+    SL_ATR_BASE_MULTIPLIER = _float(
+        "SL_ATR_BASE_MULTIPLIER", 3.0, lo=3.0, hi=3.5
+    )
 # LOW_VOLATILITY often precedes expansion, so widen the protective stop while
 # retaining the global 3.5x cap in the capital manager.
 LOW_VOLATILITY_SL_ATR_ADD = _float(

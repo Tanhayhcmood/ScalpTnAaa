@@ -163,21 +163,36 @@ async def place_market_order(
 
 # ── Close position ────────────────────────────────────────────────────────────
 
-async def close_position(position_id: str, deviation: int = 30, **kwargs) -> TradeResult:
+async def close_position(
+    position_id: str,
+    deviation: int = 30,
+    volume: Optional[float] = None,
+    **kwargs,
+) -> TradeResult:
     base    = get_connection()
     conn_id = get_conn_id()
     if not base or not conn_id:
         return TradeResult(False, None, "Not connected to MTAPI")
 
+    params = {
+        "id":         conn_id,
+        "ticket":     int(position_id),
+        "slippage": deviation,
+    }
+    if volume is not None:
+        try:
+            normalized_volume = float(volume)
+        except (TypeError, ValueError, OverflowError):
+            return TradeResult(False, None, "Partial-close volume is invalid")
+        if not math.isfinite(normalized_volume) or normalized_volume <= 0:
+            return TradeResult(False, None, "Partial-close volume must be positive")
+        params["volume"] = round(normalized_volume, 8)
+
     try:
         sess = _get_session()
         async with sess.get(
             f"{base}/OrderCloseSafe",
-            params={
-                "id":         conn_id,
-                "ticket":     int(position_id),
-                "slippage": deviation,
-            },
+            params=params,
             timeout=aiohttp.ClientTimeout(total=60),
         ) as resp:
             data = await resp.json(content_type=None)

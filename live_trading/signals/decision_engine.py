@@ -53,6 +53,10 @@ from live_trading.config import (
     SL_MIN_ATR_MULTIPLIER,
     SL_STRUCTURE_BUFFER_ATR,
     TARGET_ROOM_BUFFER_ATR,
+    SCALP_PROFILE,
+    SCALP_SL_MIN_ATR,
+    SCALP_SL_MAX_ATR,
+    SCALP_TP2_RR,
 )
 
 # Marginal confidence R:R floor: trades with confidence between CONF_HARD_MIN
@@ -95,8 +99,12 @@ def _protective_sl_atr_multiplier(
     """
     base = float(base_multiplier)
     if regime.regime == "LOW_VOLATILITY":
-        return base + float(low_volatility_add)
-    return base * float(regime.rules.sl_atr_mult_adjust)
+        adjusted = base + float(low_volatility_add)
+    else:
+        adjusted = base * float(regime.rules.sl_atr_mult_adjust)
+    if SCALP_PROFILE == "on":
+        return max(SCALP_SL_MIN_ATR, min(SCALP_SL_MAX_ATR, adjusted))
+    return adjusted
 
 
 def _entry_location_block_reason(candidate: str, pa) -> Optional[str]:
@@ -816,7 +824,11 @@ def run_decision_engine(
             if regime.regime == "RANGE" and range_risk_percent is not None
             else risk_percent
         ),
-        take_profit_rr=range_min_rr if regime.regime == "RANGE" else FIXED_TP_RR,
+        take_profit_rr=(
+            SCALP_TP2_RR
+            if SCALP_PROFILE == "on"
+            else range_min_rr if regime.regime == "RANGE" else FIXED_TP_RR
+        ),
         order_block_top=None,
         order_block_bottom=None,
         swing_high=None,
@@ -824,10 +836,16 @@ def run_decision_engine(
         support_level=range_support,
         resistance_level=range_resistance,
         take_profit_level=(
-            range_resistance if candidate == "BUY" else range_support
+            None
+            if SCALP_PROFILE == "on"
+            else range_resistance if candidate == "BUY" else range_support
         ),
         sl_atr_multiplier=protective_multiplier,
-        sl_min_atr_multiplier=SL_MIN_ATR_MULTIPLIER,
+        sl_min_atr_multiplier=(
+            SCALP_SL_MIN_ATR
+            if SCALP_PROFILE == "on"
+            else SL_MIN_ATR_MULTIPLIER
+        ),
         structure_buffer_atr=SL_STRUCTURE_BUFFER_ATR,
     )
     trade_params = calc_trade_parameters(cap_input)
@@ -880,7 +898,7 @@ def run_decision_engine(
         regime.regime,
         regime.rules.min_rr,
         range_min_rr,
-        FIXED_TP_RR,
+        SCALP_TP2_RR if SCALP_PROFILE == "on" else FIXED_TP_RR,
     )
 
     # Marginal confidence check
