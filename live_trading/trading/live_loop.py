@@ -38,7 +38,8 @@ from live_trading.config import (
     STALENESS_LIMIT_WEAK_TREND, STALENESS_LIMIT_RANGE,
     LOW_VOLATILITY_SL_ATR_ADD,
     MAX_OPEN_TRADES, COMMENT,
-    ENTRY_GATES_MODE, MAX_SPREAD_PRICE,
+    ENTRY_GATES_MODE, MAX_SPREAD_PRICE, MAX_SPREAD_ATR_FRACTION,
+    NEWS_FILTER_MODE,
     TRADE_WINDOW_UTC_START, TRADE_WINDOW_UTC_END,
     FRIDAY_LAST_ENTRY_UTC_HOUR,
     H1_GATE_MODE, H1_GATE_STRICTNESS,
@@ -104,6 +105,7 @@ from live_trading.signals.h1_trend_gate import (
     detect_h1_bias,
     evaluate_h1_trend_gate,
 )
+from live_trading.signals.news_filter import check_news_filter
 from live_trading.signals.wyckoff_engine import calibrate_wyckoff, set_calibrated_config
 from live_trading.mt5.connector import (
     connect, disconnect, ensure_connected,
@@ -135,7 +137,10 @@ from live_trading.trading.entry_guard import (
     staleness_limit_for_regime,
     validate_entry_price_distance,
 )
-from live_trading.trading.entry_gates import evaluate_entry_gates
+from live_trading.trading.entry_gates import (
+    evaluate_entry_gates,
+    evaluate_spread_atr_gate,
+)
 from live_trading.trading.loss_streak import evaluate_loss_streak_pause
 from live_trading.trading.active_entry_policy import (
     evaluate_active_entry,
@@ -3855,6 +3860,35 @@ class GoldScalperLive:
                     spread_price = ask - bid
             except (KeyError, TypeError, ValueError):
                 pass
+            if spread_price is None:
+                spread_atr_allowed, spread_atr_reason = (
+                    False,
+                    "Spread unavailable",
+                )
+            else:
+                try:
+                    m5_candles = await fetch_candles(SYMBOL, "M5", 15)
+                    m5_atr = (
+                        calc_atr(m5_candles, 14)
+                        if len(m5_candles) >= 15
+                        else 0.0
+                    )
+                except Exception as exc:
+                    log.warning("M5 ATR(14) fetch failed for spread gate: %s", exc)
+                    m5_atr = 0.0
+                spread_atr_allowed, spread_atr_reason = evaluate_spread_atr_gate(
+                    spread_price,
+                    m5_atr,
+                    max_spread_atr_fraction=MAX_SPREAD_ATR_FRACTION,
+                )
+            if not spread_atr_allowed:
+                log.warning("ENTRY_GATE_BLOCK spread_atr %s", spread_atr_reason)
+                return (
+                    None,
+                    confirm_dicts,
+                    "SPREAD_ATR_GATE_BLOCKED",
+                    spread_atr_reason,
+                )
             if ENTRY_GATES_MODE != "off":
                 gates_allowed, gate_reasons = evaluate_entry_gates(
                     datetime.now(timezone.utc),
@@ -3901,6 +3935,20 @@ class GoldScalperLive:
                             "LOSS_STREAK_PAUSED",
                             loss_pause.reason,
                         )
+            if NEWS_FILTER_MODE != "off":
+                news_result = await check_news_filter()
+                if news_result.blocked:
+                    event_name = news_result.event_name or news_result.reason
+                    if NEWS_FILTER_MODE == "shadow":
+                        log.warning("WOULD_BLOCK_NEWS %s", event_name)
+                    else:
+                        log.warning("NEWS_ENTRY_BLOCK %s", news_result.reason)
+                        return (
+                            None,
+                            confirm_dicts,
+                            "NEWS_FILTER_BLOCKED",
+                            news_result.reason,
+                        )
             if H1_GATE_MODE != "off":
                 h1_allowed, h1_reasons = evaluate_h1_trend_gate(
                     decision.direction,
@@ -3913,7 +3961,13 @@ class GoldScalperLive:
                     if H1_GATE_MODE == "shadow":
                         if self._h1_gate_shadow_logged_bar.get(timeframe) != bar_time:
                             log.warning(
-                                "SHADOW_BLOCK h1_trend %s", h1_reason_text
+                                "SHADOW_BLOCK h1_trend signal_id=%s direction=%s "
+                                "timeframe=%s bar_time=%s %s",
+                                signal_id,
+                                decision.direction,
+                                timeframe,
+                                bar_time.isoformat(),
+                                h1_reason_text,
                             )
                             self._h1_gate_shadow_logged_bar[timeframe] = bar_time
                     else:

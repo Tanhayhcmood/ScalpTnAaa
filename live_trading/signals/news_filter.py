@@ -146,30 +146,36 @@ async def check_news_filter(
     Always fails open: network / parse errors → blocked=False.
     """
     current = now or datetime.now(timezone.utc)
-    events  = await _get_events()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    else:
+        current = current.astimezone(timezone.utc)
+    try:
+        events = await _get_events()
+        for ev in events:
+            if not _is_high_impact_usd(ev):
+                continue
+            ev_time = _parse_event_utc(ev)
+            if ev_time is None:
+                continue
 
-    for ev in events:
-        if not _is_high_impact_usd(ev):
-            continue
-        ev_time = _parse_event_utc(ev)
-        if ev_time is None:
-            continue
+            delta = (ev_time - current).total_seconds()
 
-        delta = (ev_time - current).total_seconds()
-
-        if -_BLOCK_AFTER_S <= delta <= _BLOCK_BEFORE_S:
-            title = ev.get("title", "Unknown event")
-            if delta > 0:
-                mins = int(delta / 60)
-                reason = f"High-impact news in {mins}m: {title}"
-            else:
-                mins = int(-delta / 60)
-                reason = f"Post-news blackout ({mins}m since): {title}"
-            return NewsFilterResult(
-                blocked=True,
-                reason=reason,
-                event_name=title,
-                event_time_utc=ev_time.strftime("%H:%M UTC"),
-            )
+            if -_BLOCK_AFTER_S <= delta <= _BLOCK_BEFORE_S:
+                title = ev.get("title", "Unknown event")
+                if delta > 0:
+                    mins = int(delta / 60)
+                    reason = f"High-impact news in {mins}m: {title}"
+                else:
+                    mins = int(-delta / 60)
+                    reason = f"Post-news blackout ({mins}m since): {title}"
+                return NewsFilterResult(
+                    blocked=True,
+                    reason=reason,
+                    event_name=title,
+                    event_time_utc=ev_time.strftime("%H:%M UTC"),
+                )
+    except Exception as exc:
+        log.warning(f"[news_filter] Filter check failed (fail-open): {exc}")
 
     return NewsFilterResult(blocked=False)

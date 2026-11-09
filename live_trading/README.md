@@ -136,6 +136,8 @@ candles (300 M5 bars)
 | SMC swing lookback | 5 bars | smcEngine.ts |
 | ATR period | 14 (Wilder) | goldEngine.ts |
 
+Set `H1_GATE_MODE=enforce` to make the H1 gate block entries it rejects.
+
 Order size at the final broker gate is recalculated from the executable entry,
 the exact SL sent with the order, and the broker's tick size/value (or a
 same-account-currency contract-size fallback). Open tickets are counted once;

@@ -4,6 +4,37 @@ from datetime import datetime, timezone
 import math
 
 
+def evaluate_spread_atr_gate(
+    spread_price: float | None,
+    m5_atr: float,
+    *,
+    max_spread_atr_fraction: float = 0.15,
+) -> tuple[bool, str]:
+    """Block entries when spread exceeds a fraction of M5 ATR(14)."""
+    try:
+        spread = float(spread_price)
+        atr_value = float(m5_atr)
+        fraction = float(max_spread_atr_fraction)
+    except (TypeError, ValueError, OverflowError):
+        return False, "Spread or M5 ATR(14) is unavailable"
+
+    if not math.isfinite(spread) or spread < 0:
+        return False, "Spread unavailable or invalid"
+    if not math.isfinite(atr_value) or atr_value <= 0:
+        return False, "M5 ATR(14) unavailable or invalid"
+    if not math.isfinite(fraction) or fraction < 0:
+        return False, "Invalid maximum spread ATR fraction"
+
+    limit = fraction * atr_value
+    if spread > limit:
+        return (
+            False,
+            f"Spread {spread:.4f} exceeds {fraction:.2f} × "
+            f"M5 ATR(14) limit {limit:.4f}",
+        )
+    return True, ""
+
+
 def evaluate_entry_gates(
     now_utc: datetime,
     spread_price: float | None,
