@@ -126,6 +126,38 @@ async def _trade_features(req: web.Request) -> web.Response:
     return web.json_response({"trade_features": features})
 
 
+async def _funnel(req: web.Request) -> web.Response:
+    """GET /funnel — return authenticated M5 decision-funnel counters."""
+    authorized, status, message = _command_authorized(req)
+    if not authorized:
+        return web.json_response({"error": message}, status=status)
+
+    from live_trading.config import DECISION_FUNNEL_ENABLED
+    if not DECISION_FUNNEL_ENABLED:
+        return web.json_response({
+            "enabled": False,
+            "reason": "Set DECISION_FUNNEL_ENABLED=true to collect counters.",
+        })
+
+    engine_funnel = getattr(_current_engine, "_decision_funnel", None)
+    if engine_funnel is not None and engine_funnel.enabled:
+        return web.json_response(engine_funnel.snapshot())
+
+    state = None
+    try:
+        from live_trading.redis_ipc import redis_available, redis_read_state
+        if redis_available():
+            state = redis_read_state()
+    except Exception:
+        state = None
+    if not isinstance(state, dict):
+        state = _read_local_state()
+    if isinstance(state, dict) and isinstance(state.get("decision_funnel"), dict):
+        return web.json_response(state["decision_funnel"])
+
+    return web.json_response({"error": "decision funnel data is unavailable"}, status=503)
+
+
 async def _connection_health(req: web.Request) -> web.Response:
     """GET /connection-health — return authenticated broker connection history."""
     authorized, status, message = _command_authorized(req)
@@ -546,6 +578,7 @@ def _create_app() -> web.Application:
     app.router.add_get("/", _health)
     app.router.add_get("/health", _health)
     app.router.add_get("/status", _status)
+    app.router.add_get("/funnel", _funnel)
     app.router.add_get("/crash-log", _crash_log)
     app.router.add_get("/progress", _progress_log)
     app.router.add_post("/force-resume", _force_resume)

@@ -27,6 +27,7 @@ import math
 import os
 import re
 import sys
+from functools import wraps
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
@@ -73,6 +74,7 @@ from live_trading.config import (
     SCALP_PROFILE, SCALP_SL_MIN_ATR, SCALP_SL_MAX_ATR,
     SCALP_TIME_STOP_BARS, SCALP_TP1_RR, SCALP_TP2_RR,
     SCALP_MIN_NET_RR,
+    DECISION_FUNNEL_ENABLED,
 )
 from live_trading.logger import get_logger
 from live_trading.risk.guardian import RiskGuardian, GuardianStatus
@@ -157,12 +159,48 @@ from live_trading.trading.active_entry_policy import (
     evaluate_active_entry,
     strong_trend_validation_reason,
 )
+from live_trading.trading.decision_funnel import (
+    DecisionFunnel,
+    classify_reason,
+    classify_stage,
+)
 from live_trading.utils.state_writer import (
     write_robot_state, write_mt5_snapshot,
     read_commands, clear_command, log_trade,
 )
 
 log = get_logger()
+
+
+def _observe_m5_funnel(method):
+    @wraps(method)
+    async def wrapped(self, bar_time, tf=TIMEFRAME):
+        funnel = getattr(self, "_decision_funnel", None)
+        if funnel is None or not funnel.begin(bar_time, tf):
+            return await method(self, bar_time, tf)
+        try:
+            return await method(self, bar_time, tf)
+        except Exception:
+            funnel.block("EVALUATION_ERROR")
+            raise
+        finally:
+            try:
+                permission = getattr(self, "_last_trade_permission", {}) or {}
+                stage = permission.get("stage", "")
+                passed = stage in {"ORDER_PLACED", "ORDER_FAILED", "MARKET_CLOSED"}
+                fallback = (
+                    None if passed
+                    else classify_stage(stage, permission.get("reasons"))
+                )
+                summary = funnel.finish(fallback_code=fallback, passed=passed)
+                if summary:
+                    log.info("%s", summary)
+                self._persist_decision_funnel_state()
+            except Exception as exc:
+                log.warning("Decision funnel update skipped: %s", exc)
+
+    return wrapped
+
 
 def _candle_time_text(candle) -> str:
     if candle is None:
@@ -733,6 +771,8 @@ class GoldScalperLive:
         self.trade_history: List[dict] = []
         self._last_open_positions: list[dict] = []
         self.last_decision: Optional[DecisionResult] = None
+        self._decision_funnel = DecisionFunnel(enabled=DECISION_FUNNEL_ENABLED)
+        self._last_state_write_args = None
         # Structured telemetry for the most recently evaluated closed candle.
         # It is mirrored into robot_state.json and emitted as one JSON log
         # record per scan, so Render logs can be analysed without parsing
@@ -851,6 +891,7 @@ class GoldScalperLive:
         # Do this before the first state write so an empty in-memory list does
         # not replace persisted Redis recent_trades on process startup.
         self.trade_history = self._load_trade_history()
+        self._restore_decision_funnel()
         self._write_state("STARTING")
         # Restore per-ticket entry/initial-SL baselines before the first broker
         # sync.  These are persisted separately from trade history because the
@@ -1649,6 +1690,7 @@ class GoldScalperLive:
             self._sl_atr_cache_failure_at = asyncio.get_event_loop().time()
             return 0.0, reason
 
+    @_observe_m5_funnel
     async def _on_new_bar(self, bar_time: datetime, tf: str = TIMEFRAME) -> None:
         self._set_trade_permission(
             False,
@@ -1969,6 +2011,7 @@ class GoldScalperLive:
             symbol=SYMBOL,
         )
         self.last_decision = decision
+        self._decision_funnel.observe_decision(decision)
 
         # Session Edge is a separate context gate; shadow mode only records
         # WOULD_ALLOW/WOULD_BLOCK and never changes this decision.
@@ -1999,6 +2042,12 @@ class GoldScalperLive:
         decision.session_edge = session_context["session_edge"]
         decision.vwap_filter = session_context["vwap_filter"]
         if (
+            decision.vwap_filter.get("mode") == "shadow"
+            and session_edge_applicable
+            and not decision.vwap_filter.get("would_allow", True)
+        ):
+            self._decision_funnel.would_block("SESSION_WINDOW")
+        if (
             decision.vwap_filter["mode"] == "enforce"
             and decision.allowed
             and session_edge_applicable
@@ -2009,6 +2058,7 @@ class GoldScalperLive:
                 "and no unused matching Asian signal is active"
             )
             decision.allowed = False
+            self._decision_funnel.block("SESSION_WINDOW")
             decision.blocked_reasons.append(reason)
             decision.reasoning.append(reason)
             decision.trade_params = None
@@ -2369,6 +2419,8 @@ class GoldScalperLive:
             _is_hard_block = (
                 (_would_block or _alignment_blocked) and not MTF_DRY_RUN
             )
+            if (_would_block or _alignment_blocked) and MTF_DRY_RUN:
+                self._decision_funnel.would_block("REGIME_DISALLOW")
             self._last_candle_telemetry.setdefault("mtf", {}).update({
                 "htf_trend": _mtf_check.htf_trend,
                 "candidate": _mtf_check.candidate,
@@ -4285,6 +4337,11 @@ class GoldScalperLive:
                 if not gates_allowed:
                     gate_reason_text = "; ".join(gate_reasons)
                     if ENTRY_GATES_MODE == "shadow":
+                        for gate_reason in gate_reasons:
+                            self._decision_funnel.would_block(
+                                classify_reason(gate_reason)
+                            )
+                    if ENTRY_GATES_MODE == "shadow":
                         if self._entry_gate_shadow_logged_bar.get(timeframe) != bar_time:
                             log.warning("SHADOW_BLOCK %s", gate_reason_text)
                             self._entry_gate_shadow_logged_bar[timeframe] = bar_time
@@ -4304,6 +4361,7 @@ class GoldScalperLive:
                 )
                 if loss_pause.active:
                     if ENTRY_GATES_MODE == "shadow":
+                        self._decision_funnel.would_block("LOSS_STREAK")
                         if self._loss_streak_shadow_logged_bar.get(timeframe) != bar_time:
                             log.warning(
                                 "SHADOW_BLOCK loss_streak %s", loss_pause.reason
@@ -4324,6 +4382,7 @@ class GoldScalperLive:
                 if news_result.blocked:
                     event_name = news_result.event_name or news_result.reason
                     if NEWS_FILTER_MODE == "shadow":
+                        self._decision_funnel.would_block("NEWS")
                         log.warning("WOULD_BLOCK_NEWS %s", event_name)
                     else:
                         log.warning("NEWS_ENTRY_BLOCK %s", news_result.reason)
@@ -4343,6 +4402,7 @@ class GoldScalperLive:
                 if not h1_allowed:
                     h1_reason_text = "; ".join(h1_reasons)
                     if H1_GATE_MODE == "shadow":
+                        self._decision_funnel.would_block("H1_GATE")
                         if self._h1_gate_shadow_logged_bar.get(timeframe) != bar_time:
                             log.warning(
                                 "SHADOW_BLOCK h1_trend signal_id=%s direction=%s "
@@ -4934,6 +4994,33 @@ class GoldScalperLive:
             "reasons": [str(reason) for reason in reasons if str(reason).strip()],
         }
 
+    def _restore_decision_funnel(self) -> None:
+        if not self._decision_funnel.enabled:
+            return
+        state = None
+        try:
+            from live_trading.redis_ipc import redis_available, redis_read_state
+            if redis_available():
+                state = redis_read_state()
+        except Exception:
+            state = None
+        if not isinstance(state, dict):
+            try:
+                with open(STATE_FILE, "r", encoding="utf-8") as state_file:
+                    state = json.load(state_file)
+            except (OSError, TypeError, ValueError):
+                state = None
+        if isinstance(state, dict):
+            self._decision_funnel.restore(state.get("decision_funnel"))
+
+    def _persist_decision_funnel_state(self) -> None:
+        if not self._decision_funnel.enabled:
+            return
+        args = self._last_state_write_args
+        if args is None:
+            return
+        self._write_state(*args)
+
     def _write_state(
         self,
         status: str,
@@ -4942,6 +5029,7 @@ class GoldScalperLive:
         position: Optional[dict] = None,
         extra: Optional[dict] = None,
     ) -> None:
+        self._last_state_write_args = (status, acc_info, decision, position, extra)
         # Merge guardian data into extra (non-destructive)
         merged_extra: dict = {}
         if self._last_guardian_status is not None:
@@ -4965,6 +5053,8 @@ class GoldScalperLive:
             )
         if self._last_candle_telemetry:
             merged_extra["candle_telemetry"] = dict(self._last_candle_telemetry)
+        if self._decision_funnel.enabled:
+            merged_extra["decision_funnel"] = self._decision_funnel.snapshot()
         merged_extra["trade_history_sync"] = dict(self._history_sync_status)
 
         write_robot_state(

@@ -302,6 +302,9 @@ STALENESS_LIMIT_RANGE = _float(
 # ── Risk & Trade Rules ───────────────────────────────────────────────────────
 # Production defaults — override via Render env vars if needed.
 ENTRY_GATES_MODE = os.getenv("ENTRY_GATES_MODE", "shadow").strip().lower()
+DECISION_FUNNEL_ENABLED = os.getenv(
+    "DECISION_FUNNEL_ENABLED", "false"
+).strip().lower() == "true"
 if ENTRY_GATES_MODE not in {"off", "shadow", "enforce"}:
     print(
         "ERROR: ENTRY_GATES_MODE must be off, shadow, or enforce. "
