@@ -41,6 +41,7 @@ from live_trading.config import (
     MAX_OPEN_TRADES, COMMENT,
     ENTRY_GATES_MODE, MAX_SPREAD_PRICE, MAX_SPREAD_ATR_FRACTION,
     NEWS_FILTER_MODE,
+    NORMAL_MIN_CONFIDENCE,
     TRADE_WINDOW_UTC_START, TRADE_WINDOW_UTC_END,
     FRIDAY_LAST_ENTRY_UTC_HOUR,
     H1_GATE_MODE, H1_GATE_STRICTNESS,
@@ -82,7 +83,7 @@ from live_trading.risk.adaptive_trailing_stop import (
     AdaptiveTrailingConfig, atr, compute_adaptive_trail, should_apply,
 )
 from live_trading.risk.capital_manager import (
-    CapitalOutput,
+    CapitalOutput, FIXED_TP_RR,
 )
 from live_trading.risk.aggregate_risk import (
     AggregateRiskLimitError,
@@ -135,7 +136,10 @@ from live_trading.mt5.executor import (
 )
 from live_trading.utils.broker_time import broker_time_to_utc
 from live_trading.utils import canonical_symbol
-from live_trading.signals.session_edge import evaluate_entry_context
+from live_trading.signals.session_edge import (
+    evaluate_entry_context,
+    get_session_edge_mode,
+)
 from live_trading.trading.strategy_slots import (
     strategy_order_comment,
     strategy_slots_for_decision,
@@ -873,6 +877,55 @@ class GoldScalperLive:
             canonical,
             canonical == ACTIVE_ENTRY_SYMBOL,
         )
+        effective_config = {
+            "RISK_PERCENT": RISK_PERCENT,
+            "RANGE_RISK_PERCENT": RANGE_RISK_PERCENT,
+            "MAX_TOTAL_RISK_PERCENT": MAX_TOTAL_RISK_PERCENT,
+            "MAX_OPEN_TRADES": MAX_OPEN_TRADES,
+            "CONF_HARD_MIN": CONF_HARD_MIN,
+            "NORMAL_MIN_CONFIDENCE": NORMAL_MIN_CONFIDENCE,
+            "MIN_CONFIRMATIONS": MIN_CONFIRMATIONS,
+            "PA_STANDALONE_MIN_SCORE": PA_STANDALONE_MIN_SCORE,
+            "TREND_STANDALONE_MIN_SCORE": TREND_STANDALONE_MIN_SCORE,
+            "PRICE_ACTION_STANDALONE": PRICE_ACTION_STANDALONE,
+            "TREND_STANDALONE": TREND_STANDALONE,
+            "SL_ATR_TIMEFRAME": SL_ATR_TIMEFRAME,
+            "SL_ATR_BASE_MULTIPLIER": SL_ATR_BASE_MULTIPLIER,
+            "TP_RR": FIXED_TP_RR,
+            "SCALP_TP1_RR": SCALP_TP1_RR,
+            "SCALP_TP2_RR": SCALP_TP2_RR,
+            "SCALP_MIN_NET_RR": SCALP_MIN_NET_RR,
+            "RANGE_MIN_RR": RANGE_MIN_RR,
+            "SCALP_PROFILE": SCALP_PROFILE,
+            "ENTRY_GATES_MODE": ENTRY_GATES_MODE,
+            "NEWS_FILTER_MODE": NEWS_FILTER_MODE,
+            "H1_GATE_MODE": H1_GATE_MODE,
+            "H1_GATE_STRICTNESS": H1_GATE_STRICTNESS,
+            "SESSION_EDGE_MODE": get_session_edge_mode(),
+            "MTF_ENABLED": MTF_ENABLED,
+            "TRADE_WINDOW_UTC_START": TRADE_WINDOW_UTC_START,
+            "TRADE_WINDOW_UTC_END": TRADE_WINDOW_UTC_END,
+            "FRIDAY_LAST_ENTRY_UTC_HOUR": FRIDAY_LAST_ENTRY_UTC_HOUR,
+            "DECISION_FUNNEL_ENABLED": DECISION_FUNNEL_ENABLED,
+        }
+        log.info(
+            "EFFECTIVE_CONFIG %s",
+            json.dumps(effective_config, sort_keys=True),
+        )
+        if RISK_PERCENT > MAX_TOTAL_RISK_PERCENT:
+            log.warning(
+                "EFFECTIVE_CONFIG conflict: RISK_PERCENT=%.2f exceeds "
+                "MAX_TOTAL_RISK_PERCENT=%.2f",
+                RISK_PERCENT,
+                MAX_TOTAL_RISK_PERCENT,
+            )
+        if RANGE_RISK_PERCENT > RISK_PERCENT:
+            log.warning(
+                "EFFECTIVE_CONFIG conflict: RANGE_RISK_PERCENT=%.2f exceeds "
+                "RISK_PERCENT=%.2f normal risk",
+                RANGE_RISK_PERCENT,
+                RISK_PERCENT,
+            )
         log.info("=" * 60)
         log.info("  GoldScalperPro v4 — LIVE TRADING ENGINE (MTAPI)")
         log.info(f"  Symbol: {SYMBOL}  |  Trade TFs: {chr(44).join(TRADE_TIMEFRAMES)} (highest first)")
