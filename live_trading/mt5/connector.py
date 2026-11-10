@@ -54,6 +54,7 @@ from live_trading.mt5.volume_units import (
 )
 from live_trading.signals.gold_engine import OHLCV
 from live_trading.logger import get_logger
+from live_trading.utils import canonical_symbol
 from live_trading.utils.broker_time import observe_broker_server_time
 
 log = get_logger()
@@ -2430,8 +2431,7 @@ def _with_tick_size(
 
 
 def _is_xauusd_symbol(symbol: str) -> bool:
-    # Broker suffixes such as XAUUSDb and XAUUSD.a are common.
-    return symbol.strip().upper().startswith("XAUUSD")
+    return canonical_symbol(symbol) == "XAUUSD"
 
 
 async def get_symbol_params(symbol: str) -> dict:
