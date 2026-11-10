@@ -40,6 +40,11 @@ def _reload_config(env_overrides: dict) -> object:
 class TestConfigDefaults:
     """Verify that default values are correct when no env vars are set."""
 
+    def test_decision_funnel_diagnostics_default_on(self, monkeypatch):
+        monkeypatch.delenv("DECISION_FUNNEL_ENABLED", raising=False)
+        cfg = _reload_config({})
+        assert cfg.DECISION_FUNNEL_ENABLED is True
+
     def test_symbol_default(self):
         """When SYMBOL is not set, default is XAUUSD (AMarkets reports gold as
         XAUUSD, not XAUUSDb -- see CHANGELOG 4.0.3 render.yaml SYMBOL fix)."""
@@ -194,6 +199,10 @@ class TestConfigDefaults:
 
 class TestConfigEnvOverrides:
     """Verify that env var overrides are correctly applied."""
+
+    def test_decision_funnel_diagnostics_can_be_disabled(self):
+        cfg = _reload_config({"DECISION_FUNNEL_ENABLED": "false"})
+        assert cfg.DECISION_FUNNEL_ENABLED is False
 
     def test_symbol_override(self):
         cfg = _reload_config({"SYMBOL": "EURUSD"})
