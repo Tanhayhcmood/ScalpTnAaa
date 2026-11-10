@@ -10,6 +10,7 @@ from live_trading.signals.market_regime import (
     REGIME_RULES,
     STRONG_ADX_TREND_THRESHOLD,
 )
+from live_trading.utils import canonical_symbol
 
 
 ACTIVE_ENTRY_STRATEGY = "XAUUSD_VOLATILITY_TREND_BREAKOUT"
@@ -127,13 +128,14 @@ def evaluate_active_entry(
     standalone gate. SMC and Wyckoff remain diagnostic-only and cannot
     authorize or veto this policy.
     """
-    normalized_symbol = str(symbol or "").upper().strip()
+    raw_symbol = str(symbol or "").strip().upper()
+    normalized_symbol = canonical_symbol(symbol)
     if normalized_symbol != ACTIVE_ENTRY_SYMBOL:
         return ActiveEntryPolicyResult(
             False,
             ACTIVE_ENTRY_STRATEGY,
-            f"{ACTIVE_ENTRY_STRATEGY} blocked: symbol {normalized_symbol or 'UNKNOWN'} "
-            f"is not {ACTIVE_ENTRY_SYMBOL}",
+            f"{ACTIVE_ENTRY_STRATEGY} blocked: symbol raw={raw_symbol!r} "
+            f"canonical={normalized_symbol!r} allowed={ACTIVE_ENTRY_SYMBOL!r}",
         )
 
     normalized_timeframe = str(timeframe or "").strip().lower()

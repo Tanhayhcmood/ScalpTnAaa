@@ -18,6 +18,7 @@ from live_trading.mt5.volume_units import (
     extended_volume_to_lots,
     volume_constraint_sanity_error,
 )
+from live_trading.utils import canonical_symbol
 
 
 log = get_logger()
@@ -362,7 +363,7 @@ def build_symbol_risk_spec(
                 not profit_currency
                 and not (
                     account_ccy == "USD"
-                    and symbol.upper().startswith("XAUUSD")
+                    and canonical_symbol(symbol) == "XAUUSD"
                 )
             )
         ):

@@ -134,6 +134,7 @@ from live_trading.mt5.executor import (
     place_market_order, close_position, modify_position, TradeResult
 )
 from live_trading.utils.broker_time import broker_time_to_utc
+from live_trading.utils import canonical_symbol
 from live_trading.signals.session_edge import evaluate_entry_context
 from live_trading.trading.strategy_slots import (
     strategy_order_comment,
@@ -156,6 +157,7 @@ from live_trading.trading.entry_gates import (
 )
 from live_trading.trading.loss_streak import evaluate_loss_streak_pause
 from live_trading.trading.active_entry_policy import (
+    ACTIVE_ENTRY_SYMBOL,
     evaluate_active_entry,
     strong_trend_validation_reason,
 )
@@ -864,6 +866,13 @@ class GoldScalperLive:
 
     async def start(self) -> bool:
         global SYMBOL
+        canonical = canonical_symbol(SYMBOL)
+        log.info(
+            "SYMBOL raw=%s canonical=%s active_policy_allows=%s",
+            SYMBOL,
+            canonical,
+            canonical == ACTIVE_ENTRY_SYMBOL,
+        )
         log.info("=" * 60)
         log.info("  GoldScalperPro v4 — LIVE TRADING ENGINE (MTAPI)")
         log.info(f"  Symbol: {SYMBOL}  |  Trade TFs: {chr(44).join(TRADE_TIMEFRAMES)} (highest first)")
