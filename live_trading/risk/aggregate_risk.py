@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_FLOOR
 import json
 import math
+import os
 from typing import Iterable, Mapping, Optional
 
 from live_trading.logger import get_logger
@@ -18,6 +19,7 @@ from live_trading.mt5.volume_units import (
     extended_volume_to_lots,
     volume_constraint_sanity_error,
 )
+from live_trading.risk.capital_manager import LOT_DOLLAR_PER_UNIT
 from live_trading.utils import canonical_symbol
 
 
@@ -45,6 +47,7 @@ class SymbolRiskSpec:
     volume_step: float
     volume_max: float
     contract_size: Optional[float] = None
+    contract_size_confirmed: bool = False
     tick_value_source: str = "broker"
     tick_size_source: str = "broker"
     volume_min_source: str = "unknown"
@@ -56,6 +59,10 @@ class SymbolRiskSpec:
     volume_min_raw: Optional[object] = None
     volume_step_raw: Optional[object] = None
     volume_max_raw: Optional[object] = None
+
+    @property
+    def value_per_point_per_lot(self) -> float:
+        return self.tick_value_per_lot / self.tick_size
 
 
 @dataclass(frozen=True)
@@ -342,42 +349,103 @@ def build_symbol_risk_spec(
         mappings, "contractSize", "contract_size", "tradeContractSize"
     )
     symbol = str(symbol_params.get("symbol") or "").strip()
-    source = "broker_tick_value"
-    if tick_value is not None:
-        if tick_value_currency and tick_value_currency != account_ccy:
-            raise RiskCalculationError(
-                "Broker tick value currency does not match account currency"
-            )
-    else:
-        profit_currency = _currency(
-            mappings,
-            "currencyProfit",
-            "currency_profit",
-            "profitCurrency",
-            "profit_currency",
+    profit_currency = _currency(
+        mappings,
+        "currencyProfit",
+        "currency_profit",
+        "profitCurrency",
+        "profit_currency",
+    )
+    contract_size_confirmed = contract_size is not None and (
+        profit_currency == account_ccy
+        or (
+            not profit_currency
+            and account_ccy == "USD"
+            and canonical_symbol(symbol) == "XAUUSD"
         )
-        if (
-            contract_size is None
-            or (profit_currency and profit_currency != account_ccy)
-            or (
-                not profit_currency
-                and not (
-                    account_ccy == "USD"
-                    and canonical_symbol(symbol) == "XAUUSD"
-                )
+    )
+    if tick_value is not None and tick_value_currency and tick_value_currency != account_ccy:
+        raise RiskCalculationError(
+            "Broker tick value currency does not match account currency"
+        )
+
+    broker_value_per_point = (
+        tick_value / tick_size if tick_value is not None else None
+    )
+    contract_value_per_point = (
+        contract_size if contract_size_confirmed else None
+    )
+    if broker_value_per_point is not None and contract_value_per_point is not None:
+        mismatch_ratio = abs(
+            broker_value_per_point - contract_value_per_point
+        ) / contract_value_per_point
+        value_per_point = max(
+            broker_value_per_point, contract_value_per_point
+        )
+        source = (
+            "broker_tick_value"
+            if broker_value_per_point >= contract_value_per_point
+            else "contract_size"
+        )
+        if mismatch_ratio > 0.20:
+            log.error(
+                "TICK_VALUE_MISMATCH symbol=%s tick_value=%g tick_size=%g "
+                "contract_size=%g broker_value_per_point_per_lot=%g "
+                "contract_value_per_point_per_lot=%g "
+                "selected_value_per_point_per_lot=%g",
+                symbol or "unknown",
+                tick_value,
+                tick_size,
+                contract_size,
+                broker_value_per_point,
+                contract_value_per_point,
+                value_per_point,
             )
-        ):
-            raise RiskCalculationError(
-                "Broker tick value is unavailable and contract currency "
-                "cannot be matched to the account currency"
-            )
-        # One tick moves one contract by tick_size in its profit currency.
-        tick_value = tick_size * contract_size
+            source = f"{source}_after_mismatch"
+    elif contract_value_per_point is not None:
+        value_per_point = contract_value_per_point
         source = (
             "contract_size_xauusd_usd_assumed"
             if not profit_currency
             else "contract_size_same_currency"
         )
+    elif broker_value_per_point is not None:
+        value_per_point = broker_value_per_point
+        source = "broker_tick_value"
+    else:
+        raise RiskCalculationError(
+            "Broker tick value is unavailable and contract currency "
+            "cannot be matched to the account currency"
+        )
+
+    if not contract_size_confirmed and value_per_point < LOT_DOLLAR_PER_UNIT:
+        value_per_point = LOT_DOLLAR_PER_UNIT
+        source = "lot_dollar_per_unit_floor"
+
+    override_raw = os.getenv("TICK_VALUE_OVERRIDE_PER_POINT_PER_LOT")
+    if override_raw is not None and override_raw.strip():
+        try:
+            override_value = float(override_raw)
+        except (TypeError, ValueError) as exc:
+            raise RiskCalculationError(
+                "TICK_VALUE_OVERRIDE_PER_POINT_PER_LOT must be a positive number"
+            ) from exc
+        if not math.isfinite(override_value) or override_value <= 0:
+            raise RiskCalculationError(
+                "TICK_VALUE_OVERRIDE_PER_POINT_PER_LOT must be finite and positive"
+            )
+        if override_value >= value_per_point:
+            value_per_point = override_value
+            source = "env_override"
+        else:
+            log.warning(
+                "TICK_VALUE_OVERRIDE_BELOW_SAFE_VALUE symbol=%s override=%g "
+                "selected=%g; retaining the larger value",
+                symbol or "unknown",
+                override_value,
+                value_per_point,
+            )
+    tick_value = value_per_point * tick_size
 
     volume_min, volume_min_source, volume_min_raw = _volume_constraint(
         mappings,
@@ -436,7 +504,7 @@ def build_symbol_risk_spec(
         )
         raise RiskCalculationError(reason)
 
-    return SymbolRiskSpec(
+    spec = SymbolRiskSpec(
         tick_size=tick_size,
         tick_value_per_lot=tick_value,
         account_currency=account_ccy,
@@ -444,6 +512,7 @@ def build_symbol_risk_spec(
         volume_step=volume_step,
         volume_max=volume_max,
         contract_size=contract_size,
+        contract_size_confirmed=contract_size_confirmed,
         tick_value_source=source,
         tick_size_source=str(
             symbol_params.get("_tick_size_source")
@@ -459,6 +528,17 @@ def build_symbol_risk_spec(
         volume_step_raw=volume_step_raw,
         volume_max_raw=volume_max_raw,
     )
+    log.info(
+        "SPEC symbol=%s contract_size=%s tick_size=%g tick_value=%g "
+        "value_per_point_per_lot=%g source=%s",
+        symbol or "unknown",
+        f"{contract_size:g}" if contract_size is not None else "n/a",
+        tick_size,
+        tick_value,
+        spec.value_per_point_per_lot,
+        source,
+    )
+    return spec
 
 
 def _number(value: object, field: str) -> float:
@@ -531,6 +611,32 @@ def position_risk_amount(position: Mapping, spec: SymbolRiskSpec) -> float:
     # Break-even and profit-locked stops have zero loss-to-stop exposure.
     loss_distance = max(0.0, signed_distance)
     return (loss_distance / spec.tick_size) * spec.tick_value_per_lot * volume
+
+
+def post_fill_risk_amount(position: Mapping, spec: SymbolRiskSpec) -> float:
+    """Recalculate filled loss-to-SL risk from the broker's open position."""
+    if not isinstance(position, Mapping):
+        raise RiskCalculationError("Filled position data is malformed")
+    entry = _positive_number(
+        (position,), "openPrice", "open_price", "price_open", "priceOpen"
+    )
+    stop = _positive_number(
+        (position,), "stopLoss", "stop_loss", "sl"
+    )
+    volume = _positive_number((position,), "lots", "volume")
+    if entry is None or stop is None or volume is None:
+        raise RiskCalculationError(
+            "Filled position entry, stop loss, or volume is unavailable"
+        )
+    point_value = (
+        spec.contract_size
+        if spec.contract_size_confirmed and spec.contract_size is not None
+        else spec.value_per_point_per_lot
+    )
+    risk = abs(entry - stop) * volume * point_value
+    if not math.isfinite(risk):
+        raise RiskCalculationError("Filled position risk is not finite")
+    return risk
 
 
 def aggregate_open_risk(
