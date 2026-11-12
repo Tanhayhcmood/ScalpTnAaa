@@ -85,6 +85,19 @@ def _smc_only_false_breakout_decision():
 
 def _patch_order_dependencies(monkeypatch, order_calls):
     async def fake_get_open_positions(*_args, **kwargs):
+        if order_calls:
+            order = order_calls[-1]
+            filled_position = {
+                "ticket": "position-1",
+                "symbol": "XAUUSD",
+                "type": "BUY",
+                "volume": order["lot_size"],
+                "openPrice": 100.10,
+                "stopLoss": order["sl"],
+                "comment": order["comment"],
+            }
+            result = [filled_position]
+            return (result, []) if kwargs.get("return_diagnostics") else result
         if kwargs.get("return_diagnostics"):
             return [], []
         return []
@@ -110,6 +123,9 @@ def _patch_order_dependencies(monkeypatch, order_calls):
     async def fake_get_current_quote(_symbol):
         return {"bid": 100.00, "ask": 100.10}
 
+    async def fake_fetch_candles(*_args, **_kwargs):
+        return []
+
     async def fake_place_market_order(**kwargs):
         order_calls.append(kwargs)
         return TradeResult(True, "position-1", "ORDER_PLACED")
@@ -122,6 +138,12 @@ def _patch_order_dependencies(monkeypatch, order_calls):
     monkeypatch.setattr(live_loop, "get_open_positions", fake_get_open_positions)
     monkeypatch.setattr(live_loop, "get_symbol_params", fake_get_symbol_params)
     monkeypatch.setattr(live_loop, "get_current_quote", fake_get_current_quote)
+    monkeypatch.setattr(live_loop, "fetch_candles", fake_fetch_candles)
+    monkeypatch.setattr(
+        live_loop,
+        "evaluate_spread_atr_gate",
+        lambda *_args, **_kwargs: (True, "test spread gate"),
+    )
     monkeypatch.setattr(live_loop, "place_market_order", fake_place_market_order)
 
 
@@ -239,8 +261,20 @@ async def test_final_gate_sizes_one_open_trade_under_aggregate_cap(monkeypatch):
     }
 
     async def one_open_position(*_args, **kwargs):
-        result = ([existing_position], [])
-        return result if kwargs.get("return_diagnostics") else [existing_position]
+        positions = [existing_position]
+        if order_calls:
+            order = order_calls[-1]
+            positions.append({
+                "ticket": "position-1",
+                "symbol": "XAUUSD",
+                "type": "BUY",
+                "volume": order["lot_size"],
+                "openPrice": 100.10,
+                "stopLoss": order["sl"],
+                "comment": order["comment"],
+            })
+        result = (positions, [])
+        return result if kwargs.get("return_diagnostics") else positions
 
     monkeypatch.setattr(live_loop, "get_open_positions", one_open_position)
     robot = GoldScalperLive()
@@ -265,6 +299,106 @@ async def test_final_gate_sizes_one_open_trade_under_aggregate_cap(monkeypatch):
     assert sent_risk <= 100.0
     assert sent_risk + 10.0 <= 200.0
     assert order_calls[0]["volume_step"] == 0.01
+
+
+@pytest.mark.asyncio
+async def test_capital_manager_formula_limits_lot_when_broker_economics_are_lower(
+    monkeypatch,
+):
+    order_calls = []
+    _patch_order_dependencies(monkeypatch, order_calls)
+
+    async def smaller_contract_spec(_symbol):
+        return {
+            "_mtapi_volume_units": "lots",
+            "_mtapi_volume_scale": 1.0,
+            "symbol": "XAUUSD_i",
+            "symbolInfo": {
+                "digits": 2,
+                "points": 0.01,
+                "tickSize": 0.01,
+                "tickValue": 0.1,
+                "tickValueCurrency": "USD",
+                "contractSize": 10.0,
+                "currencyProfit": "USD",
+                "volumeMin": 0.01,
+                "volumeStep": 0.01,
+                "volumeMax": 50.0,
+            },
+            "symbolGroup": {"sl": 200.0, "tp": 0.0},
+        }
+
+    monkeypatch.setattr(live_loop, "get_symbol_params", smaller_contract_spec)
+    robot = GoldScalperLive()
+
+    result, _, stage, reason = await robot._safe_entry_order(
+        _decision(2.0),
+        (ACTIVE_STRATEGY_SLOT,),
+        "5m",
+        datetime(2026, 10, 16, 9, 30, tzinfo=timezone.utc),
+        1.0,
+        account_balance=10_000.0,
+        account_currency="USD",
+    )
+
+    assert result is not None and result.success
+    assert stage == ""
+    assert reason == ""
+    assert order_calls[0]["lot_size"] == pytest.approx(0.47)
+    capital_manager_risk = (
+        order_calls[0]["lot_size"]
+        * abs(100.10 - order_calls[0]["sl"])
+        * 100.0
+    )
+    assert capital_manager_risk <= 100.0
+
+
+@pytest.mark.asyncio
+async def test_post_fill_risk_over_150_percent_of_cap_closes_position(monkeypatch):
+    order_calls = []
+    _patch_order_dependencies(monkeypatch, order_calls)
+    monkeypatch.setattr(redis_ipc, "REDIS_URL", "")
+    close_calls = []
+
+    async def over_risk_fill(*_args, **kwargs):
+        if not order_calls:
+            positions = []
+        else:
+            order = order_calls[-1]
+            positions = [{
+                "ticket": "position-1",
+                "symbol": "XAUUSD",
+                "type": "BUY",
+                "volume": order["lot_size"],
+                "openPrice": 101.50,
+                "stopLoss": order["sl"],
+            }]
+        return (positions, []) if kwargs.get("return_diagnostics") else positions
+
+    async def fake_close_position(position_id):
+        close_calls.append(position_id)
+        return TradeResult(True, position_id, "closed")
+
+    monkeypatch.setattr(live_loop, "get_open_positions", over_risk_fill)
+    monkeypatch.setattr(live_loop, "close_position", fake_close_position)
+    robot = GoldScalperLive()
+
+    result, positions, stage, reason = await robot._safe_entry_order(
+        _decision(2.0),
+        (ACTIVE_STRATEGY_SLOT,),
+        "5m",
+        datetime(2026, 10, 16, 9, 30, tzinfo=timezone.utc),
+        1.0,
+        account_balance=10_000.0,
+        account_currency="USD",
+    )
+
+    assert result is None
+    assert positions == []
+    assert stage == "POST_FILL_RISK_EXCEEDED"
+    assert "exceeds 1.5x per-trade cap" in reason
+    assert close_calls == ["position-1"]
+    assert order_calls
 
 
 @pytest.mark.asyncio
@@ -625,7 +759,19 @@ async def test_shared_redis_claim_blocks_parallel_engine_instances(monkeypatch):
 
     async def delayed_position_check(*_args, **kwargs):
         await asyncio.sleep(0.01)
-        return ([], []) if kwargs.get("return_diagnostics") else []
+        positions = []
+        if order_calls:
+            order = order_calls[-1]
+            positions = [{
+                "ticket": "position-1",
+                "symbol": "XAUUSD",
+                "type": "BUY",
+                "volume": order["lot_size"],
+                "openPrice": 100.10,
+                "stopLoss": order["sl"],
+                "comment": order["comment"],
+            }]
+        return (positions, []) if kwargs.get("return_diagnostics") else positions
 
     async def delayed_order(**kwargs):
         order_calls.append(kwargs)

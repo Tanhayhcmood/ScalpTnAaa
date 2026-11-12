@@ -83,13 +83,14 @@ from live_trading.risk.adaptive_trailing_stop import (
     AdaptiveTrailingConfig, atr, compute_adaptive_trail, should_apply,
 )
 from live_trading.risk.capital_manager import (
-    CapitalOutput, FIXED_TP_RR,
+    CapitalOutput, FIXED_TP_RR, LOT_DOLLAR_PER_UNIT,
 )
 from live_trading.risk.aggregate_risk import (
     AggregateRiskLimitError,
     OpenPositionRiskError,
     RiskCalculationError,
     build_symbol_risk_spec,
+    post_fill_risk_amount,
     size_order_for_aggregate_risk,
 )
 from live_trading.risk.scalp_exit import (
@@ -176,6 +177,83 @@ from live_trading.utils.state_writer import (
 )
 
 log = get_logger()
+
+
+async def _post_fill_risk_guard(
+    position_id: str,
+    symbol: str,
+    risk_spec,
+    trade_risk_cap: float,
+) -> Optional[tuple[str, str]]:
+    threshold = 1.5 * trade_risk_cap
+    real_risk = None
+    try:
+        positions = await get_open_positions(symbol)
+        if isinstance(positions, tuple):
+            positions = positions[0]
+        position = next(
+            (
+                item for item in positions
+                if isinstance(item, dict)
+                and str(
+                    item.get("ticket", item.get("identifier", item.get("id", "")))
+                ) == str(position_id)
+            ),
+            None,
+        )
+        if position is None:
+            raise RiskCalculationError(
+                f"Filled position {position_id} was not returned by the broker"
+            )
+        real_risk = post_fill_risk_amount(position, risk_spec)
+    except Exception as exc:
+        stage = "POST_FILL_RISK_UNVERIFIABLE"
+        reason = f"Could not verify filled position risk: {exc}"
+    else:
+        if real_risk <= threshold:
+            log.info(
+                "POST_FILL_RISK_CHECK position=%s risk=%.2f cap=%.2f "
+                "threshold=%.2f contract_size=%s",
+                position_id,
+                real_risk,
+                trade_risk_cap,
+                threshold,
+                f"{risk_spec.contract_size:g}"
+                if risk_spec.contract_size_confirmed
+                and risk_spec.contract_size is not None
+                else "resolved_value_per_point",
+            )
+            return None
+        stage = "POST_FILL_RISK_EXCEEDED"
+        reason = (
+            f"Filled position risk {real_risk:.2f} exceeds 1.5x per-trade cap "
+            f"{threshold:.2f}"
+        )
+
+    log.critical(
+        "%s position=%s symbol=%s real_risk=%s cap=%.2f threshold=%.2f; "
+        "closing immediately",
+        stage,
+        position_id,
+        symbol,
+        f"{real_risk:.2f}" if real_risk is not None else "unavailable",
+        trade_risk_cap,
+        threshold,
+    )
+    try:
+        close_result = await close_position(str(position_id))
+        close_ok = bool(close_result.success)
+        close_message = close_result.message
+    except Exception as exc:
+        close_ok = False
+        close_message = str(exc)
+    log.critical(
+        "POST_FILL_RISK_CLOSE position=%s success=%s message=%s",
+        position_id,
+        close_ok,
+        close_message,
+    )
+    return stage, f"{reason}; immediate close success={close_ok}: {close_message}"
 
 
 def _observe_m5_funnel(method):
@@ -1053,6 +1131,28 @@ class GoldScalperLive:
             #      which lets it reject stale state from a different account; and
             #   b) always call initialize() when restore_state() is rejected.
             acc_info = await get_account_info()
+            _startup_symbol_info = (
+                symbol_params.get("symbolInfo", {})
+                if isinstance(symbol_params, dict)
+                else {}
+            )
+            if not isinstance(_startup_symbol_info, dict):
+                _startup_symbol_info = {}
+            try:
+                build_symbol_risk_spec(
+                    symbol_params,
+                    str((acc_info or {}).get("currency") or ""),
+                )
+            except RiskCalculationError as exc:
+                log.error(
+                    "SPEC symbol=%s contract_size=%s tick_size=%s tick_value=%s "
+                    "value_per_point_per_lot=n/a source=unavailable reason=%s",
+                    SYMBOL,
+                    _startup_symbol_info.get("contractSize", "n/a"),
+                    _startup_symbol_info.get("tickSize", "n/a"),
+                    _startup_symbol_info.get("tickValue", "n/a"),
+                    exc,
+                )
             if acc_info:
                 self._last_acc_info = acc_info
                 log.info(
@@ -4710,8 +4810,62 @@ class GoldScalperLive:
                     "RISK_DATA_UNAVAILABLE",
                     str(exc),
                 )
-            tp_params.lot_size = risk_sizing.lot_size
-            tp_params.risk_amount = round(risk_sizing.new_risk, 2)
+            sl_distance = abs(
+                float(tp_params.entry_price) - float(tp_params.stop_loss)
+            )
+            capital_risk_per_lot = sl_distance * LOT_DOLLAR_PER_UNIT
+            if not math.isfinite(capital_risk_per_lot) or capital_risk_per_lot <= 0:
+                return (
+                    None,
+                    confirm_dicts,
+                    "CAPITAL_RISK_LIMIT",
+                    "Capital-manager risk calculation is invalid; skipping trade",
+                )
+            capital_lot_cap = risk_sizing.risk_budget / capital_risk_per_lot
+            final_lot_cap = min(risk_sizing.lot_size, capital_lot_cap)
+            if final_lot_cap + 1e-9 < risk_spec.volume_min:
+                minimum_risk = risk_spec.volume_min * capital_risk_per_lot
+                return (
+                    None,
+                    confirm_dicts,
+                    "CAPITAL_RISK_LIMIT",
+                    f"Minimum-lot capital-manager risk {minimum_risk:.2f} exceeds "
+                    f"remaining risk budget {risk_sizing.risk_budget:.2f}; skipping trade",
+                )
+            step_count = math.floor(
+                (final_lot_cap - risk_spec.volume_min) / risk_spec.volume_step
+                + 1e-9
+            )
+            final_lot = round(
+                risk_spec.volume_min + step_count * risk_spec.volume_step,
+                8,
+            )
+            capital_risk = final_lot * capital_risk_per_lot
+            aggregate_sizer_risk = (
+                risk_sizing.new_risk * final_lot / risk_sizing.lot_size
+            )
+            final_risk = max(capital_risk, aggregate_sizer_risk)
+            if final_risk > risk_sizing.trade_limit + 0.01:
+                return (
+                    None,
+                    confirm_dicts,
+                    "CAPITAL_RISK_LIMIT",
+                    f"Final risk {final_risk:.2f} exceeds per-trade cap "
+                    f"{risk_sizing.trade_limit:.2f}; skipping trade",
+                )
+            if (
+                risk_sizing.existing_risk + final_risk
+                > risk_sizing.aggregate_limit + 0.01
+            ):
+                return (
+                    None,
+                    confirm_dicts,
+                    "AGGREGATE_RISK_LIMIT",
+                    f"Final risk {final_risk:.2f} would exceed the remaining "
+                    "aggregate risk limit; skipping trade",
+                )
+            tp_params.lot_size = final_lot
+            tp_params.risk_amount = round(final_risk, 2)
             tp_params.risk_budget = round(risk_sizing.risk_budget, 2)
             tp_params.min_lot_risk_exceeded = False
             log.info(
@@ -4719,7 +4873,8 @@ class GoldScalperLive:
                 f"lot={tp_params.lot_size:.4f} "
                 f"risk={tp_params.risk_amount:.2f} {risk_spec.account_currency} "
                 f"open={risk_sizing.existing_risk:.2f} "
-                f"combined={risk_sizing.aggregate_risk:.2f}/"
+                f"capital_guard_risk={capital_risk:.2f} "
+                f"combined={risk_sizing.existing_risk + final_risk:.2f}/"
                 f"{risk_sizing.aggregate_limit:.2f} "
                 f"trade_cap={tp_params.risk_percent:.2f}% "
                 f"tick={risk_spec.tick_size:g}/"
@@ -4829,6 +4984,41 @@ class GoldScalperLive:
                 volume_step=risk_spec.volume_step,
                 volume_max=risk_spec.volume_max,
             )
+            if result.success:
+                if result.position_id is None:
+                    log.critical(
+                        "POST_FILL_RISK_UNVERIFIABLE symbol=%s: successful order "
+                        "has no position ticket",
+                        SYMBOL,
+                    )
+                    return (
+                        None,
+                        confirm_dicts,
+                        "POST_FILL_RISK_UNVERIFIABLE",
+                        "Successful order returned no position ticket; risk cannot be verified",
+                    )
+                post_fill_failure = await _post_fill_risk_guard(
+                    str(result.position_id),
+                    SYMBOL,
+                    risk_spec,
+                    risk_sizing.trade_limit,
+                )
+                if post_fill_failure is not None:
+                    stage, reason = post_fill_failure
+                    if shared_claim_required and redis_ipc is not None:
+                        try:
+                            redis_ipc.redis_mark_entry_signal(
+                                signal_id,
+                                "FAILED",
+                                position_id=None,
+                            )
+                        except Exception as exc:
+                            log.warning(
+                                "Could not record post-fill risk block for signal %s: %s",
+                                signal_id,
+                                exc,
+                            )
+                    return None, confirm_dicts, stage, reason
             if result.success:
                 self._entry_spread_at_order = spread_price
                 if SCALP_PROFILE == "on" and result.position_id is not None:

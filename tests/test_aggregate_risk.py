@@ -114,10 +114,68 @@ def test_tick_size_and_tick_value_produce_account_currency_risk():
         _symbol_params(tickSize=0.01, tickValue=0.5), "USD"
     )
 
-    assert risk_per_lot("BUY", 2300.0, 2299.25, spec) == pytest.approx(37.5)
+    assert risk_per_lot("BUY", 2300.0, 2299.25, spec) == pytest.approx(75.0)
     assert position_risk_amount(
         _position(1, entry=2300.0, stop=2299.25, volume=0.2), spec
-    ) == pytest.approx(7.5)
+    ) == pytest.approx(15.0)
+
+
+def test_xauusd_low_tick_value_uses_confirmed_contract_size_and_logs_mismatch():
+    params = _symbol_params(
+        tickValue=0.1,
+        tickValueCurrency="USD",
+        contractSize=100.0,
+        currencyProfit="USD",
+    )
+    params["symbol"] = "XAUUSD_i"
+
+    with patch("live_trading.risk.aggregate_risk.log.error") as error_log:
+        spec = build_symbol_risk_spec(params, "USD")
+
+    assert spec.tick_value_per_lot == pytest.approx(1.0)
+    assert spec.value_per_point_per_lot == pytest.approx(100.0)
+    assert spec.tick_value_source == "contract_size_after_mismatch"
+    assert any(
+        call.args[0].startswith("TICK_VALUE_MISMATCH")
+        for call in error_log.call_args_list
+    )
+
+
+def test_consistent_tick_value_and_contract_size_keep_expected_point_value():
+    params = _symbol_params(
+        tickValue=1.0,
+        tickValueCurrency="USD",
+        contractSize=100.0,
+        currencyProfit="USD",
+    )
+    params["symbol"] = "XAUUSD_i"
+
+    with patch("live_trading.risk.aggregate_risk.log.error") as error_log:
+        spec = build_symbol_risk_spec(params, "USD")
+
+    assert spec.tick_value_per_lot == pytest.approx(1.0)
+    assert spec.value_per_point_per_lot == pytest.approx(100.0)
+    assert spec.tick_value_source == "broker_tick_value"
+    assert not any(
+        call.args[0].startswith("TICK_VALUE_MISMATCH")
+        for call in error_log.call_args_list
+    )
+
+
+def test_tick_value_override_cannot_lower_a_safer_resolved_value(monkeypatch):
+    monkeypatch.setenv("TICK_VALUE_OVERRIDE_PER_POINT_PER_LOT", "100")
+    params = _symbol_params(
+        tickValue=0.1,
+        tickValueCurrency="USD",
+        contractSize=100.0,
+        currencyProfit="USD",
+    )
+    params["symbol"] = "XAUUSD_i"
+
+    spec = build_symbol_risk_spec(params, "USD")
+
+    assert spec.value_per_point_per_lot == pytest.approx(100.0)
+    assert spec.tick_value_source == "env_override"
 
 
 def test_contract_size_fallback_requires_matching_account_currency():
