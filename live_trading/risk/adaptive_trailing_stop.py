@@ -37,6 +37,10 @@ class AdaptiveTrailingConfig:
     min_profit_atr_multiple: float = 1.5
     min_tight_distance_atr: float = 1.0
     min_step_price: float = 0.05
+    breakeven_arm_r: float = 0.5
+    lock_arm_r: float = 0.8
+    lock_profit_r: float = 0.2
+    breakeven_buffer_price: float = 0.2
 
 
 @dataclass(frozen=True)
@@ -315,44 +319,70 @@ def compute_adaptive_trail(
     # retraces before the next poll.  The live loop persists this flag.
     breakeven_armed = bool(
         breakeven_armed
-        or (normalized_risk > 0.0 and floating_profit_price >= normalized_risk)
+        or (
+            normalized_risk > 0.0
+            and floating_profit_price
+            >= float(cfg.breakeven_arm_r) * normalized_risk
+        )
     )
 
     stage = "WAITING_FOR_1R"
     candidate = None
     multiplier = 0.0
     distance = 0.0
-    if breakeven_armed and normalized_entry is not None:
-        sl_at_or_beyond_breakeven = False
+    if normalized_entry is not None:
+        be_buffer = abs(float(cfg.breakeven_buffer_price))
+        be_candidate = round(
+            normalized_entry + (be_buffer if is_buy else -be_buffer), 8
+        )
+        lock_profit_distance = max(0.0, float(cfg.lock_profit_r)) * normalized_risk
+        lock_candidate = round(
+            normalized_entry
+            + (lock_profit_distance if is_buy else -lock_profit_distance),
+            8,
+        )
+        sl_at_or_beyond_lock = False
         if current_sl is not None:
             try:
                 live_sl = float(current_sl)
-                sl_at_or_beyond_breakeven = (
-                    live_sl >= normalized_entry if is_buy
-                    else live_sl <= normalized_entry
+                sl_at_or_beyond_lock = (
+                    live_sl >= lock_candidate if is_buy
+                    else live_sl <= lock_candidate
                 )
             except (TypeError, ValueError):
-                sl_at_or_beyond_breakeven = False
+                sl_at_or_beyond_lock = False
 
-        if not sl_at_or_beyond_breakeven:
+        if (
+            normalized_risk > 0.0
+            and floating_profit_r_multiple >= float(cfg.lock_arm_r)
+        ):
+            if not sl_at_or_beyond_lock:
+                stage = "LOCK"
+                candidate = lock_candidate
+                distance = round(abs(float(current_price) - lock_candidate), 8)
+            elif current_atr > 0.0:
+                stage = "CHANDELIER"
+                multiplier = float(cfg.chandelier_atr_multiplier)
+                if is_buy and high_since_entry is not None:
+                    candidate = round(
+                        high_since_entry - (multiplier * current_atr), 8
+                    )
+                    distance = round(high_since_entry - candidate, 8)
+                elif not is_buy and low_since_entry is not None:
+                    candidate = round(
+                        low_since_entry + (multiplier * current_atr), 8
+                    )
+                    distance = round(candidate - low_since_entry, 8)
+        elif breakeven_armed:
             stage = "BREAKEVEN"
-            candidate = round(normalized_entry, 8)
-            distance = round(abs(float(current_price) - normalized_entry), 8)
-        elif current_atr > 0.0:
-            stage = "CHANDELIER"
-            multiplier = float(cfg.chandelier_atr_multiplier)
-            if is_buy and high_since_entry is not None:
-                candidate = round(high_since_entry - (multiplier * current_atr), 8)
-                distance = round(high_since_entry - candidate, 8)
-            elif not is_buy and low_since_entry is not None:
-                candidate = round(low_since_entry + (multiplier * current_atr), 8)
-                distance = round(candidate - low_since_entry, 8)
+            candidate = be_candidate
+            distance = round(abs(float(current_price) - be_candidate), 8)
 
     # ``mode`` remains in the decision contract for panel compatibility.
     # Exhaustion indicators are retained as telemetry but no longer authorize
     # an SL move; the R-based state machine is the sole activation gate.
     mode = stage
-    tightening_eligible = stage == "CHANDELIER"
+    tightening_eligible = stage in {"BREAKEVEN", "LOCK", "CHANDELIER"}
     return AdaptiveTrailDecision(
         mode=mode,
         stage=stage,
