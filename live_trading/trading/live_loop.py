@@ -61,6 +61,7 @@ from live_trading.config import (
     DAILY_LOSS_LIMIT_PCT, MAX_DRAWDOWN_PCT, SLIPPAGE_POINTS,
     STATE_FILE, GUARDIAN_STATE_FILE,
     HISTORY_LOOKBACK_DAYS, HISTORY_SYNC_INTERVAL,
+    ADAPTIVE_TRAIL_V2,
     TRAIL_ENABLED, TRAIL_ATR_PERIOD, TRAIL_NORMAL_MULTIPLIER,
     TRAIL_TIGHT_MULTIPLIER, TRAIL_EXHAUSTION_CONFIRM_COUNT,
     TRAIL_MOMENTUM_LOOKBACK, TRAIL_BODY_SHRINK_RATIO,
@@ -922,6 +923,8 @@ class GoldScalperLive:
             min_profit_atr_multiple=TRAIL_MIN_PROFIT_ATR,
             min_tight_distance_atr=TRAIL_MIN_DISTANCE_ATR,
             min_step_price=TRAIL_MIN_STEP_PRICE,
+            breakeven_arm_r=1.0 if ADAPTIVE_TRAIL_V2 else 0.5,
+            adaptive_trail_v2=ADAPTIVE_TRAIL_V2,
         )
         # Baseline for EACH currently open position, keyed by str(ticket id):
         # its ORIGINAL entry price and ORIGINAL risk distance (never mutated
@@ -3364,27 +3367,33 @@ class GoldScalperLive:
                 pos["sl"],
                 candidate_sl,
                 apply_step,
+                reject_unchanged=ADAPTIVE_TRAIL_V2,
             )
             action = "MODIFY" if applicable else "HOLD"
             if candidate_sl is None:
                 reason_text = (
-                    "waiting for 1R (current %.3fR, risk_distance=%.5f)"
-                    % (
-                        decision.floating_profit_r_multiple,
-                        decision.risk_distance,
-                    )
+                    f"waiting for {self._trailing_cfg.breakeven_arm_r:g}R "
+                    f"(current {decision.floating_profit_r_multiple:.3f}R, "
+                    f"risk_distance={decision.risk_distance:.5f})"
                 )
                 if decision.stage == "CHANDELIER":
                     reason_text = "insufficient ATR/candle data for chandelier"
             else:
-                reason_text = (
-                    "move SL to exact breakeven at 1R"
-                    if decision.stage == "BREAKEVEN"
-                    else (
+                if decision.stage == "BREAKEVEN":
+                    be_buffer = abs(
+                        float(self._trailing_cfg.breakeven_buffer_price)
+                    )
+                    be_target = "buffered breakeven" if be_buffer else "entry"
+                    reason_text = (
+                        f"move SL to {be_target} at "
+                        f"{self._trailing_cfg.breakeven_arm_r:g}R "
+                        f"(buffer={be_buffer:.2f})"
+                    )
+                else:
+                    reason_text = (
                         "chandelier from favourable extreme "
                         f"(multiplier={self._trailing_cfg.chandelier_atr_multiplier:.2f})"
                     )
-                )
             self._last_trailing_statuses[pos_id] = {
                 "active": candidate_sl is not None,
                 "mode": decision.mode,

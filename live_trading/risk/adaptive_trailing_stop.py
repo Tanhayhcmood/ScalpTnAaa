@@ -41,6 +41,7 @@ class AdaptiveTrailingConfig:
     lock_arm_r: float = 0.8
     lock_profit_r: float = 0.2
     breakeven_buffer_price: float = 0.2
+    adaptive_trail_v2: bool = False
 
 
 @dataclass(frozen=True)
@@ -315,15 +316,27 @@ def compute_adaptive_trail(
             high_since_entry = normalized_entry
             low_since_entry = normalized_entry
 
-    # Once the threshold has been observed, retain that fact even if price
-    # retraces before the next poll.  The live loop persists this flag.
+    # V2 derives this state from the best favorable price, not a persisted V1
+    # flag that may have been armed at 0.5R.
+    threshold_profit_price = floating_profit_price
+    if cfg.adaptive_trail_v2 and normalized_entry is not None:
+        if is_buy and high_since_entry is not None:
+            threshold_profit_price = max(
+                threshold_profit_price,
+                max(0.0, high_since_entry - normalized_entry),
+            )
+        elif not is_buy and low_since_entry is not None:
+            threshold_profit_price = max(
+                threshold_profit_price,
+                max(0.0, normalized_entry - low_since_entry),
+            )
+    threshold_reached = (
+        normalized_risk > 0.0
+        and threshold_profit_price
+        >= float(cfg.breakeven_arm_r) * normalized_risk
+    )
     breakeven_armed = bool(
-        breakeven_armed
-        or (
-            normalized_risk > 0.0
-            and floating_profit_price
-            >= float(cfg.breakeven_arm_r) * normalized_risk
-        )
+        threshold_reached or (breakeven_armed and not cfg.adaptive_trail_v2)
     )
 
     stage = "WAITING_FOR_1R"
@@ -341,21 +354,40 @@ def compute_adaptive_trail(
             + (lock_profit_distance if is_buy else -lock_profit_distance),
             8,
         )
+        sl_at_or_beyond_breakeven = False
         sl_at_or_beyond_lock = False
         if current_sl is not None:
             try:
                 live_sl = float(current_sl)
+                sl_at_or_beyond_breakeven = (
+                    live_sl >= be_candidate if is_buy
+                    else live_sl <= be_candidate
+                )
                 sl_at_or_beyond_lock = (
                     live_sl >= lock_candidate if is_buy
                     else live_sl <= lock_candidate
                 )
             except (TypeError, ValueError):
+                sl_at_or_beyond_breakeven = False
                 sl_at_or_beyond_lock = False
 
-        if (
+        lock_armed = (
             normalized_risk > 0.0
             and floating_profit_r_multiple >= float(cfg.lock_arm_r)
+        )
+        if cfg.adaptive_trail_v2 and not breakeven_armed:
+            # V2 holds every adaptive stop stage until the 1R threshold.
+            stage = "WAITING_FOR_1R"
+        elif (
+            cfg.adaptive_trail_v2
+            and breakeven_armed
+            and not sl_at_or_beyond_breakeven
         ):
+            # Apply the selected buffered breakeven before the legacy lock.
+            stage = "BREAKEVEN"
+            candidate = be_candidate
+            distance = round(abs(float(current_price) - be_candidate), 8)
+        elif lock_armed:
             if not sl_at_or_beyond_lock:
                 stage = "LOCK"
                 candidate = lock_candidate
@@ -411,9 +443,15 @@ def should_apply(
     current_sl: float,
     candidate_sl: Optional[float],
     min_step_price: float,
+    reject_unchanged: bool = False,
 ) -> bool:
-    """Only permit stop movement in the trade's favourable direction."""
+    """Only permit favourable stop movement, optionally rejecting no-ops."""
     if candidate_sl is None:
+        return False
+    if (
+        reject_unchanged
+        and round(float(candidate_sl), 2) == round(float(current_sl), 2)
+    ):
         return False
     if str(direction).upper() == "BUY":
         return candidate_sl - current_sl >= min_step_price
