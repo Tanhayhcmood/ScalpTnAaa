@@ -873,6 +873,7 @@ class GoldScalperLive:
         self._entry_gate_shadow_logged_bar: dict[str, datetime] = {}
         self._loss_streak_shadow_logged_bar: dict[str, datetime] = {}
         self._close_history_checked_at: dict[str, float] = {}
+        self._missing_open_position_cycles: dict[str, int] = {}
         self._open_position_snapshot_initialized = False
         self._last_history_sync_at: float = 0.0
         self._history_sync_status: dict = {
@@ -3530,7 +3531,7 @@ class GoldScalperLive:
     async def _reconcile_closed_trades(
         self, raw_positions: Optional[list[dict]] = None
     ) -> None:
-        """Persist exact exit details for positions no longer open in MT5."""
+        """Refresh broker positions and close internal trades absent from MT5."""
         if raw_positions is None:
             try:
                 raw_positions, _ = await get_open_positions(
@@ -3540,45 +3541,92 @@ class GoldScalperLive:
                 log.debug(f"Closed-trade reconciliation skipped: {exc}")
                 return
 
-        open_ids = {
-            str(mt5_pos_to_dict(position).get("id"))
-            for position in raw_positions
-        }
+        self._last_open_positions = [
+            mt5_pos_to_dict(position) for position in raw_positions
+        ]
+        open_ids = {str(position.get("id")) for position in self._last_open_positions}
         now = asyncio.get_event_loop().time()
         candidates: dict[str, dict] = {}
         for entry in self.trade_history:
             ticket = entry.get("position_id") or entry.get("ticket")
-            if ticket is None or entry.get("close_time"):
+            if ticket is None:
+                continue
+            ticket_id = str(ticket)
+            if ticket_id in open_ids:
+                self._missing_open_position_cycles.pop(ticket_id, None)
+                continue
+            if entry.get("close_time"):
+                self._missing_open_position_cycles.pop(ticket_id, None)
                 continue
             # TRAIL_SL and close-command audit rows are not entry records.
             if entry.get("entry") is None and entry.get("lot") is None:
                 continue
-            ticket_id = str(ticket)
-            if ticket_id not in open_ids:
-                candidates.setdefault(ticket_id, entry)
+            candidates.setdefault(ticket_id, entry)
 
-        changed = False
         for ticket_id, entry in candidates.items():
+            missing_cycles = self._missing_open_position_cycles.get(ticket_id, 0) + 1
+            self._missing_open_position_cycles[ticket_id] = missing_cycles
+            if missing_cycles < 2:
+                continue
             last_checked = self._close_history_checked_at.get(ticket_id, 0.0)
             if now - last_checked < _CLOSE_HISTORY_RETRY_INTERVAL:
                 continue
             self._close_history_checked_at[ticket_id] = now
+
+            history = None
+            end_time = datetime.now(timezone.utc)
             try:
-                history = await get_closed_position_history(ticket_id)
-            except RuntimeError as exc:
+                deals = await get_deals_by_time_range(
+                    end_time - timedelta(days=HISTORY_LOOKBACK_DAYS), end_time
+                )
+                history = next(
+                    (
+                        record
+                        for record in self._history_records_from_deals(deals)
+                        if str(record.get("position_id")) == ticket_id
+                        and record.get("status") == "CLOSED"
+                    ),
+                    None,
+                )
+            except Exception as exc:
                 log.warning(
-                    f"Could not read MetaAPI close history for {ticket_id}: {exc}"
+                    "Could not read broker deal history for ticket=%s: %s",
+                    ticket_id,
+                    exc,
+                )
+
+            if history is None:
+                try:
+                    history = await get_closed_position_history(ticket_id)
+                except RuntimeError as exc:
+                    log.warning(
+                        "Could not read MT5 close history for ticket=%s: %s",
+                        ticket_id,
+                        exc,
+                    )
+                    continue
+            if not history:
+                log.debug(
+                    "No broker close deal found for ticket=%s after %d absent checks",
+                    ticket_id,
+                    missing_cycles,
                 )
                 continue
-            if not history:
-                # Missing history is not evidence of a close. Retry later.
-                continue
             if self._apply_close_history(entry, history):
-                changed = True
+                self._missing_open_position_cycles.pop(ticket_id, None)
 
         self._open_position_snapshot_initialized = True
-        if changed:
-            self._write_state("RUNNING", self._last_acc_info)
+        # Publish broker-confirmed positions every reconciliation cycle so the
+        # panel count and floating P&L never lag behind the live MT5 response.
+        last_status = (
+            self._last_state_write_args[0]
+            if self._last_state_write_args
+            else "RUNNING"
+        )
+        current_position = self._last_open_positions[0] if self._last_open_positions else None
+        self._write_state(
+            last_status, self._last_acc_info, position=current_position
+        )
 
     @staticmethod
     def _deal_value(deal: dict, *keys: str, default=None):
@@ -3594,6 +3642,10 @@ class GoldScalperLive:
             "positionId",
             "positionID",
             "position_id",
+            "positionTicket",
+            "position_ticket",
+            "positionIdentifier",
+            "position_identifier",
             "position",
             default="",
         )
@@ -3613,9 +3665,15 @@ class GoldScalperLive:
 
     @staticmethod
     def _deal_entry_type(deal: dict) -> str:
-        return str(
-            deal.get("entryType", deal.get("entry", deal.get("entry_type", "")))
-        ).upper()
+        value = deal.get("entryType", deal.get("entry", deal.get("entry_type", "")))
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return {0: "IN", 1: "OUT", 2: "INOUT", 3: "OUT_BY"}.get(
+                int(value), str(value).upper()
+            )
+        text = str(value).upper()
+        if text in {"0", "1", "2", "3"}:
+            return {"0": "IN", "1": "OUT", "2": "INOUT", "3": "OUT_BY"}[text]
+        return text.removeprefix("DEAL_ENTRY_")
 
     @classmethod
     def _history_records_from_deals(cls, deals: list[dict]) -> list[dict]:
@@ -3637,13 +3695,11 @@ class GoldScalperLive:
         for position_id, position_deals in grouped.items():
             entries = [
                 deal for deal in position_deals
-                if cls._deal_entry_type(deal) in {"DEAL_ENTRY_IN", "IN"}
+                if cls._deal_entry_type(deal) == "IN"
             ]
             closes = [
                 deal for deal in position_deals
-                if cls._deal_entry_type(deal) in {
-                    "DEAL_ENTRY_OUT", "DEAL_ENTRY_OUT_BY", "OUT", "OUT_BY",
-                }
+                if cls._deal_entry_type(deal) in {"OUT", "OUT_BY", "INOUT"}
             ]
             # Some broker adapters omit entryType. Keep such a row visible as
             # an open entry instead of silently dropping a real position.
@@ -3683,7 +3739,13 @@ class GoldScalperLive:
             )
             close_comment = (
                 cls._deal_value(
-                    close, "comment", "brokerComment", "closeComment", default=""
+                    close,
+                    "comment",
+                    "brokerComment",
+                    "closeComment",
+                    "reason",
+                    "closeReason",
+                    default="",
                 )
                 if close else ""
             )
@@ -3758,6 +3820,10 @@ class GoldScalperLive:
             for record in records:
                 ticket = str(record["position_id"])
                 existing = by_ticket.get(ticket)
+                was_closed = bool(
+                    existing
+                    and (existing.get("close_time") or existing.get("status") == "CLOSED")
+                )
                 if existing is None:
                     record["logged_at"] = (
                         record.get("close_time")
@@ -3776,6 +3842,15 @@ class GoldScalperLive:
                     })
                     merged += 1
                 if record.get("status") == "CLOSED":
+                    if not was_closed:
+                        log.info(
+                            "Trade close reconciled from broker deals: ticket=%s "
+                            "price=%s profit=%s reason=%s",
+                            ticket,
+                            record.get("close_price"),
+                            record.get("profit"),
+                            record.get("close_reason"),
+                        )
                     closed += 1
 
             self.trade_history.sort(
@@ -3814,10 +3889,11 @@ class GoldScalperLive:
             log.warning("Broker history sync failed: %s", exc)
 
     def _apply_close_history(self, entry: dict, history: dict) -> bool:
-        close_price = _history_float(history, "closePrice", "price")
+        close_price = _history_float(history, "closePrice", "close_price", "price")
         close_time = _history_datetime(
             history,
             "closeTime",
+            "close_time",
             "closeTimestampUTC",
             "historyTime",
             "executionTime",
@@ -3837,12 +3913,12 @@ class GoldScalperLive:
             if event.get("action") == "TRAIL_SL":
                 trailing_stop = _history_float(event, "new_sl")
 
-        gross_profit = _history_float(history, "profit") or 0.0
+        gross_profit = _history_float(history, "profit_gross", "profit") or 0.0
         commission = _history_float(history, "commission") or 0.0
         swap = _history_float(history, "swap") or 0.0
         fee = _history_float(history, "fee") or 0.0
         net_profit = gross_profit + commission + swap + fee
-        close_reason = classify_close_reason(
+        close_reason = _history_value(history, "close_reason") or classify_close_reason(
             history, entry, trailing_stop=trailing_stop
         )
         entry.update({
@@ -3859,7 +3935,7 @@ class GoldScalperLive:
             "fee": fee,
             "profit": net_profit,
             "close_reason": close_reason,
-            "close_comment": _history_value(history, "closeComment", "comment"),
+            "close_comment": _history_value(history, "closeComment", "close_comment", "comment"),
             "close_source": "MT5_HISTORY",
             "status": "CLOSED",
         })
@@ -3878,7 +3954,8 @@ class GoldScalperLive:
                 exc,
             )
         log.info(
-            f"Trade closed ticket={ticket_id} reason={entry['close_reason']} "
+            f"Trade close reconciled from broker history: ticket={ticket_id} "
+            f"reason={entry['close_reason']} "
             f"price={close_price:.5f} profit={entry['profit']:+.2f} "
             f"time={close_time}"
         )

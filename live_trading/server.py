@@ -346,15 +346,36 @@ def _build_snapshot_from_state(state: dict, signal_snap: dict | None = None) -> 
     per-bar signal metrics (price, regime, adx, atr).  This helper merges both
     so the Telegram panel always gets real account + signal data in one response.
     """
-    account_info = state.get("account_info", {})
+    account_info = dict(state.get("account_info", {}) or {})
     guardian = state.get("guardian", {})
     pos = state.get("open_position")
+    open_positions = state.get("open_positions")
+    if not isinstance(open_positions, list):
+        open_positions = [pos] if pos else []
+    open_positions = [
+        {
+            **position,
+            "type": position.get("type", position.get("direction", "BUY")),
+            "volume": position.get("volume", position.get("lot_size", 0.0)),
+            "open_price": position.get("open_price", position.get("entry", 0.0)),
+            "profit": position.get("profit", position.get("floating_profit", 0.0)),
+        }
+        for position in open_positions
+        if isinstance(position, dict)
+    ]
+    floating_profit = 0.0
+    for position in open_positions:
+        try:
+            floating_profit += float(position.get("profit", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+    account_info["floating_profit"] = floating_profit
     result: dict = {
         "account_info":     account_info,
         "connection_status": state.get("connection_status", "disconnected"),
         "today_profit":     float(state.get("today_profit", 0.0)),
-        "floating_profit":  float(account_info.get("floating_profit", 0.0)),
-        "open_positions":   [pos] if pos else [],
+        "floating_profit":  floating_profit,
+        "open_positions":   open_positions,
         "pending_orders":   [],
         "recent_trades":    state.get("recent_trades", []),
         "drawdown": {

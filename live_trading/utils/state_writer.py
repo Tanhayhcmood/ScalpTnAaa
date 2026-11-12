@@ -4,6 +4,7 @@ so the Telegram Control Panel can display live status and take commands.
 """
 import json
 import os
+import time
 from datetime import datetime, timezone
 from typing import List, Optional
 from live_trading.signals.decision_engine import DecisionResult, describe_strategy
@@ -61,6 +62,28 @@ VERSION = "v4.0.5"
 # uptime_seconds is accurate from engine start regardless of when the module
 # is imported.  Using None until first call avoids a spurious 0-uptime flash.
 _engine_start_time: Optional[datetime] = None
+_CONNECTION_STATUS_GRACE_SECONDS = 30.0
+_display_connection_status: Optional[str] = None
+_connection_failure_started: Optional[float] = None
+
+
+def _stable_connection_status(connected: bool) -> str:
+    """Keep the last valid dashboard status for brief connection failures."""
+    global _display_connection_status, _connection_failure_started
+    now = time.monotonic()
+    if connected:
+        _display_connection_status = "connected"
+        _connection_failure_started = None
+        return _display_connection_status
+    if _connection_failure_started is None:
+        _connection_failure_started = now
+    if (
+        _display_connection_status == "connected"
+        and now - _connection_failure_started < _CONNECTION_STATUS_GRACE_SECONDS
+    ):
+        return _display_connection_status
+    _display_connection_status = "disconnected"
+    return _display_connection_status
 
 
 def _now_iso() -> str:
@@ -141,12 +164,20 @@ def write_robot_state(
             "ticket":    position.get("ticket", position.get("id")),
             "symbol":    position.get("symbol"),
             "direction": position.get("type", position.get("direction")),
-            "lot_size":  position.get("volume"),
-            "entry":     position.get("open_price"),
+            "type":      position.get("type", position.get("direction")),
+            "lot_size":  position.get("volume", position.get("lot_size")),
+            "volume":    position.get("volume", position.get("lot_size")),
+            "entry":     position.get("open_price", position.get("entry")),
+            "open_price": position.get("open_price", position.get("entry")),
             "sl":        position.get("sl"),
             "tp":        position.get("tp"),
-            "profit":    position.get("profit"),
+            "profit":    position.get("profit", position.get("floating_profit", 0.0)),
+            "floating_profit": position.get("floating_profit", position.get("profit", 0.0)),
+            "commission": position.get("commission", 0.0),
+            "swap":      position.get("swap", 0.0),
             "open_time": position.get("open_time"),
+            "comment":   position.get("comment", ""),
+            "magic":     position.get("magic", 0),
         })
 
     dec_data = None
@@ -202,19 +233,23 @@ def write_robot_state(
             "vwap_filter": getattr(decision, "vwap_filter", None),
         }
 
-    # Derive connection/MT5 status from the ACTUAL connector state.
-    # Using the robot loop-status string (RUNNING/PAUSED/WAITING) caused the
-    # panel to show "connected" even when the mt5rest bridge was unreachable
-    # (e.g. Render free-tier sleep, Guardian-paused robot, or mid-reconnect).
-    # We import lazily so state_writer stays importable in unit tests that
-    # don't initialise the connector.
+    # Derive broker status from the connector, but hold the last valid status
+    # during a short outage so transient reconnect checks do not flicker the panel.
     try:
         from live_trading.mt5.connector import is_connected as _mt5_is_connected
         _connected = _mt5_is_connected()
     except Exception:
-        # Fallback: derive from status string (original behaviour)
         _connected = status.upper() in ("RUNNING", "WAITING", "SCANNING", "HOLDING")
-    _conn_str = "connected" if _connected else "disconnected"
+    _conn_str = _stable_connection_status(_connected)
+
+    _position_floating = 0.0
+    for _position in source_positions:
+        try:
+            _position_floating += float(
+                _position.get("profit", _position.get("floating_profit", 0.0)) or 0.0
+            )
+        except (TypeError, ValueError, OverflowError):
+            continue
 
     # Convenience account dict (legacy "account" key kept for backward compat)
     _balance = account_info.get("balance", 0)
@@ -222,11 +257,8 @@ def write_robot_state(
     _account_dict = {
         "balance":     _balance,
         "equity":      _equity,
-        # connector.get_account_info() does NOT return a "profit" field.
-        # Compute it as equity − balance (= floating P&L on open positions).
-        # Fall back to the API's "profit" field if it IS present (e.g. future
-        # mt5rest versions that expose it directly).
-        "profit":      account_info.get("profit", _equity - _balance),
+        # Use P&L from the broker-confirmed open positions, not a stale summary.
+        "profit":      _position_floating,
         "margin":      account_info.get("margin", 0),
         "margin_free": account_info.get("freeMargin", account_info.get("free_margin", 0)),
         "currency":    account_info.get("currency", "USD"),
@@ -314,6 +346,14 @@ def write_robot_state(
         state.update(extra)
 
     _safe_write(STATE_FILE, state)
+    # Keep the panel snapshot aligned with broker positions and floating P&L.
+    if open_positions is not None:
+        try:
+            from live_trading.redis_ipc import redis_update_snapshot_positions
+            redis_update_snapshot_positions(open_positions)
+        except Exception as _positions_exc:
+            log.debug(f"Snapshot position sync skipped: {_positions_exc}")
+
     # ROOT-CAUSE FIX: sync recent_trades to snapshot key so the panel's
     # MT5Service (which reads goldscalper:snapshot) always has the latest
     # trade history without waiting for the next bar.
