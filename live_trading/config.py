@@ -645,6 +645,8 @@ SLIPPAGE_POINTS      = _int("SLIPPAGE_POINTS",         30,   lo=1,   hi=500)
 # The live stop waits for 1R, moves to breakeven, then uses a Chandelier stop
 # anchored to the best price seen since entry. Legacy normal/tight settings are
 # retained for config compatibility and telemetry.
+# Keep the adaptive v2 stop behavior explicitly opt-in.
+ADAPTIVE_TRAIL_V2 = False
 TRAIL_ENABLED        = os.getenv("TRAIL_ENABLED", "true").lower() == "true"
 TRAIL_ATR_PERIOD = _int("TRAIL_ATR_PERIOD", 14, lo=1, hi=100)
 TRAIL_CHANDELIER_ATR_MULTIPLIER = _float(
