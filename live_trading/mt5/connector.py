@@ -64,6 +64,7 @@ _session:    Optional[aiohttp.ClientSession] = None
 _connected:  bool = False
 _base_url:   str  = ""
 _conn_id:    str  = ""   # Token returned by Connect; passed to every call
+_conn_id_confirmed: bool = False
 _last_connect_time: float = 0.0   # monotonic timestamp of last successful connect()
 # Kept as a narrow test/adaptor seam for callers that provide an RPC-shaped
 # fake. Production traffic never uses this object; it always uses MTAPI REST.
@@ -654,6 +655,7 @@ async def _previous_connection_is_alive(
     conn_id: str,
 ) -> Optional[bool]:
     """Return True/False for confirmed status, or None when it is unknown."""
+    global _conn_id_confirmed
     try:
         async with session.get(
             f"{base_url}/ConnectionStatus",
@@ -664,9 +666,12 @@ async def _previous_connection_is_alive(
             if resp.status == 200:
                 alive = _connection_status_is_alive(data)
                 if alive:
+                    _conn_id_confirmed = True
                     _connection_health["connection_status"] = "connected"
+                    _connection_health["consecutive_failures"] = 0
                     _persist_connection_history()
                     return True
+                _conn_id_confirmed = False
                 _record_connection_event(
                     "connection_status_not_alive",
                     source="previous_session_validation",
@@ -677,6 +682,7 @@ async def _previous_connection_is_alive(
                 )
                 return False
             if resp.status in {404, 410}:
+                _conn_id_confirmed = False
                 _record_connection_event(
                     "connection_status_not_alive",
                     source="previous_session_validation",
@@ -711,7 +717,7 @@ async def _connect_unlocked() -> bool:
     retry loop, or manual reconnect from replacing the same broker session
     concurrently.
     """
-    global _connected, _base_url, _conn_id, _last_connect_time, _connection_generation
+    global _connected, _base_url, _conn_id, _conn_id_confirmed, _last_connect_time, _connection_generation
 
     base = MTAPI_URL.rstrip("/") if MTAPI_URL else ""
     host = MT5_HOST
@@ -851,6 +857,7 @@ async def _connect_unlocked() -> bool:
                 )
                 return False
             _conn_id = conn_id
+            _conn_id_confirmed = True
             _connected = True
             _last_connect_time = _time.monotonic()
             _connection_generation += 1
@@ -873,13 +880,13 @@ async def connect(*args, **kwargs) -> bool:
 
 async def disconnect() -> None:
     """Close the MTAPI connection and release the HTTP session."""
-    global _connected, _session, _conn_id, _base_url
+    global _connected, _session, _conn_id, _base_url, _conn_id_confirmed
     lock = _get_reconnect_lock()
     async with lock:
         conn_id, base_url, session = _conn_id, _base_url, _session
         if conn_id:
             _record_connection_event("connection_invalidated", source="disconnect")
-        _connected, _conn_id, _base_url = False, "", ""
+        _connected, _conn_id, _base_url, _conn_id_confirmed = False, "", "", False
         if conn_id and base_url and session and not session.closed:
             try:
                 async with session.get(
@@ -1002,7 +1009,8 @@ async def connect_with_retry(max_attempts: int = 5, retry_delay: float = 60.0) -
 
 def _invalidate_connection() -> None:
     global _connected
-    log.warning("MT5 conn_id is unconfirmed — retaining it until status is checked")
+    if not _conn_id_confirmed:
+        log.warning("MT5 conn_id is unconfirmed — retaining it until status is checked")
     _record_connection_event(
         "connection_invalidated",
         source="invalidate",
@@ -1019,7 +1027,7 @@ async def _acquire_thread_lock(lock: threading.Lock) -> None:
 
 
 async def ensure_connected(*args, **kwargs) -> bool:
-    global _connected, _conn_id, _base_url
+    global _connected, _conn_id, _base_url, _conn_id_confirmed
     await _acquire_thread_lock(_ensure_connected_thread_lock)
     try:
         if _conn_id and _base_url:
@@ -1030,6 +1038,7 @@ async def ensure_connected(*args, **kwargs) -> bool:
             )
             if alive is True:
                 _connected = True
+                _conn_id_confirmed = True
                 return True
             _connected = False
             if alive is False:
@@ -1053,77 +1062,107 @@ async def ensure_connected(*args, **kwargs) -> bool:
 
 
 async def start_connection_watchdog(interval_seconds: float = 30.0) -> None:
-    global _watchdog_task
+    global _watchdog_task, _connected, _conn_id_confirmed
     log.info(f"[watchdog] MT5 connection watchdog started (interval={interval_seconds}s)")
     _record_connection_event("watchdog_started", source="watchdog")
     failures = 0
     try:
         while True:
             await asyncio.sleep(interval_seconds)
-            if not _connected or not _conn_id:
-                _record_connection_event("watchdog_reconnect_attempt", source="watchdog")
-                if await ensure_connected():
-                    log.info("[watchdog] MT5 proactive reconnect succeeded")
-                    _record_connection_event("watchdog_reconnect_success", source="watchdog")
-                else:
-                    _record_connection_event(
-                        "watchdog_reconnect_failure",
-                        source="watchdog",
-                        error=ConnectionError("watchdog reconnect failed"),
-                        failure=True,
-                    )
+            if not _conn_id or not _base_url:
+                failures = 0
                 continue
+
+            checked_conn_id = _conn_id
+            checked_base_url = _base_url
             try:
                 async with _get_session().get(
-                    f"{_base_url}/ConnectionStatus",
-                    params={"id": _conn_id},
+                    f"{checked_base_url}/ConnectionStatus",
+                    params={"id": checked_conn_id},
                     timeout=aiohttp.ClientTimeout(total=8),
                 ) as resp:
                     data = await resp.json(content_type=None)
-                    if resp.status == 200 and _connection_status_is_alive(data):
+                    alive = resp.status == 200 and _connection_status_is_alive(data)
+                    if alive:
+                        if checked_conn_id != _conn_id or checked_base_url != _base_url:
+                            failures = 0
+                            continue
+                        was_unconfirmed = not _conn_id_confirmed or not _connected
                         failures = 0
+                        _connected = True
+                        _conn_id_confirmed = True
+                        _connection_health["connection_status"] = "connected"
+                        _connection_health["consecutive_failures"] = 0
+                        _persist_connection_history()
                         _record_connection_event(
                             "watchdog_connection_status_alive", source="watchdog"
                         )
-                    else:
-                        failures += 1
-                        _record_connection_event(
-                            (
-                                "connection_status_not_alive"
-                                if not _connection_status_is_alive(data)
-                                else "connection_status_error"
-                            ),
-                            source="watchdog",
-                            error=ConnectionError("ConnectionStatus reported not alive"),
-                            message=(
-                                f"ConnectionStatus reported not alive "
-                                f"(HTTP {resp.status}): {data!s}"
-                            ),
-                            status=resp.status,
-                            failure=True,
-                        )
+                        if was_unconfirmed:
+                            log.info(
+                                "[watchdog] MT5 ConnectionStatus confirmed the current conn_id; "
+                                "reconnect skipped"
+                            )
+                        continue
+
+                    failures += 1
+                    _conn_id_confirmed = False
+                    _record_connection_event(
+                        (
+                            "connection_status_not_alive"
+                            if not _connection_status_is_alive(data)
+                            else "connection_status_error"
+                        ),
+                        source="watchdog",
+                        error=ConnectionError("ConnectionStatus reported not alive"),
+                        message=(
+                            f"ConnectionStatus check failed ({failures}/3): "
+                            f"HTTP {resp.status}: {data!s}"
+                        ),
+                        status=resp.status,
+                        failure=True,
+                    )
             except Exception as exc:
                 failures += 1
-                log.warning("[watchdog] ConnectionStatus check failed (%s/1): %s", failures, _redact_connection_text(exc))
+                _conn_id_confirmed = False
+                log.warning(
+                    "[watchdog] ConnectionStatus check failed (%s/3): %s",
+                    failures,
+                    _redact_connection_text(exc),
+                )
                 _record_connection_event(
                     "watchdog_status_check_error",
                     source="watchdog",
                     error=exc,
                     failure=True,
                 )
-            if failures >= 1:
-                failures = 0
-                _invalidate_connection()
-                _record_connection_event("watchdog_reconnect_attempt", source="watchdog")
-                if await ensure_connected():
-                    _record_connection_event("watchdog_reconnect_success", source="watchdog")
-                else:
+
+            if failures < 3:
+                continue
+
+            previous_conn_id = _conn_id
+            log.warning(
+                "[watchdog] MT5 ConnectionStatus failed three consecutive checks; "
+                "validating the current session before reconnecting"
+            )
+            _connected = False
+            _record_connection_event("watchdog_reconnect_attempt", source="watchdog")
+            if await ensure_connected():
+                if _conn_id == previous_conn_id:
+                    log.info("[watchdog] Existing MT5 conn_id recovered; no replacement needed")
                     _record_connection_event(
-                        "watchdog_reconnect_failure",
-                        source="watchdog",
-                        error=ConnectionError("watchdog reconnect failed"),
-                        failure=True,
+                        "watchdog_connection_status_alive", source="watchdog"
                     )
+                else:
+                    log.info("[watchdog] MT5 connection restored after three failed checks")
+                    _record_connection_event("watchdog_reconnect_success", source="watchdog")
+            else:
+                _record_connection_event(
+                    "watchdog_reconnect_failure",
+                    source="watchdog",
+                    error=ConnectionError("watchdog reconnect failed"),
+                    failure=True,
+                )
+            failures = 0
     except asyncio.CancelledError:
         log.info("[watchdog] MT5 connection watchdog stopped")
         _record_connection_event("watchdog_stopped", source="watchdog")

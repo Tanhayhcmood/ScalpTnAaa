@@ -448,6 +448,19 @@ def redis_update_snapshot_positions(positions: list) -> bool:
         raw = r.get(_SNAPSHOT_KEY)
         snap = json.loads(raw) if raw else {}
         snap["open_positions"] = positions
+        floating_profit = 0.0
+        for position in positions:
+            if not isinstance(position, dict):
+                continue
+            try:
+                floating_profit += float(
+                    position.get("profit", position.get("floating_profit", 0.0)) or 0.0
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+        snap["floating_profit"] = round(floating_profit, 4)
+        if isinstance(snap.get("account_info"), dict):
+            snap["account_info"]["floating_profit"] = round(floating_profit, 4)
         r.set(_SNAPSHOT_KEY, json.dumps(snap, default=str), ex=_STATE_TTL)
         return True
     except Exception as exc:
