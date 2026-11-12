@@ -61,7 +61,7 @@ class AdaptiveTrailingStopTests(unittest.TestCase):
         self.assertIsNone(decision.candidate_sl)
         self.assertEqual(decision.floating_profit_price, 0.0)
 
-    def test_one_r_moves_stop_exactly_to_breakeven(self):
+    def test_one_r_moves_stop_to_lock_level(self):
         candles = [candle(100, 101, 100, 100.5, 100) for _ in range(30)]
         decision = compute_adaptive_trail(
             "BUY",
@@ -72,8 +72,8 @@ class AdaptiveTrailingStopTests(unittest.TestCase):
             initial_sl=98.0,
             current_sl=98.0,
         )
-        self.assertEqual(decision.stage, "BREAKEVEN")
-        self.assertEqual(decision.candidate_sl, 100.0)
+        self.assertEqual(decision.stage, "LOCK")
+        self.assertEqual(decision.candidate_sl, 100.4)
         self.assertTrue(decision.breakeven_armed)
         self.assertAlmostEqual(decision.floating_profit_r_multiple, 1.0)
 
@@ -86,7 +86,7 @@ class AdaptiveTrailingStopTests(unittest.TestCase):
             AdaptiveTrailingConfig(chandelier_atr_multiplier=2.5),
             entry_price=100.0,
             initial_sl=98.0,
-            current_sl=100.0,
+            current_sl=100.4,
             highest_price_since_entry=106.0,
             breakeven_armed=True,
         )
@@ -103,7 +103,7 @@ class AdaptiveTrailingStopTests(unittest.TestCase):
             AdaptiveTrailingConfig(chandelier_atr_multiplier=2.5),
             entry_price=100.0,
             initial_sl=102.0,
-            current_sl=100.0,
+            current_sl=99.6,
             lowest_price_since_entry=94.0,
             breakeven_armed=True,
         )
@@ -123,7 +123,8 @@ class AdaptiveTrailingStopTests(unittest.TestCase):
             current_sl=98.0,
         )
         self.assertEqual(decision.risk_distance, 2.0)
-        self.assertEqual(decision.stage, "BREAKEVEN")
+        self.assertEqual(decision.stage, "LOCK")
+        self.assertEqual(decision.candidate_sl, 100.4)
 
     def test_legacy_zero_initial_sl_falls_back_to_saved_risk(self):
         candles = [candle(100, 101, 100, 100.5, 100) for _ in range(30)]
@@ -138,7 +139,7 @@ class AdaptiveTrailingStopTests(unittest.TestCase):
             current_sl=98.0,
         )
         self.assertEqual(decision.risk_distance, 2.0)
-        self.assertEqual(decision.stage, "BREAKEVEN")
+        self.assertEqual(decision.stage, "LOCK")
 
     def test_missing_volume_does_not_count_as_declining(self):
         candles = [candle(100, 102, 99, 101, 0) for _ in range(30)]
