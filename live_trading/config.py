@@ -642,23 +642,29 @@ MAX_DRAWDOWN_PCT     = _float("MAX_DRAWDOWN_PCT",      8.0,  lo=0.1, hi=50.0)
 SLIPPAGE_POINTS      = _int("SLIPPAGE_POINTS",         30,   lo=1,   hi=500)
 
 # ── Adaptive ATR Trailing Stop ─────────────────────────────────────────────────
-# The live stop waits for 1R, moves to breakeven, then uses a Chandelier stop
-# anchored to the best price seen since entry. Legacy normal/tight settings are
-# retained for config compatibility and telemetry.
-# Keep the adaptive v2 stop behavior explicitly opt-in.
+# The staged stop moves to buffered breakeven at 1R, locks 0.5R at 1.5R,
+# then uses a protective-timeframe Chandelier from 2R onward.
+# Retained only for compatibility; trailing behavior no longer branches on V1/V2.
 ADAPTIVE_TRAIL_V2 = False
 TRAIL_ENABLED        = os.getenv("TRAIL_ENABLED", "true").lower() == "true"
 TRAIL_ATR_PERIOD = _int("TRAIL_ATR_PERIOD", 14, lo=1, hi=100)
 TRAIL_CHANDELIER_ATR_MULTIPLIER = _float(
     "TRAIL_CHANDELIER_ATR_MULTIPLIER",
-    1.5 if SCALP_PROFILE == "on" else 2.5,
+    1.5,
     lo=0.8,
     hi=3.0,
 )
-TRAIL_BE_ARM_R = _float("TRAIL_BE_ARM_R", 0.5, lo=0.1, hi=1.0)
-TRAIL_LOCK_ARM_R = _float("TRAIL_LOCK_ARM_R", 0.8)
-TRAIL_LOCK_PROFIT_R = _float("TRAIL_LOCK_PROFIT_R", 0.2)
-TRAIL_BE_BUFFER_PRICE = _float("TRAIL_BE_BUFFER_PRICE", 0.2)
+TRAIL_BE_ARM_R = _float("TRAIL_BE_ARM_R", 1.0, lo=0.1, hi=20.0)
+TRAIL_LOCK_ARM_R = _float("TRAIL_LOCK_ARM_R", 1.5, lo=0.1, hi=20.0)
+TRAIL_LOCK_PROFIT_R = _float("TRAIL_LOCK_PROFIT_R", 0.5, lo=0.0, hi=10.0)
+TRAIL_BE_BUFFER_PRICE = _float("TRAIL_BE_BUFFER_PRICE", 0.2, lo=0.0, hi=100.0)
+TRAIL_CHANDELIER_ARM_R = _float(
+    "TRAIL_CHANDELIER_ARM_R", 2.0, lo=0.1, hi=20.0
+)
+TRAIL_MIN_DISTANCE_R = _float("TRAIL_MIN_DISTANCE_R", 0.75, lo=0.1, hi=10.0)
+TRAIL_MODIFY_COOLDOWN_S = _float(
+    "TRAIL_MODIFY_COOLDOWN_S", 15.0, lo=0.0, hi=3600.0
+)
 TRAIL_NORMAL_MULTIPLIER = _float("TRAIL_NORMAL_MULTIPLIER", 2.0, lo=0.1, hi=5.0)
 TRAIL_TIGHT_MULTIPLIER = _float("TRAIL_TIGHT_MULTIPLIER", 0.9, lo=0.1, hi=3.0)
 TRAIL_EXHAUSTION_CONFIRM_COUNT = _int(
@@ -676,7 +682,7 @@ if TRAIL_TIGHT_MULTIPLIER >= TRAIL_NORMAL_MULTIPLIER:
         file=sys.stderr,
     )
     sys.exit(1)
-TRAIL_MIN_STEP_PRICE = _float("TRAIL_MIN_STEP_PRICE", 0.05, lo=0.0, hi=100.0)
+TRAIL_MIN_STEP_PRICE = _float("TRAIL_MIN_STEP_PRICE", 0.05, lo=0.01, hi=100.0)
 
 # ── Wyckoff Calibration ──────────────────────────────────────────────────────
 WYCKOFF_MAX_RANGE_PCT = 0.01163

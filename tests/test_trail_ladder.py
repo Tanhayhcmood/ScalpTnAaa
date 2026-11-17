@@ -16,9 +16,10 @@ def candles():
 
 class TrailLadderTests(unittest.TestCase):
     def test_buy_and_sell_ladder_only_tightens(self):
+        # Match the updated 1R breakeven, 1.5R lock, and 2R chandelier arms.
         cases = (
-            ("BUY", 92.0, 104.0, 106.4, 108.0, 108.0, 92.0, 1),
-            ("SELL", 108.0, 96.0, 93.6, 92.0, 100.0, 92.0, -1),
+            ("BUY", 92.0, 108.0, 112.0, 116.0, 116.0, 92.0, 1),
+            ("SELL", 108.0, 92.0, 88.0, 84.0, 108.0, 84.0, -1),
         )
         cfg = AdaptiveTrailingConfig(chandelier_atr_multiplier=1.5)
 
@@ -59,7 +60,7 @@ class TrailLadderTests(unittest.TestCase):
                     current_sl=be.candidate_sl,
                 )
                 self.assertEqual(lock.stage, "LOCK")
-                expected_lock = 100.0 + (1.6 * sign)
+                expected_lock = 100.0 + (4.0 * sign)
                 self.assertAlmostEqual(lock.candidate_sl, expected_lock)
                 self.assertTrue(
                     should_apply(direction, be.candidate_sl, lock.candidate_sl, 0.05)

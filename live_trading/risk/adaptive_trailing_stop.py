@@ -5,17 +5,14 @@ It accepts any candle objects (or dictionaries) exposing open/high/low/close
 and, optionally, volume.  The live loop owns persistence, logging, and broker
 modification requests.
 
-The trail uses ATR for its normal distance and switches to a smaller distance
-only after the trade has earned enough favourable movement and at least two of
-these independent signals agree:
-
-* consecutive contraction of recent candle bodies,
-* momentum weakening through MACD histogram or directional RSI slope,
-* declining volume when volume data is available.
+The live loop supplies the original risk baseline, spread, protective ATR,
+and persisted best prices. Exhaustion indicators remain available as telemetry
+but do not control the staged stop.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
@@ -24,7 +21,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 class AdaptiveTrailingConfig:
     enabled: bool = True
     atr_period: int = 14
-    chandelier_atr_multiplier: float = 2.5
+    chandelier_atr_multiplier: float = 1.5
     normal_multiplier: float = 2.0
     tight_multiplier: float = 0.9
     exhaustion_confirm_count: int = 2
@@ -37,11 +34,13 @@ class AdaptiveTrailingConfig:
     min_profit_atr_multiple: float = 1.5
     min_tight_distance_atr: float = 1.0
     min_step_price: float = 0.05
-    breakeven_arm_r: float = 0.5
-    lock_arm_r: float = 0.8
-    lock_profit_r: float = 0.2
+    breakeven_arm_r: float = 1.0
+    lock_arm_r: float = 1.5
+    lock_profit_r: float = 0.5
     breakeven_buffer_price: float = 0.2
-    adaptive_trail_v2: bool = False
+    chandelier_arm_r: float = 2.0
+    min_distance_r: float = 0.75
+    modify_cooldown_s: float = 15.0
 
 
 @dataclass(frozen=True)
@@ -242,19 +241,26 @@ def compute_adaptive_trail(
     highest_price_since_entry: Optional[float] = None,
     lowest_price_since_entry: Optional[float] = None,
     breakeven_armed: bool = False,
+    highest_stage: Optional[str] = None,
+    allow_chandelier_only: bool = False,
+    spread_price: Optional[float] = None,
+    protective_atr: Optional[float] = None,
 ) -> AdaptiveTrailDecision:
-    """Compute the three-stage trailing decision for one open position.
-
-    Stage 1 deliberately returns no candidate until favourable price movement
-    reaches one initial risk unit (1R).  Stage 2 returns the entry price as
-    the exact breakeven candidate.  Once the live SL is already at/beyond
-    breakeven, stage 3 uses a Chandelier stop anchored to the best price seen
-    since entry rather than to the current quote.
+    """Compute the monotonic R-based trailing decision for one position.
 
     ``highest_price_since_entry`` and ``lowest_price_since_entry`` are supplied
-    by the live loop so the extreme survives between ticks and restarts.
+    by the live loop so favorable and adverse extremes survive between ticks
+    and restarts. ``protective_atr`` is the ATR for the configured SL timeframe.
     """
-    current_atr = atr(candles, cfg.atr_period)
+    if protective_atr is None:
+        current_atr = atr(candles, cfg.atr_period)
+    else:
+        try:
+            current_atr = max(0.0, float(protective_atr))
+            if not math.isfinite(current_atr):
+                current_atr = 0.0
+        except (TypeError, ValueError):
+            current_atr = 0.0
     exhaustion = detect_exhaustion(candles, direction, cfg)
     is_buy = str(direction).upper() == "BUY"
     floating_profit_price = 0.0
@@ -316,37 +322,27 @@ def compute_adaptive_trail(
             high_since_entry = normalized_entry
             low_since_entry = normalized_entry
 
-    # V2 derives this state from the best favorable price, not a persisted V1
-    # flag that may have been armed at 0.5R.
-    threshold_profit_price = floating_profit_price
-    if cfg.adaptive_trail_v2 and normalized_entry is not None:
-        if is_buy and high_since_entry is not None:
-            threshold_profit_price = max(
-                threshold_profit_price,
-                max(0.0, high_since_entry - normalized_entry),
-            )
-        elif not is_buy and low_since_entry is not None:
-            threshold_profit_price = max(
-                threshold_profit_price,
-                max(0.0, normalized_entry - low_since_entry),
-            )
-    threshold_reached = (
-        normalized_risk > 0.0
-        and threshold_profit_price
-        >= float(cfg.breakeven_arm_r) * normalized_risk
-    )
-    breakeven_armed = bool(
-        threshold_reached or (breakeven_armed and not cfg.adaptive_trail_v2)
-    )
-
+    stage_ranks = {
+        "WAITING_FOR_1R": 0,
+        "BREAKEVEN": 1,
+        "LOCK": 2,
+        "CHANDELIER": 3,
+    }
     stage = "WAITING_FOR_1R"
     candidate = None
     multiplier = 0.0
     distance = 0.0
     if normalized_entry is not None:
-        be_buffer = abs(float(cfg.breakeven_buffer_price))
+        be_offset = abs(float(cfg.breakeven_buffer_price))
+        if spread_price is not None:
+            try:
+                spread = float(spread_price)
+                if math.isfinite(spread) and spread >= 0.0:
+                    be_offset = spread
+            except (TypeError, ValueError):
+                pass
         be_candidate = round(
-            normalized_entry + (be_buffer if is_buy else -be_buffer), 8
+            normalized_entry + (be_offset if is_buy else -be_offset), 8
         )
         lock_profit_distance = max(0.0, float(cfg.lock_profit_r)) * normalized_risk
         lock_candidate = round(
@@ -354,67 +350,69 @@ def compute_adaptive_trail(
             + (lock_profit_distance if is_buy else -lock_profit_distance),
             8,
         )
-        sl_at_or_beyond_breakeven = False
-        sl_at_or_beyond_lock = False
-        if current_sl is not None:
+        best_favorable_move = (
+            max(0.0, high_since_entry - normalized_entry)
+            if is_buy and high_since_entry is not None
+            else max(0.0, normalized_entry - low_since_entry)
+            if not is_buy and low_since_entry is not None
+            else 0.0
+        )
+        best_profit_r = (
+            best_favorable_move / normalized_risk if normalized_risk > 0.0 else 0.0
+        )
+        if allow_chandelier_only and normalized_risk <= 0.0:
+            stage = "CHANDELIER"
+        elif normalized_risk > 0.0:
+            if best_profit_r >= float(cfg.chandelier_arm_r):
+                stage = "CHANDELIER"
+            elif best_profit_r >= float(cfg.lock_arm_r):
+                stage = "LOCK"
+            elif best_profit_r >= float(cfg.breakeven_arm_r):
+                stage = "BREAKEVEN"
+
+        # Recover a stage floor for older baselines that persisted a moved SL
+        # but predate the explicit monotonic stage field.
+        if normalized_risk > 0.0 and current_sl is not None:
             try:
                 live_sl = float(current_sl)
-                sl_at_or_beyond_breakeven = (
-                    live_sl >= be_candidate if is_buy
-                    else live_sl <= be_candidate
-                )
-                sl_at_or_beyond_lock = (
-                    live_sl >= lock_candidate if is_buy
-                    else live_sl <= lock_candidate
-                )
+                if (live_sl >= lock_candidate if is_buy else live_sl <= lock_candidate):
+                    stage = max((stage, "LOCK"), key=stage_ranks.__getitem__)
+                elif (live_sl >= normalized_entry if is_buy else live_sl <= normalized_entry):
+                    stage = max((stage, "BREAKEVEN"), key=stage_ranks.__getitem__)
             except (TypeError, ValueError):
-                sl_at_or_beyond_breakeven = False
-                sl_at_or_beyond_lock = False
+                pass
+        if highest_stage in stage_ranks:
+            stage = max((stage, highest_stage), key=stage_ranks.__getitem__)
 
-        lock_armed = (
-            normalized_risk > 0.0
-            and floating_profit_r_multiple >= float(cfg.lock_arm_r)
-        )
-        if cfg.adaptive_trail_v2 and not breakeven_armed:
-            # V2 holds every adaptive stop stage until the 1R threshold.
-            stage = "WAITING_FOR_1R"
-        elif (
-            cfg.adaptive_trail_v2
-            and breakeven_armed
-            and not sl_at_or_beyond_breakeven
-        ):
-            # Apply the selected buffered breakeven before the legacy lock.
-            stage = "BREAKEVEN"
+        if stage == "BREAKEVEN":
             candidate = be_candidate
             distance = round(abs(float(current_price) - be_candidate), 8)
-        elif lock_armed:
-            if not sl_at_or_beyond_lock:
-                stage = "LOCK"
-                candidate = lock_candidate
-                distance = round(abs(float(current_price) - lock_candidate), 8)
-            elif current_atr > 0.0:
-                stage = "CHANDELIER"
-                multiplier = float(cfg.chandelier_atr_multiplier)
-                if is_buy and high_since_entry is not None:
-                    candidate = round(
-                        high_since_entry - (multiplier * current_atr), 8
-                    )
-                    distance = round(high_since_entry - candidate, 8)
-                elif not is_buy and low_since_entry is not None:
-                    candidate = round(
-                        low_since_entry + (multiplier * current_atr), 8
-                    )
-                    distance = round(candidate - low_since_entry, 8)
-        elif breakeven_armed:
-            stage = "BREAKEVEN"
-            candidate = be_candidate
-            distance = round(abs(float(current_price) - be_candidate), 8)
+        elif stage == "LOCK":
+            candidate = lock_candidate
+            distance = round(abs(float(current_price) - lock_candidate), 8)
+        elif stage == "CHANDELIER" and current_atr > 0.0:
+            multiplier = float(cfg.chandelier_atr_multiplier)
+            r_distance = (
+                float(cfg.min_distance_r) * normalized_risk
+                if normalized_risk > 0.0 else 0.0
+            )
+            distance = max(multiplier * current_atr, r_distance)
+            if is_buy and high_since_entry is not None:
+                candidate = round(high_since_entry - distance, 8)
+                if candidate >= float(current_price):
+                    candidate = None
+            elif not is_buy and low_since_entry is not None:
+                candidate = round(low_since_entry + distance, 8)
+                if candidate <= float(current_price):
+                    candidate = None
+
+    breakeven_armed = stage_ranks.get(stage, 0) >= stage_ranks["BREAKEVEN"]
 
     # ``mode`` remains in the decision contract for panel compatibility.
     # Exhaustion indicators are retained as telemetry but no longer authorize
     # an SL move; the R-based state machine is the sole activation gate.
     mode = stage
-    tightening_eligible = stage in {"BREAKEVEN", "LOCK", "CHANDELIER"}
+    tightening_eligible = stage_ranks.get(stage, 0) >= stage_ranks["BREAKEVEN"]
     return AdaptiveTrailDecision(
         mode=mode,
         stage=stage,
@@ -445,14 +443,17 @@ def should_apply(
     min_step_price: float,
     reject_unchanged: bool = False,
 ) -> bool:
-    """Only permit favourable stop movement, optionally rejecting no-ops."""
+    """Allow only favourable moves meeting the minimum step, never a no-op."""
     if candidate_sl is None:
         return False
-    if (
-        reject_unchanged
-        and round(float(candidate_sl), 2) == round(float(current_sl), 2)
-    ):
+    try:
+        current = float(current_sl)
+        candidate = float(candidate_sl)
+        min_step = max(0.0, float(min_step_price))
+    except (TypeError, ValueError):
+        return False
+    if round(candidate, 2) == round(current, 2):
         return False
     if str(direction).upper() == "BUY":
-        return candidate_sl - current_sl >= min_step_price
-    return current_sl - candidate_sl >= min_step_price
+        return candidate > current and candidate - current + 1e-9 >= min_step
+    return candidate < current and current - candidate + 1e-9 >= min_step
