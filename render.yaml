@@ -153,10 +153,10 @@ services:
         value: "8.0"
       - key: SLIPPAGE_POINTS
         value: "30"
-      # Trailing waits for 1R, moves to breakeven, then uses
-      # highest/lowest-price-since-entry minus 2.5 ATR.
+      # Trailing: buffered breakeven at 1R, lock +0.5R at 1.5R, then
+      # a 1.5x protective-timeframe ATR chandelier from the best price at 2R.
       - key: TRAIL_CHANDELIER_ATR_MULTIPLIER
-        value: "2.5"
+        value: "1.5"
       # Weak RANGE entries require a stronger strategy consensus.
       - key: RANGE_WEAK_MIN_CONFIRMATIONS
         value: "2"

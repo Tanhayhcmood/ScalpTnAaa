@@ -61,13 +61,15 @@ from live_trading.config import (
     DAILY_LOSS_LIMIT_PCT, MAX_DRAWDOWN_PCT, SLIPPAGE_POINTS,
     STATE_FILE, GUARDIAN_STATE_FILE,
     HISTORY_LOOKBACK_DAYS, HISTORY_SYNC_INTERVAL,
-    ADAPTIVE_TRAIL_V2,
     TRAIL_ENABLED, TRAIL_ATR_PERIOD, TRAIL_NORMAL_MULTIPLIER,
     TRAIL_TIGHT_MULTIPLIER, TRAIL_EXHAUSTION_CONFIRM_COUNT,
     TRAIL_MOMENTUM_LOOKBACK, TRAIL_BODY_SHRINK_RATIO,
     TRAIL_VOLUME_SHRINK_RATIO, TRAIL_MIN_PROFIT_ATR,
     TRAIL_MIN_DISTANCE_ATR, TRAIL_MIN_STEP_PRICE,
     TRAIL_CHANDELIER_ATR_MULTIPLIER,
+    TRAIL_BE_ARM_R, TRAIL_LOCK_ARM_R, TRAIL_LOCK_PROFIT_R,
+    TRAIL_BE_BUFFER_PRICE, TRAIL_CHANDELIER_ARM_R,
+    TRAIL_MIN_DISTANCE_R, TRAIL_MODIFY_COOLDOWN_S,
     RANGE_WEAK_MIN_CONFIRMATIONS,
     MTF_ENABLED, MTF_TIMEFRAME, MTF_CANDLE_WINDOW,
     MTF_OPPOSITION_THRESHOLD, MTF_REQUIRE_ALIGNMENT, MTF_DRY_RUN,
@@ -804,6 +806,31 @@ def _trade_feature_exit_type(close_reason: str) -> str:
     }.get(close_reason, close_reason)
 
 
+def _make_adaptive_trailing_config() -> AdaptiveTrailingConfig:
+    """Build the live trail config from the bounded environment settings."""
+    return AdaptiveTrailingConfig(
+        enabled=TRAIL_ENABLED,
+        atr_period=TRAIL_ATR_PERIOD,
+        chandelier_atr_multiplier=TRAIL_CHANDELIER_ATR_MULTIPLIER,
+        normal_multiplier=TRAIL_NORMAL_MULTIPLIER,
+        tight_multiplier=TRAIL_TIGHT_MULTIPLIER,
+        exhaustion_confirm_count=TRAIL_EXHAUSTION_CONFIRM_COUNT,
+        momentum_lookback=TRAIL_MOMENTUM_LOOKBACK,
+        body_shrink_ratio=TRAIL_BODY_SHRINK_RATIO,
+        volume_shrink_ratio=TRAIL_VOLUME_SHRINK_RATIO,
+        min_profit_atr_multiple=TRAIL_MIN_PROFIT_ATR,
+        min_tight_distance_atr=TRAIL_MIN_DISTANCE_ATR,
+        min_step_price=TRAIL_MIN_STEP_PRICE,
+        breakeven_arm_r=TRAIL_BE_ARM_R,
+        lock_arm_r=TRAIL_LOCK_ARM_R,
+        lock_profit_r=TRAIL_LOCK_PROFIT_R,
+        breakeven_buffer_price=TRAIL_BE_BUFFER_PRICE,
+        chandelier_arm_r=TRAIL_CHANDELIER_ARM_R,
+        min_distance_r=TRAIL_MIN_DISTANCE_R,
+        modify_cooldown_s=TRAIL_MODIFY_COOLDOWN_S,
+    )
+
+
 class GoldScalperLive:
     def __init__(self):
         self.running: bool = True
@@ -910,22 +937,7 @@ class GoldScalperLive:
         # Toggleable at runtime via the Telegram panel's "Auto Trail" switch
         # (routed through the update_risk command — see _process_commands).
         self.trailing_enabled: bool = TRAIL_ENABLED
-        self._trailing_cfg = AdaptiveTrailingConfig(
-            enabled=TRAIL_ENABLED,
-            atr_period=TRAIL_ATR_PERIOD,
-            chandelier_atr_multiplier=TRAIL_CHANDELIER_ATR_MULTIPLIER,
-            normal_multiplier=TRAIL_NORMAL_MULTIPLIER,
-            tight_multiplier=TRAIL_TIGHT_MULTIPLIER,
-            exhaustion_confirm_count=TRAIL_EXHAUSTION_CONFIRM_COUNT,
-            momentum_lookback=TRAIL_MOMENTUM_LOOKBACK,
-            body_shrink_ratio=TRAIL_BODY_SHRINK_RATIO,
-            volume_shrink_ratio=TRAIL_VOLUME_SHRINK_RATIO,
-            min_profit_atr_multiple=TRAIL_MIN_PROFIT_ATR,
-            min_tight_distance_atr=TRAIL_MIN_DISTANCE_ATR,
-            min_step_price=TRAIL_MIN_STEP_PRICE,
-            breakeven_arm_r=1.0 if ADAPTIVE_TRAIL_V2 else 0.5,
-            adaptive_trail_v2=ADAPTIVE_TRAIL_V2,
-        )
+        self._trailing_cfg = _make_adaptive_trailing_config()
         # Baseline for EACH currently open position, keyed by str(ticket id):
         # its ORIGINAL entry price and ORIGINAL risk distance (never mutated
         # once a trade opens), so the staircase always measures R from where
@@ -2917,76 +2929,153 @@ class GoldScalperLive:
     # ── Staircase trailing stop ───────────────────────────────────────────────
 
     def _restore_trail_baseline(self, pos: dict) -> Optional[dict]:
-        """Recover the trailing baseline for an already-open position.
-
-        Runs when the engine (re)starts with a position already open (e.g.
-        after a Render restart) and self._trail_baseline is empty. Finds the
-        entry log written when this exact position was opened — that record
-        was written once, before any SL modification, so it still holds the
-        trade's true original risk distance.
-
-        Falls back to the position's *current* entry/SL if no matching log
-        entry survives (e.g. very old trade, log rotated away). This is an
-        approximation only: if the stop had already been trailed before the
-        log was lost, the recovered "risk distance" will be smaller than the
-        true original — the staircase would then activate a little earlier
-        than intended, but it can never move the stop backwards, so this is
-        safe, just slightly more conservative.
-        """
+        """Restore original risk from trade history, never from the live SL."""
         pos_id = pos.get("id")
-        for entry in reversed(self.trade_history):
-            if not isinstance(entry, dict):
-                continue
-            if str(entry.get("position_id")) == str(pos_id) and "sl" in entry and "entry" in entry:
-                risk = abs(float(entry["entry"]) - float(entry["sl"]))
-                if risk > 0:
-                    return {
-                        "id":            pos_id,
-                        "direction":     entry.get("direction", pos.get("type", "BUY")),
-                        "entry":         float(entry["entry"]),
-                        "risk_distance": risk,
-                        "initial_sl":    float(entry["sl"]),
-                    "timeframe":     entry.get("timeframe") or TIMEFRAME,
-                    "highest_price_since_entry": float(entry["entry"]),
-                    "lowest_price_since_entry": float(entry["entry"]),
-                    "breakeven_armed": False,
-                    "scalp_profile": bool(entry.get("scalp_profile", False)),
-                    "opened_at": entry.get("opened_at") or pos.get("open_time"),
-                    "initial_volume": float(
-                        entry.get("initial_volume", entry.get("lot", pos.get("volume", 0.0)))
+        history_rows = [
+            entry for entry in getattr(self, "trade_history", [])
+            if isinstance(entry, dict)
+            and str(entry.get("position_id")) == str(pos_id)
+        ]
+        entry_log = next(
+            (
+                entry for entry in history_rows
+                if entry.get("entry") is not None
+                and entry.get("action") != "TRAIL_SL"
+            ),
+            None,
+        )
+        direction = str(
+            (entry_log or {}).get("direction", pos.get("type", "BUY"))
+        ).upper()
+        entry_price = float(
+            (entry_log or {}).get(
+                "entry", pos.get("open_price", pos.get("entry", 0.0))
+            ) or 0.0
+        )
+        initial_sl = None
+        risk = 0.0
+        if entry_log is not None:
+            try:
+                logged_sl = entry_log.get("initial_sl") or entry_log.get("sl")
+                if logged_sl is not None and float(logged_sl) > 0.0:
+                    initial_sl = float(logged_sl)
+                    risk = abs(entry_price - initial_sl)
+            except (TypeError, ValueError):
+                initial_sl = None
+                risk = 0.0
+            if risk <= 0.0:
+                try:
+                    logged_risk = float(entry_log.get("risk_distance") or 0.0)
+                except (TypeError, ValueError):
+                    logged_risk = 0.0
+                if logged_risk > 0.0:
+                    risk = logged_risk
+            if risk <= 0.0:
+                try:
+                    tp = float(
+                        entry_log.get(
+                            "tp",
+                            entry_log.get("take_profit", entry_log.get("tp_price", 0.0)),
+                        ) or 0.0
+                    )
+                    rr = float(
+                        entry_log.get("rr", entry_log.get("risk_reward_ratio", 0.0))
                         or 0.0
-                    ),
-                    "volume_min": entry.get("volume_min"),
-                    "volume_step": entry.get("volume_step"),
-                    "spread_buffer": float(entry.get("spread_buffer") or 0.0),
-                    "price_digits": int(entry.get("price_digits") or 2),
-                    "tp1_price": entry.get("tp1_price"),
-                    "tp1_done": bool(entry.get("tp1_done", False)),
-                    "scalp_be_done": bool(entry.get("scalp_be_done", False)),
-                    "reached_half_r": bool(entry.get("reached_half_r", False)),
-                    }
-                break
-        # Fallback: derive from the position's live snapshot.
-        risk = abs(float(pos.get("open_price", 0.0)) - float(pos.get("sl", 0.0)))
-        if risk > 0:
+                    )
+                    if tp > 0.0 and rr > 0.0:
+                        risk = abs(tp - entry_price) / rr
+                except (TypeError, ValueError):
+                    risk = 0.0
+            if risk > 0.0 and initial_sl is None:
+                initial_sl = entry_price - risk if direction == "BUY" else entry_price + risk
+
+        stage_ranks = {
+            "WAITING_FOR_1R": 0,
+            "BREAKEVEN": 1,
+            "LOCK": 2,
+            "CHANDELIER": 3,
+        }
+        trail_stage = "WAITING_FOR_1R"
+        high = entry_price
+        low = entry_price
+        for row in history_rows:
+            row_stage = row.get("stage")
+            if row_stage in stage_ranks and stage_ranks[row_stage] > stage_ranks[trail_stage]:
+                trail_stage = row_stage
+            try:
+                high = max(high, float(row.get("highest_price_since_entry", high)))
+                low = min(low, float(row.get("lowest_price_since_entry", low)))
+            except (TypeError, ValueError):
+                pass
+        if risk <= 0.0:
+            allow_chandelier_only = True
+            trail_stage = "CHANDELIER"
             log.warning(
-                f"Trailing baseline for position {pos_id} could not be found in "
-                f"trade history — approximating from live position data."
+                "Trailing baseline for ticket=%s has no recoverable original R; "
+                "allowing chandelier only (current SL is not a risk baseline).",
+                pos_id,
             )
-            return {
-                "id":            pos_id,
-                "direction":     pos.get("type", "BUY"),
-                "entry":         float(pos.get("open_price", 0.0)),
-                "risk_distance": risk,
-                "initial_sl":    float(pos.get("sl", 0.0)),
-                "timeframe":     pos.get("timeframe") or TIMEFRAME,
-                "highest_price_since_entry": float(pos.get("open_price", 0.0)),
-                "lowest_price_since_entry": float(pos.get("open_price", 0.0)),
-                "breakeven_armed": False,
-                    "scalp_profile": False,
-                    "opened_at": pos.get("open_time"),
-            }
-        return None
+        else:
+            allow_chandelier_only = False
+            if initial_sl is not None:
+                trail_stage = max(
+                    (trail_stage, "WAITING_FOR_1R"),
+                    key=stage_ranks.__getitem__,
+                )
+        if entry_price <= 0.0:
+            return None
+        restored_baseline = {
+            "id": pos_id,
+            "direction": direction,
+            "entry": entry_price,
+            "risk_distance": risk,
+            "initial_sl": initial_sl,
+            "timeframe": (entry_log or {}).get("timeframe") or pos.get("timeframe") or TIMEFRAME,
+            "highest_price_since_entry": high,
+            "lowest_price_since_entry": low,
+            "trail_stage": trail_stage,
+            "allow_chandelier_only": allow_chandelier_only,
+            "last_modify_at": None,
+            "breakeven_armed": stage_ranks.get(trail_stage, 0) >= 1,
+            "scalp_profile": bool((entry_log or {}).get("scalp_profile", False)),
+            "opened_at": (
+                (entry_log or {}).get("opened_at")
+                or (entry_log or {}).get("open_time")
+                or (entry_log or {}).get("bar_time")
+                or pos.get("open_time")
+            ),
+            "initial_volume": float(
+                (entry_log or {}).get(
+                    "initial_volume",
+                    (entry_log or {}).get("lot", pos.get("volume", 0.0)),
+                ) or 0.0
+            ),
+            "volume_min": (entry_log or {}).get("volume_min"),
+            "volume_step": (entry_log or {}).get("volume_step"),
+            "spread_buffer": float((entry_log or {}).get("spread_buffer") or 0.0),
+            "price_digits": int((entry_log or {}).get("price_digits") or 2),
+            "tp1_price": (entry_log or {}).get("tp1_price"),
+            "tp1_done": bool((entry_log or {}).get("tp1_done", False)),
+            "scalp_be_done": bool((entry_log or {}).get("scalp_be_done", False)),
+            "reached_half_r": bool((entry_log or {}).get("reached_half_r", False)),
+        }
+        if entry_log is None:
+            self.trade_history.append({
+                "position_id": pos_id,
+                "direction": direction,
+                "entry": entry_price,
+                "open_price": entry_price,
+                "open_time": pos.get("open_time"),
+                "opened_at": pos.get("open_time"),
+                "tp": pos.get("tp"),
+                "initial_sl": None,
+                "risk_distance": 0.0,
+                "status": "OPEN",
+                "source": "TRAILING_BASELINE_RECOVERY",
+                "highest_price_since_entry": high,
+                "lowest_price_since_entry": low,
+            })
+        return restored_baseline
 
     async def _sync_trailing_positions(self, reason: str) -> None:
         """Explicitly resync all open tickets after startup or reconnect."""
@@ -3292,24 +3381,24 @@ class GoldScalperLive:
             timeframe = str(baseline.get("timeframe") or TIMEFRAME)
             candles = self._last_candles_by_timeframe.get(timeframe, [])
 
-            # Keep the best favourable quote observed for this ticket.  These
-            # extremes, unlike the current quote, are the anchor for the
-            # Chandelier calculation and are persisted with the baseline.
+            # Persist both price extremes: the favorable extreme anchors the
+            # Chandelier, while the adverse extreme records MAE.
             try:
                 current_price = float(current_price)
                 entry_price = float(baseline["entry"])
-                if direction == "BUY":
-                    baseline["highest_price_since_entry"] = max(
-                        float(baseline.get("highest_price_since_entry", entry_price)),
-                        entry_price,
-                        current_price,
-                    )
-                else:
-                    baseline["lowest_price_since_entry"] = min(
-                        float(baseline.get("lowest_price_since_entry", entry_price)),
-                        entry_price,
-                        current_price,
-                    )
+                baseline["highest_price_since_entry"] = max(
+                    float(baseline.get("highest_price_since_entry", entry_price)),
+                    entry_price,
+                    current_price,
+                )
+                baseline["lowest_price_since_entry"] = min(
+                    float(baseline.get("lowest_price_since_entry", entry_price)),
+                    entry_price,
+                    current_price,
+                )
+                baseline.setdefault("trail_stage", "WAITING_FOR_1R")
+                baseline.setdefault("allow_chandelier_only", False)
+                baseline.setdefault("last_modify_at", None)
             except (TypeError, ValueError):
                 self._last_trailing_statuses[pos_id] = {
                     "active": False,
@@ -3327,6 +3416,13 @@ class GoldScalperLive:
             ):
                 return
 
+            spread_price = None
+            try:
+                bid, ask = float(quote["bid"]), float(quote["ask"])
+                if math.isfinite(bid) and math.isfinite(ask) and ask >= bid:
+                    spread_price = ask - bid
+            except (KeyError, TypeError, ValueError):
+                pass
             decision = compute_adaptive_trail(
                 direction=direction,
                 current_price=current_price,
@@ -3343,6 +3439,12 @@ class GoldScalperLive:
                     "lowest_price_since_entry"
                 ),
                 breakeven_armed=baseline.get("breakeven_armed", False),
+                highest_stage=baseline.get("trail_stage"),
+                allow_chandelier_only=baseline.get(
+                    "allow_chandelier_only", False
+                ),
+                spread_price=spread_price,
+                protective_atr=self._sl_atr_cache_value,
             )
             baseline.update(
                 {
@@ -3353,22 +3455,69 @@ class GoldScalperLive:
                         decision.lowest_price_since_entry
                     ),
                     "breakeven_armed": decision.breakeven_armed,
+                    "trail_stage": decision.stage,
                 }
             )
+            risk = decision.risk_distance
+            if direction == "BUY":
+                mfe_price = max(
+                    0.0,
+                    float(baseline["highest_price_since_entry"]) - entry_price,
+                )
+                mae_price = max(
+                    0.0,
+                    entry_price - float(baseline["lowest_price_since_entry"]),
+                )
+            else:
+                mfe_price = max(
+                    0.0,
+                    entry_price - float(baseline["lowest_price_since_entry"]),
+                )
+                mae_price = max(
+                    0.0,
+                    float(baseline["highest_price_since_entry"]) - entry_price,
+                )
+            for history_entry in reversed(self.trade_history):
+                if (
+                    isinstance(history_entry, dict)
+                    and str(history_entry.get("position_id")) == pos_id
+                    and history_entry.get("entry") is not None
+                    and history_entry.get("action") != "TRAIL_SL"
+                ):
+                    history_entry.update({
+                        "risk_distance": risk,
+                        "initial_sl": baseline.get("initial_sl"),
+                        "highest_price_since_entry": baseline[
+                            "highest_price_since_entry"
+                        ],
+                        "lowest_price_since_entry": baseline[
+                            "lowest_price_since_entry"
+                        ],
+                        "mfe_price": round(mfe_price, 8),
+                        "mae_price": round(mae_price, 8),
+                        "mfe_r": round(mfe_price / risk, 8) if risk > 0.0 else None,
+                        "mae_r": round(mae_price / risk, 8) if risk > 0.0 else None,
+                    })
+                    break
             candidate_sl = decision.candidate_sl
             previous_status = self._last_trailing_statuses.get(pos_id, {})
-            apply_step = (
-                0.0
-                if decision.stage == "BREAKEVEN"
-                else self._trailing_cfg.min_step_price
-            )
             applicable = should_apply(
                 direction,
                 pos["sl"],
                 candidate_sl,
-                apply_step,
-                reject_unchanged=ADAPTIVE_TRAIL_V2,
+                self._trailing_cfg.min_step_price,
             )
+            now = datetime.now(timezone.utc).timestamp()
+            last_modify_at = baseline.get("last_modify_at")
+            cooldown_active = False
+            if applicable and last_modify_at is not None:
+                try:
+                    elapsed = max(0.0, now - float(last_modify_at))
+                except (TypeError, ValueError):
+                    elapsed = self._trailing_cfg.modify_cooldown_s
+                if elapsed < self._trailing_cfg.modify_cooldown_s:
+                    applicable = False
+                    cooldown_active = True
             action = "MODIFY" if applicable else "HOLD"
             if candidate_sl is None:
                 reason_text = (
@@ -3377,28 +3526,45 @@ class GoldScalperLive:
                     f"risk_distance={decision.risk_distance:.5f})"
                 )
                 if decision.stage == "CHANDELIER":
-                    reason_text = "insufficient ATR/candle data for chandelier"
+                    reason_text = (
+                        "insufficient protective ATR for chandelier"
+                        if decision.atr <= 0.0
+                        else "chandelier stop is beyond current market; holding"
+                    )
             else:
                 if decision.stage == "BREAKEVEN":
-                    be_buffer = abs(
-                        float(self._trailing_cfg.breakeven_buffer_price)
-                    )
-                    be_target = "buffered breakeven" if be_buffer else "entry"
                     reason_text = (
-                        f"move SL to {be_target} at "
+                        f"move SL to spread-adjusted breakeven at "
                         f"{self._trailing_cfg.breakeven_arm_r:g}R "
-                        f"(buffer={be_buffer:.2f})"
+                        f"(offset={abs(candidate_sl - entry_price):.2f})"
+                    )
+                elif decision.stage == "LOCK":
+                    reason_text = (
+                        f"lock {self._trailing_cfg.lock_profit_r:g}R at "
+                        f"{self._trailing_cfg.lock_arm_r:g}R"
                     )
                 else:
                     reason_text = (
-                        "chandelier from favourable extreme "
-                        f"(multiplier={self._trailing_cfg.chandelier_atr_multiplier:.2f})"
+                        "chandelier from best price since entry "
+                        f"(multiplier={self._trailing_cfg.chandelier_atr_multiplier:.2f}, "
+                        f"min_distance={self._trailing_cfg.min_distance_r:.2f}R)"
                     )
+            if cooldown_active:
+                reason_text = (
+                    f"per-ticket modify cooldown "
+                    f"({self._trailing_cfg.modify_cooldown_s:g}s)"
+                )
+            elif not applicable and candidate_sl is not None:
+                reason_text = (
+                    "candidate held: no favorable move meets the configured "
+                    "minimum step"
+                )
             self._last_trailing_statuses[pos_id] = {
                 "active": candidate_sl is not None,
                 "mode": decision.mode,
                 "stage": decision.stage,
                 "timeframe": timeframe,
+                "atr_timeframe": SL_ATR_TIMEFRAME,
                 "atr": decision.atr,
                 "multiplier": decision.multiplier,
                 "trail_distance": decision.distance,
@@ -3431,6 +3597,19 @@ class GoldScalperLive:
                     decision.risk_distance,
                     pos.get("profit", 0.0),
                     decision.floating_profit_price,
+                    decision.floating_profit_r_multiple,
+                )
+            elif (
+                previous_status.get("stage") != decision.stage
+                and decision.stage == "LOCK"
+            ):
+                log.info(
+                    "Adaptive trailing stage: ticket=%s stage=LOCK "
+                    "timeframe=%s lock_profit_r=%.3f "
+                    "floating_profit_r=%.3f",
+                    pos_id,
+                    timeframe,
+                    self._trailing_cfg.lock_profit_r,
                     decision.floating_profit_r_multiple,
                 )
             elif (
@@ -3475,6 +3654,7 @@ class GoldScalperLive:
             if not applicable:
                 return
 
+            baseline["last_modify_at"] = now
             try:
                 result = await modify_position(pos["id"], candidate_sl, pos["tp"])
             except Exception as exc:
@@ -3852,13 +4032,8 @@ class GoldScalperLive:
                     merged += 1
                 if record.get("status") == "CLOSED":
                     if not was_closed:
-                        log.info(
-                            "Trade close reconciled from broker deals: ticket=%s "
-                            "price=%s profit=%s reason=%s",
-                            ticket,
-                            record.get("close_price"),
-                            record.get("profit"),
-                            record.get("close_reason"),
+                        self._log_trailing_close_metrics(
+                            by_ticket.get(ticket, record), ticket
                         )
                     closed += 1
 
@@ -3896,6 +4071,128 @@ class GoldScalperLive:
                 "error": str(exc),
             }
             log.warning("Broker history sync failed: %s", exc)
+
+    def _log_trailing_close_metrics(self, entry: dict, ticket_id: str) -> None:
+        """Persist excursion metrics and emit one concise close record."""
+        if entry.get("close_metrics_logged"):
+            return
+        baseline = getattr(self, "_trail_baselines", {}).get(str(ticket_id), {})
+        try:
+            entry_price = float(
+                entry.get("entry", entry.get("open_price", baseline.get("entry", 0.0)))
+                or 0.0
+            )
+            direction = str(
+                entry.get("direction", entry.get("type", baseline.get("direction", "")))
+            ).upper()
+            initial_sl = entry.get("initial_sl", baseline.get("initial_sl"))
+            risk = 0.0
+            if initial_sl not in (None, "", 0, 0.0):
+                risk = abs(entry_price - float(initial_sl))
+            if risk <= 0.0:
+                risk = float(
+                    entry.get("risk_distance", baseline.get("risk_distance", 0.0))
+                    or 0.0
+                )
+            high = float(
+                entry.get(
+                    "highest_price_since_entry",
+                    baseline.get("highest_price_since_entry", entry_price),
+                )
+                or entry_price
+            )
+            low = float(
+                entry.get(
+                    "lowest_price_since_entry",
+                    baseline.get("lowest_price_since_entry", entry_price),
+                )
+                or entry_price
+            )
+            for event in getattr(self, "trade_history", []):
+                if (
+                    isinstance(event, dict)
+                    and str(event.get("position_id")) == str(ticket_id)
+                ):
+                    high = max(
+                        high,
+                        float(event.get("highest_price_since_entry", high) or high),
+                    )
+                    low = min(
+                        low,
+                        float(event.get("lowest_price_since_entry", low) or low),
+                    )
+            if direction == "BUY":
+                mfe_price = max(0.0, high - entry_price)
+                mae_price = max(0.0, entry_price - low)
+            else:
+                mfe_price = max(0.0, entry_price - low)
+                mae_price = max(0.0, high - entry_price)
+            mfe_r = mfe_price / risk if risk > 0.0 else None
+            mae_r = mae_price / risk if risk > 0.0 else None
+        except (TypeError, ValueError):
+            mfe_price = mae_price = 0.0
+            mfe_r = mae_r = None
+
+        def _as_datetime(value):
+            if isinstance(value, datetime):
+                parsed = value
+            elif value:
+                try:
+                    parsed = datetime.fromisoformat(
+                        str(value).replace("Z", "+00:00")
+                    )
+                except (TypeError, ValueError):
+                    return None
+            else:
+                return None
+            return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+        opened_at = _as_datetime(
+            entry.get("opened_at")
+            or entry.get("open_time")
+            or entry.get("bar_time")
+            or baseline.get("opened_at")
+        )
+        closed_at = _as_datetime(entry.get("close_time"))
+        duration_minutes = (
+            max(0.0, (closed_at - opened_at).total_seconds() / 60.0)
+            if opened_at is not None and closed_at is not None
+            else None
+        )
+        raw_reason = str(
+            entry.get("close_reason") or entry.get("close_comment") or ""
+        )
+        reason_lower = raw_reason.lower()
+        if "trail" in reason_lower:
+            exit_reason = "trail"
+        elif "take profit" in reason_lower or "takeprofit" in reason_lower or reason_lower == "tp":
+            exit_reason = "TP"
+        elif "stop loss" in reason_lower or "stoploss" in reason_lower or reason_lower == "sl":
+            exit_reason = "SL"
+        elif "manual" in reason_lower:
+            exit_reason = "manual"
+        else:
+            exit_reason = raw_reason or "manual"
+        entry.update({
+            "mfe_price": round(mfe_price, 8),
+            "mae_price": round(mae_price, 8),
+            "mfe_r": round(mfe_r, 8) if mfe_r is not None else None,
+            "mae_r": round(mae_r, 8) if mae_r is not None else None,
+            "duration_minutes": (
+                round(duration_minutes, 3) if duration_minutes is not None else None
+            ),
+            "exit_reason": exit_reason,
+            "close_metrics_logged": True,
+        })
+        log.info(
+            "Trade close metrics: ticket=%s duration_minutes=%s "
+            "mfe_r=%s mae_r=%s exit_reason=%s",
+            ticket_id,
+            f"{duration_minutes:.3f}" if duration_minutes is not None else "unknown",
+            f"{mfe_r:.3f}" if mfe_r is not None else "unknown",
+            f"{mae_r:.3f}" if mae_r is not None else "unknown",
+            exit_reason,
+        )
 
     def _apply_close_history(self, entry: dict, history: dict) -> bool:
         close_price = _history_float(history, "closePrice", "close_price", "price")
@@ -3948,6 +4245,7 @@ class GoldScalperLive:
             "close_source": "MT5_HISTORY",
             "status": "CLOSED",
         })
+        self._log_trailing_close_metrics(entry, ticket_id)
         try:
             from live_trading.redis_ipc import redis_update_trade_feature
 
@@ -3962,12 +4260,6 @@ class GoldScalperLive:
                 ticket_id,
                 exc,
             )
-        log.info(
-            f"Trade close reconciled from broker history: ticket={ticket_id} "
-            f"reason={entry['close_reason']} "
-            f"price={close_price:.5f} profit={entry['profit']:+.2f} "
-            f"time={close_time}"
-        )
         return True
 
     # ── Telegram command processing ───────────────────────────────────────────
@@ -5177,15 +5469,38 @@ class GoldScalperLive:
                 continue
             try:
                 entry = float(baseline["entry"])
-                risk_distance = float(baseline["risk_distance"])
-                if risk_distance <= 0:
+                initial_sl_raw = baseline.get("initial_sl")
+                initial_sl = (
+                    float(initial_sl_raw)
+                    if initial_sl_raw not in (None, "", 0, 0.0)
+                    else None
+                )
+                risk_distance = float(baseline.get("risk_distance", 0.0) or 0.0)
+                if risk_distance <= 0.0 and initial_sl is not None:
+                    risk_distance = abs(entry - initial_sl)
+                allow_chandelier_only = bool(
+                    baseline.get("allow_chandelier_only", risk_distance <= 0.0)
+                )
+                if risk_distance <= 0.0 and not allow_chandelier_only:
                     continue
+                saved_positions = trailing.get("positions", {})
+                saved_status = (
+                    saved_positions.get(str(ticket), {})
+                    if isinstance(saved_positions, dict) else {}
+                )
+                if not isinstance(saved_status, dict):
+                    saved_status = {}
+                trail_stage = (
+                    baseline.get("trail_stage")
+                    or saved_status.get("stage")
+                    or ("CHANDELIER" if allow_chandelier_only else "WAITING_FOR_1R")
+                )
                 restored[str(ticket)] = {
                     "id": str(baseline.get("id", ticket)),
                     "direction": str(baseline["direction"]).upper(),
                     "entry": entry,
                     "risk_distance": risk_distance,
-                    "initial_sl": float(baseline.get("initial_sl", 0.0)),
+                    "initial_sl": initial_sl,
                     "timeframe": baseline.get("timeframe") or TIMEFRAME,
                     "highest_price_since_entry": float(
                         baseline.get("highest_price_since_entry", entry)
@@ -5196,6 +5511,9 @@ class GoldScalperLive:
                     "breakeven_armed": bool(
                         baseline.get("breakeven_armed", False)
                     ),
+                    "trail_stage": trail_stage,
+                    "allow_chandelier_only": allow_chandelier_only,
+                    "last_modify_at": baseline.get("last_modify_at"),
                     "scalp_profile": bool(baseline.get("scalp_profile", False)),
                     "opened_at": baseline.get("opened_at"),
                     "initial_volume": float(
