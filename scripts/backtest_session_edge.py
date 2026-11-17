@@ -14,12 +14,17 @@ import argparse
 import csv
 import math
 import sys
+from collections import Counter
 from pathlib import Path
-from typing import Any
 
 from live_trading.signals.decision_engine import run_decision_engine
 from live_trading.signals.gold_engine import OHLCV
 from live_trading.signals.session_edge import evaluate_entry_context, utc_datetime
+from scripts.backtest_core import (
+    ALLOWED_DIRECTIONS,
+    M5_TIMEFRAME,
+    simulate_trade as _simulate_trade,
+)
 
 
 def _row_value(row: dict[str, str], *names: str) -> str | None:
@@ -31,7 +36,7 @@ def _row_value(row: dict[str, str], *names: str) -> str | None:
     return None
 
 
-def load_m5_csv(path: Path, fallback_spread: float = 0.0) -> tuple[list[OHLCV], list[float]]:
+def load_m5_csv(path: Path, fallback_spread: float = 0.30) -> tuple[list[OHLCV], list[float]]:
     records: list[tuple[OHLCV, float]] = []
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         for row in csv.DictReader(handle):
@@ -64,41 +69,7 @@ def load_m5_csv(path: Path, fallback_spread: float = 0.0) -> tuple[list[OHLCV], 
     return [item[0] for item in records], [item[1] for item in records]
 
 
-def _simulate_trade(
-    bars: list[OHLCV], spreads: list[float], signal_index: int, decision: Any
-) -> dict[str, float | int] | None:
-    if signal_index + 1 >= len(bars) or decision.trade_params is None:
-        return None
-    direction = str(decision.direction).upper()
-    entry_index = signal_index + 1
-    entry = float(bars[entry_index].open)
-    stop = float(decision.trade_params.stop_loss)
-    target = float(decision.trade_params.take_profit)
-    risk = abs(entry - stop)
-    if direction not in {"BUY", "SELL"} or risk <= 0 or not math.isfinite(risk):
-        return None
-    exit_price = float(bars[-1].close)
-    exit_index = len(bars) - 1
-    for index in range(entry_index, len(bars)):
-        candle = bars[index]
-        if direction == "BUY":
-            stop_hit = float(candle.low) <= stop
-            target_hit = float(candle.high) >= target
-        else:
-            stop_hit = float(candle.high) >= stop
-            target_hit = float(candle.low) <= target
-        if stop_hit:
-            exit_price, exit_index = stop, index
-            break
-        if target_hit:
-            exit_price, exit_index = target, index
-            break
-    gross = exit_price - entry if direction == "BUY" else entry - exit_price
-    net = gross - spreads[entry_index]
-    return {"net": net, "r": net / risk, "exit_index": exit_index}
-
-
-def _metrics(trades: list[dict[str, float | int]]) -> tuple[int, float, float, float, float, float]:
+def _metrics(trades: list[dict[str, float | int | str]]) -> tuple[int, float, float, float, float, float]:
     pnls = [float(trade["net"]) for trade in trades]
     rs = [float(trade["r"]) for trade in trades]
     wins = sum(value > 0 for value in pnls)
@@ -121,7 +92,14 @@ def _metrics(trades: list[dict[str, float | int]]) -> tuple[int, float, float, f
     )
 
 
-def run(csv_path: Path, *, spread_price: float = 0.0, account_balance: float = 10000.0, warmup: int = 200) -> int:
+def run(
+    csv_path: Path,
+    *,
+    spread_price: float = 0.30,
+    account_balance: float = 10000.0,
+    warmup: int = 200,
+    allowed_directions: frozenset[str] = ALLOWED_DIRECTIONS,
+) -> int:
     try:
         bars, spreads = load_m5_csv(csv_path, spread_price)
     except OSError as exc:
@@ -132,21 +110,32 @@ def run(csv_path: Path, *, spread_price: float = 0.0, account_balance: float = 1
         return 2
 
     names = ("baseline", "+VWAP", "+Asian sweep", "both")
-    trades: dict[str, list[dict[str, float | int]]] = {name: [] for name in names}
+    trades: dict[str, list[dict[str, float | int | str]]] = {name: [] for name in names}
     next_entry = {name: warmup for name in names}
     edge_used_days: dict[str, set[str]] = {name: set() for name in names}
+    blocked_reasons: Counter[str] = Counter()
+    allowed_signal_count = 0
 
     for index in range(warmup, len(bars) - 1):
         history = bars[max(0, index - 299):index + 1]
         decision = run_decision_engine(
             history,
             account_balance=account_balance,
-            timeframe="M5",
+            timeframe=M5_TIMEFRAME,
             symbol="XAUUSD",
         )
-        if not decision.allowed or decision.trade_params is None:
+        if not decision.allowed:
+            reasons = decision.blocked_reasons or ["Decision was blocked without a reason"]
+            blocked_reasons.update(str(reason) for reason in reasons)
+            continue
+        if decision.trade_params is None:
+            blocked_reasons["Decision allowed without trade parameters"] += 1
             continue
         direction = str(decision.direction).upper()
+        if direction not in allowed_directions:
+            blocked_reasons[f"{direction} filtered by ALLOWED_DIRECTIONS"] += 1
+            continue
+        allowed_signal_count += 1
         context = evaluate_entry_context(history, direction, mode="off", applicable=True)
         edge = context["session_edge"]
         vwap = context["vwap_filter"]
@@ -171,6 +160,7 @@ def run(csv_path: Path, *, spread_price: float = 0.0, account_balance: float = 1
                 continue
             result = _simulate_trade(bars, spreads, index, decision)
             if result is None:
+                blocked_reasons["Simulator rejected the allowed signal"] += 1
                 continue
             trades[name].append(result)
             next_entry[name] = int(result["exit_index"]) + 1
@@ -183,22 +173,51 @@ def run(csv_path: Path, *, spread_price: float = 0.0, account_balance: float = 1
         count, win_rate, pf, avg_r, drawdown, net = _metrics(trades[name])
         pf_text = "inf" if math.isinf(pf) else f"{pf:.2f}"
         print(f"{name:<13} {count:>6}  {win_rate:>7.2f}%  {pf_text:>13}  {avg_r:>6.3f}  {drawdown:>7.3f}  {net:>15.3f}")
+    if allowed_signal_count == 0 or not trades["baseline"]:
+        print(
+            f"\nERROR: no baseline trades were produced after "
+            f"{allowed_signal_count} allowed signal(s) "
+            f"(timeframe={M5_TIMEFRAME!r}). Top blocked reasons:",
+            file=sys.stderr,
+        )
+        for reason, count in blocked_reasons.most_common(5):
+            print(f"  {count:>5}x  {reason}", file=sys.stderr)
+        if not blocked_reasons:
+            print("  No decision attempts produced a blocked reason.", file=sys.stderr)
+        return 2
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, help="Historical M5 CSV path")
-    parser.add_argument("--spread-price", type=float, default=0.0, help="Fallback spread cost in price units")
+    parser.add_argument("--spread-price", type=float, default=0.30, help="Fallback spread cost in price units")
     parser.add_argument("--account-balance", type=float, default=10000.0)
     parser.add_argument("--warmup", type=int, default=200)
+    parser.add_argument(
+        "--allowed-directions",
+        choices=("both", "buy"),
+        default="both",
+        help="Backtest-only A/B filter; BUY stays enabled",
+    )
     args = parser.parse_args()
     if args.csv is None:
         print("No historical CSV is checked into this repo; pass --csv PATH to run the M5 comparison.")
         return 2
     if args.spread_price < 0 or args.warmup < 50:
         parser.error("--spread-price must be non-negative and --warmup at least 50")
-    return run(args.csv, spread_price=args.spread_price, account_balance=args.account_balance, warmup=args.warmup)
+    allowed_directions = (
+        ALLOWED_DIRECTIONS
+        if args.allowed_directions == "both"
+        else frozenset({"BUY"})
+    )
+    return run(
+        args.csv,
+        spread_price=args.spread_price,
+        account_balance=args.account_balance,
+        warmup=args.warmup,
+        allowed_directions=allowed_directions,
+    )
 
 
 if __name__ == "__main__":
