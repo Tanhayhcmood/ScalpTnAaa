@@ -9,13 +9,13 @@ from typing import Optional
 
 DEFAULT_RISK_PCT    = 1.0
 ATR_BUFFER_MULT     = 0.25
-DEFAULT_SL_ATR_MULT = 3.00
+DEFAULT_SL_ATR_MULT = 2.00
 MIN_SL_ATR_MULT     = 1.50
 MAX_SL_ATR_MULT     = 3.50
 
 
 def _tp_rr_from_env() -> float:
-    raw = os.getenv("TP_RR", "2.0")
+    raw = os.getenv("TP_RR", "1.5")
     try:
         value = float(raw)
     except (TypeError, ValueError) as exc:
@@ -25,7 +25,19 @@ def _tp_rr_from_env() -> float:
     return value
 
 
+def _tp_max_atr_from_env() -> float:
+    raw = os.getenv("TP_MAX_ATR", "4.0")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("TP_MAX_ATR must be a positive number") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("TP_MAX_ATR must be a positive number")
+    return value
+
+
 FIXED_TP_RR         = _tp_rr_from_env()
+TP_MAX_ATR          = _tp_max_atr_from_env()
 LOT_DOLLAR_PER_UNIT = 100
 MIN_LOT             = 0.01
 LOT_STEP            = 0.01
@@ -215,6 +227,8 @@ def calc_trade_parameters(inp: CapitalInput) -> CapitalOutput:
     sl_dist    = _r2(abs(entry - sl))
     sl_pips    = _r2(sl_dist * 100)
 
+    safe_atr = max(float(atr), 1e-9)
+    max_tp_distance = safe_atr * TP_MAX_ATR
     range_target_valid = (
         inp.take_profit_level is not None
         and (
@@ -223,10 +237,13 @@ def calc_trade_parameters(inp: CapitalInput) -> CapitalOutput:
         )
     )
     if range_target_valid:
-        tp = _r2(inp.take_profit_level)  # type: ignore[arg-type]
-        tp_dist = abs(tp - entry)
+        requested_tp = _r2(inp.take_profit_level)  # type: ignore[arg-type]
+        tp_dist = min(abs(requested_tp - entry), max_tp_distance)
+        tp = _r2(
+            entry + tp_dist if direction == "BUY" else entry - tp_dist
+        )
     else:
-        tp_dist = sl_dist * inp.take_profit_rr
+        tp_dist = min(sl_dist * inp.take_profit_rr, max_tp_distance)
         tp = _r2(entry + tp_dist if direction == "BUY" else entry - tp_dist)
     rr         = _r2(tp_dist / sl_dist) if sl_dist > 0 else 0.0
 

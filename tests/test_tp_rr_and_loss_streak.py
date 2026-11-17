@@ -7,12 +7,12 @@ from live_trading.signals.decision_engine import _rr_requirements
 from live_trading.trading.loss_streak import evaluate_loss_streak_pause
 
 
-def test_tp_rr_default_is_identical_to_legacy_two_r(monkeypatch):
+def test_tp_rr_default_is_1_5_r_and_matches_explicit_target(monkeypatch):
     original = os.environ.get("TP_RR")
     try:
         monkeypatch.delenv("TP_RR", raising=False)
         manager = importlib.reload(capital_manager)
-        assert manager.FIXED_TP_RR == 2.0
+        assert manager.FIXED_TP_RR == 1.5
 
         defaults = {
             "direction": "BUY",
@@ -26,9 +26,38 @@ def test_tp_rr_default_is_identical_to_legacy_two_r(monkeypatch):
             manager.CapitalInput(**defaults)
         )
         explicit_params = manager.calc_trade_parameters(
-            manager.CapitalInput(**defaults, take_profit_rr=2.0)
+            manager.CapitalInput(**defaults, take_profit_rr=1.5)
         )
         assert default_params == explicit_params
+    finally:
+        if original is None:
+            monkeypatch.delenv("TP_RR", raising=False)
+        else:
+            monkeypatch.setenv("TP_RR", original)
+        importlib.reload(capital_manager)
+
+
+def test_default_tp_rr_passes_normal_trend_rr_gate(monkeypatch):
+    original = os.environ.get("TP_RR")
+    try:
+        monkeypatch.setenv("TP_RR", "1.5")
+        manager = importlib.reload(capital_manager)
+        params = manager.calc_trade_parameters(
+            manager.CapitalInput(
+                direction="BUY",
+                entry_price=2500.0,
+                atr=10.0,
+                account_balance=10_000.0,
+                sl_atr_multiplier=2.0,
+                sl_min_atr_multiplier=1.5,
+            )
+        )
+        required_rr, _ = _rr_requirements(
+            "TREND", 1.8, 1.5, manager.FIXED_TP_RR
+        )
+        assert params.risk_reward_ratio == 1.5
+        assert required_rr == 1.5
+        assert params.risk_reward_ratio >= required_rr
     finally:
         if original is None:
             monkeypatch.delenv("TP_RR", raising=False)

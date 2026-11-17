@@ -78,6 +78,7 @@ from live_trading.config import (
     SCALP_PROFILE, SCALP_SL_MIN_ATR, SCALP_SL_MAX_ATR,
     SCALP_TIME_STOP_BARS, SCALP_TP1_RR, SCALP_TP2_RR,
     SCALP_MIN_NET_RR,
+    TIME_STOP_BARS, TIME_STOP_MIN_R, MAX_TRADE_MINUTES,
     DECISION_FUNNEL_ENABLED,
 )
 from live_trading.logger import get_logger
@@ -86,7 +87,7 @@ from live_trading.risk.adaptive_trailing_stop import (
     AdaptiveTrailingConfig, atr, compute_adaptive_trail, should_apply,
 )
 from live_trading.risk.capital_manager import (
-    CapitalOutput, FIXED_TP_RR, LOT_DOLLAR_PER_UNIT,
+    CapitalOutput, FIXED_TP_RR, TP_MAX_ATR, LOT_DOLLAR_PER_UNIT,
 )
 from live_trading.risk.aggregate_risk import (
     AggregateRiskLimitError,
@@ -986,6 +987,10 @@ class GoldScalperLive:
             "SL_ATR_TIMEFRAME": SL_ATR_TIMEFRAME,
             "SL_ATR_BASE_MULTIPLIER": SL_ATR_BASE_MULTIPLIER,
             "TP_RR": FIXED_TP_RR,
+            "TP_MAX_ATR": TP_MAX_ATR,
+            "TIME_STOP_BARS": TIME_STOP_BARS,
+            "TIME_STOP_MIN_R": TIME_STOP_MIN_R,
+            "MAX_TRADE_MINUTES": MAX_TRADE_MINUTES,
             "SCALP_TP1_RR": SCALP_TP1_RR,
             "SCALP_TP2_RR": SCALP_TP2_RR,
             "SCALP_MIN_NET_RR": SCALP_MIN_NET_RR,
@@ -2819,7 +2824,10 @@ class GoldScalperLive:
                 "signal_id":   signal_id,
                 "strategy":    strategy,
                 "strategy_slots": list(candidate_strategy_slots),
-                "opened_at": scalp_baseline.get("opened_at"),
+                "opened_at": (
+                    scalp_baseline.get("opened_at")
+                    or datetime.now(timezone.utc).isoformat()
+                ),
                 "scalp_profile": bool(scalp_baseline.get("scalp_profile", False)),
                 "initial_volume": scalp_baseline.get("initial_volume"),
                 "volume_min": scalp_baseline.get("volume_min"),
@@ -2867,6 +2875,7 @@ class GoldScalperLive:
                 "risk_distance": abs(tp_params.entry_price - tp_params.stop_loss),
                 "initial_sl":    tp_params.stop_loss,
                 "timeframe":     tf,
+                "opened_at":     entry_log["opened_at"],
                 "highest_price_since_entry": tp_params.entry_price,
                 "lowest_price_since_entry": tp_params.entry_price,
                 "breakeven_armed": False,
@@ -3304,9 +3313,6 @@ class GoldScalperLive:
         ``return_exceptions=True``.  A broker error for one ticket therefore
         cannot prevent the other open positions from receiving their update.
         """
-        if not self.trailing_enabled and SCALP_PROFILE != "on":
-            return
-
         try:
             raw_positions = await get_open_positions(
                 SYMBOL, self._known_open_tickets()
@@ -3343,15 +3349,21 @@ class GoldScalperLive:
             ),
             [],
         )
-        if SCALP_PROFILE == "on" and not m5_candles:
+        if not m5_candles:
             try:
                 m5_candles = await fetch_candles(
-                    SYMBOL, "M5", max(CANDLE_WINDOW, SCALP_TIME_STOP_BARS + 2)
+                    SYMBOL,
+                    "M5",
+                    max(
+                        CANDLE_WINDOW,
+                        SCALP_TIME_STOP_BARS + 2,
+                        TIME_STOP_BARS + 2,
+                    ),
                 )
                 if m5_candles:
                     self._last_candles_by_timeframe["M5"] = list(m5_candles)
             except Exception as exc:
-                log.warning("Scalp M5 candle fetch failed: %s", exc)
+                log.warning("M5 time-exit candle fetch failed: %s", exc)
                 m5_candles = []
 
         async def update_ticket(raw_position: dict) -> None:
@@ -3373,9 +3385,6 @@ class GoldScalperLive:
                     pos_id,
                 )
                 return
-            if not self.trailing_enabled and not baseline.get("scalp_profile"):
-                return
-
             direction = str(baseline["direction"]).upper()
             current_price = quote["bid"] if direction == "BUY" else quote["ask"]
             timeframe = str(baseline.get("timeframe") or TIMEFRAME)
@@ -3405,6 +3414,118 @@ class GoldScalperLive:
                     "action": "SKIP",
                     "reason": "invalid quote or entry price",
                 }
+                return
+
+            if not baseline.get("scalp_profile"):
+                opened_at = baseline.get("opened_at") or pos.get("open_time")
+                opened_time = None
+                try:
+                    if isinstance(opened_at, datetime):
+                        opened_time = opened_at
+                    elif opened_at:
+                        opened_time = datetime.fromisoformat(
+                            str(opened_at).replace("Z", "+00:00")
+                        )
+                    if opened_time is not None:
+                        if opened_time.tzinfo is None:
+                            opened_time = opened_time.replace(tzinfo=timezone.utc)
+                        opened_time = opened_time.astimezone(timezone.utc)
+                        age_minutes = max(
+                            0.0,
+                            (
+                                datetime.now(timezone.utc) - opened_time
+                            ).total_seconds() / 60.0,
+                        )
+                    else:
+                        age_minutes = None
+                except (TypeError, ValueError, OverflowError):
+                    age_minutes = None
+
+                try:
+                    risk_distance = float(baseline.get("risk_distance") or 0.0)
+                except (TypeError, ValueError):
+                    risk_distance = 0.0
+                max_favorable_r = None
+                if risk_distance > 0 and math.isfinite(risk_distance):
+                    favorable_move = (
+                        float(baseline["highest_price_since_entry"]) - entry_price
+                        if direction == "BUY"
+                        else entry_price - float(baseline["lowest_price_since_entry"])
+                    )
+                    max_favorable_r = max(0.0, favorable_move) / risk_distance
+
+                bars_since_entry = closed_m5_bars_since_entry(
+                    m5_candles, opened_at
+                )
+                exit_reason = None
+                if (
+                    age_minutes is not None
+                    and age_minutes >= MAX_TRADE_MINUTES
+                ):
+                    exit_reason = "MAX_AGE"
+                elif (
+                    bars_since_entry >= TIME_STOP_BARS
+                    and max_favorable_r is not None
+                    and max_favorable_r + 1e-9 < TIME_STOP_MIN_R
+                ):
+                    exit_reason = "TIME_STOP"
+
+                if exit_reason:
+                    result = await close_position(pos_id)
+                    if result.success:
+                        baseline["pending_exit_reason"] = exit_reason
+                        for trade in self.trade_history:
+                            if (
+                                str(
+                                    trade.get("position_id")
+                                    or trade.get("ticket")
+                                ) == pos_id
+                                and not trade.get("close_time")
+                            ):
+                                trade.update({
+                                    "pending_exit_reason": exit_reason,
+                                    "exit_reason": exit_reason,
+                                    "max_favorable_r": (
+                                        round(max_favorable_r, 4)
+                                        if max_favorable_r is not None
+                                        else None
+                                    ),
+                                })
+                    action = (
+                        f"{exit_reason}_CLOSED"
+                        if result.success
+                        else "ERROR"
+                    )
+                    minutes_text = (
+                        f"{age_minutes:.1f}"
+                        if age_minutes is not None
+                        else "unknown"
+                    )
+                    max_r_text = (
+                        f"{max_favorable_r:.2f}"
+                        if max_favorable_r is not None
+                        else "unknown"
+                    )
+                    self._last_trailing_statuses[pos_id] = {
+                        "active": True,
+                        "action": action,
+                        "reason": (
+                            exit_reason
+                            if result.success
+                            else result.message
+                        ),
+                    }
+                    log.info(
+                        "%s ticket=%s minutes=%s max_r=%s action=%s",
+                        exit_reason,
+                        pos_id,
+                        minutes_text,
+                        max_r_text,
+                        action,
+                    )
+                    return
+
+            if not self.trailing_enabled and not baseline.get("scalp_profile"):
                 return
 
             if SCALP_PROFILE == "on" and await self._manage_scalp_exit(
@@ -4224,8 +4345,12 @@ class GoldScalperLive:
         swap = _history_float(history, "swap") or 0.0
         fee = _history_float(history, "fee") or 0.0
         net_profit = gross_profit + commission + swap + fee
-        close_reason = _history_value(history, "close_reason") or classify_close_reason(
-            history, entry, trailing_stop=trailing_stop
+        close_reason = (
+            entry.get("pending_exit_reason")
+            or _history_value(history, "close_reason")
+            or classify_close_reason(
+                history, entry, trailing_stop=trailing_stop
+            )
         )
         entry.update({
             "ticket": ticket_id,
