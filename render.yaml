@@ -45,8 +45,7 @@ services:
         value: "5m"
       - key: CANDLE_WINDOW
         value: "300"
-      # Keep the protective SL on stable M15 volatility while entries run on
-      # M5, avoiding a stop that is too tight for normal gold noise.
+      # SL and TP distances use stable M15 protective ATR while entries run on M5.
       - key: SL_ATR_TIMEFRAME
         value: "M15"
       - key: SL_ATR_PERIOD
@@ -83,12 +82,15 @@ services:
         value: "1"
       - key: TREND_MIN_CONFIRMATIONS
         value: "1"
-      # Keep stops at least 3x higher-timeframe ATR and widen LOW_VOLATILITY
-      # setups by another 0.5x, with the capital manager capped at 3.5x.
+      # Default SL is 2x protective ATR (bounded 1.5–3.5); low volatility adds 0.5x.
       - key: SL_ATR_BASE_MULTIPLIER
-        value: "3.0"
+        value: "2.0"
       - key: LOW_VOLATILITY_SL_ATR_ADD
         value: "0.5"
+      - key: TP_RR
+        value: "1.5"
+      - key: TP_MAX_ATR
+        value: "4.0"
       # Only Trend and Price Action can authorize live entries. SMC and
       # Wyckoff remain available for diagnostics but cannot open trades.
       - key: ENABLED_STRATEGIES
@@ -126,7 +128,13 @@ services:
       - key: MAX_RANGE_TRADES_PER_SESSION
         value: "2"
       - key: MAX_OPEN_TRADES
-        value: "5"
+        value: "2"
+      - key: TIME_STOP_BARS
+        value: "12"
+      - key: TIME_STOP_MIN_R
+        value: "0.5"
+      - key: MAX_TRADE_MINUTES
+        value: "240"
       # Directional scalping is one-way by default. Opposite positions are
       # blocked even when they would occupy different strategy slots.
       - key: ALLOW_HEDGED_POSITIONS

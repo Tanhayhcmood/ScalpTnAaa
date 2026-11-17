@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -399,6 +399,106 @@ async def test_post_fill_risk_over_150_percent_of_cap_closes_position(monkeypatc
     assert "exceeds 1.5x per-trade cap" in reason
     assert close_calls == ["position-1"]
     assert order_calls
+
+
+def _time_exit_robot(monkeypatch, opened_at, candles, highest_price):
+    positions = [{
+        "id": "time-exit-ticket",
+        "type": "BUY",
+        "open_price": 100.0,
+        "sl": 98.0,
+        "tp": 103.0,
+        "volume": 0.1,
+        "open_time": opened_at.isoformat(),
+    }]
+    close_calls = []
+
+    async def fake_get_open_positions(*_args, **_kwargs):
+        return positions
+
+    async def fake_get_current_quote(_symbol):
+        return {"bid": 100.0, "ask": 100.1}
+
+    async def fake_fetch_candles(*_args, **_kwargs):
+        return []
+
+    async def fake_close_position(position_id):
+        close_calls.append(position_id)
+        return TradeResult(True, position_id, "closed")
+
+    monkeypatch.setattr(live_loop, "get_open_positions", fake_get_open_positions)
+    monkeypatch.setattr(live_loop, "get_current_quote", fake_get_current_quote)
+    monkeypatch.setattr(live_loop, "fetch_candles", fake_fetch_candles)
+    monkeypatch.setattr(live_loop, "mt5_pos_to_dict", lambda position: position)
+    monkeypatch.setattr(live_loop, "close_position", fake_close_position)
+    monkeypatch.setattr(live_loop, "TIME_STOP_BARS", 12)
+    monkeypatch.setattr(live_loop, "TIME_STOP_MIN_R", 0.5)
+    monkeypatch.setattr(live_loop, "MAX_TRADE_MINUTES", 240)
+
+    robot = GoldScalperLive()
+    robot.trailing_enabled = False
+    robot._last_candles_by_timeframe = {"M5": candles}
+    robot._trail_baselines["time-exit-ticket"] = {
+        "id": "time-exit-ticket",
+        "direction": "BUY",
+        "entry": 100.0,
+        "risk_distance": 2.0,
+        "initial_sl": 98.0,
+        "opened_at": opened_at.isoformat(),
+        "highest_price_since_entry": highest_price,
+        "lowest_price_since_entry": 99.8,
+    }
+    entry = {
+        "position_id": "time-exit-ticket",
+        "direction": "BUY",
+        "entry": 100.0,
+        "lot": 0.1,
+        "opened_at": opened_at.isoformat(),
+        "status": "OPEN",
+    }
+    robot.trade_history = [entry]
+    return robot, close_calls, entry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bar_count", "highest_price", "should_close"),
+    [(11, 100.8, False), (12, 100.8, True), (12, 101.0, False)],
+)
+async def test_normal_time_stop_requires_12_bars_without_half_r(
+    monkeypatch, bar_count, highest_price, should_close
+):
+    opened_at = datetime.now(timezone.utc) - timedelta(
+        minutes=bar_count * 5 + 1
+    )
+    candles = [
+        {"time": opened_at + timedelta(minutes=bar * 5)}
+        for bar in range(1, bar_count + 1)
+    ]
+    robot, close_calls, entry = _time_exit_robot(
+        monkeypatch, opened_at, candles, highest_price
+    )
+
+    await robot._manage_trailing_stop()
+
+    assert bool(close_calls) is should_close
+    if should_close:
+        assert entry["exit_reason"] == "TIME_STOP"
+        assert entry["max_favorable_r"] == 0.4
+
+
+@pytest.mark.asyncio
+async def test_max_age_closes_old_normal_trade(monkeypatch):
+    opened_at = datetime.now(timezone.utc) - timedelta(minutes=241)
+    robot, close_calls, entry = _time_exit_robot(
+        monkeypatch, opened_at, [], 101.4
+    )
+
+    await robot._manage_trailing_stop()
+
+    assert close_calls == ["time-exit-ticket"]
+    assert entry["exit_reason"] == "MAX_AGE"
+    assert entry["max_favorable_r"] == 0.7
 
 
 @pytest.mark.asyncio

@@ -381,12 +381,15 @@ SCALP_SL_MAX_ATR = _float(
     "SCALP_SL_MAX_ATR", 1.8, lo=SCALP_SL_MIN_ATR, hi=3.5
 )
 SCALP_TIME_STOP_BARS = _int("SCALP_TIME_STOP_BARS", 6, lo=1, hi=100)
+# Normal-trade time exits use completed M5 bars and the original stop risk.
+TIME_STOP_BARS = _int("TIME_STOP_BARS", 12, lo=1, hi=100)
+TIME_STOP_MIN_R = _float("TIME_STOP_MIN_R", 0.5, lo=0.0, hi=10.0)
+MAX_TRADE_MINUTES = _int("MAX_TRADE_MINUTES", 240, lo=1)
 SCALP_TP1_RR = 1.0
 SCALP_TP2_RR = 1.5
 SCALP_MIN_NET_RR = 1.2
 
-# Base protective stop distance in ATR units. The legacy profile keeps its
-# 3.0–3.5x bounds; scalp mode allows the configured lower bound.
+# Base protective stop distance in protective-timeframe ATR units.
 if SCALP_PROFILE == "on":
     SL_ATR_BASE_MULTIPLIER = _float(
         "SL_ATR_BASE_MULTIPLIER",
@@ -396,7 +399,7 @@ if SCALP_PROFILE == "on":
     )
 else:
     SL_ATR_BASE_MULTIPLIER = _float(
-        "SL_ATR_BASE_MULTIPLIER", 3.0, lo=3.0, hi=3.5
+        "SL_ATR_BASE_MULTIPLIER", 2.0, lo=1.5, hi=3.5
     )
 # LOW_VOLATILITY often precedes expansion, so widen the protective stop while
 # retaining the global 3.5x cap in the capital manager.
@@ -530,7 +533,7 @@ STRUCTURE_MAX_AGE_BARS = _int("STRUCTURE_MAX_AGE_BARS", 24, lo=3, hi=100)
 # Allow bounded scale-in for the active strategy while keeping the aggregate
 # position cap explicit. Legacy SMC/Wyckoff slots still fail closed during
 # transition, and the live loop retains its one-way and within-tick guards.
-MAX_OPEN_TRADES   = _int("MAX_OPEN_TRADES", 5, lo=1, hi=10)
+MAX_OPEN_TRADES   = _int("MAX_OPEN_TRADES", 2, lo=1, hi=10)
 # The account is directional by default. Strategy slots may still be used for
 # scale-in decisions, but an opposite-side position is never opened while a
 # position on this symbol is live unless the operator explicitly opts into
