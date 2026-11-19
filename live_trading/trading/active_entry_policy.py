@@ -1,20 +1,28 @@
 """
-Authoritative Phase 1 live-entry policy for XAUUSD M5 volatility/scalp entries.
+Authoritative live-entry policy for XAUUSD M5 directional scalp entries.
 
-This policy is deliberately fail-closed: a live order requires Trend and
-Price Action agreement, a usable directional market regime, and structural
-Price Action confirmation.  SMC/Wyckoff remain diagnostic only.
+A live order requires:
+- XAUUSD and M5 execution;
+- a directional trend regime (not RANGE/choppy/low volatility);
+- aligned Trend and structural Price Action confirmation;
+- ADX and data quality strong enough for a directional M5 trade.
+
+Diagnostic engines (SMC/Wyckoff) remain excluded from authorization.
 """
 
 from dataclasses import dataclass
 
-from live_trading.signals.market_regime import REGIME_RULES
+from live_trading.signals.market_regime import (
+    REGIME_RULES,
+    STRONG_ADX_TREND_THRESHOLD,
+)
 from live_trading.utils import canonical_symbol
 
 
 ACTIVE_ENTRY_STRATEGY = "XAUUSD_M5_TREND_PA_SCALP"
 ACTIVE_ENTRY_SYMBOL = "XAUUSD"
 ACTIVE_ENTRY_TIMEFRAME = "5m"
+MINIMUM_DIRECTIONAL_ADX = 18.0
 
 _ALLOWED_SCALP_REGIMES = frozenset({
     "STRONG_TREND_BULL",
@@ -48,16 +56,69 @@ def _pa_has_structural_confirmation(pa, direction: str) -> bool:
     if str(getattr(pa, "pa_signal", "")).upper().strip() != direction:
         return False
 
-    if direction == "BUY":
-        flags = ("valid_bull_breakout", "bullish_inside_breakout", "bullish_pullback")
-    else:
-        flags = ("valid_bear_breakout", "bearish_inside_breakout", "bearish_pullback")
+    flags = (
+        ("valid_bull_breakout", "bullish_inside_breakout", "bullish_pullback")
+        if direction == "BUY"
+        else ("valid_bear_breakout", "bearish_inside_breakout", "bearish_pullback")
+    )
     return any(bool(getattr(pa, flag, False)) for flag in flags)
 
 
+def _decision_adx(decision) -> float | None:
+    quality = getattr(decision, "quality_filter", None)
+    raw_adx = getattr(quality, "adx", None)
+    try:
+        adx = float(raw_adx)
+    except (TypeError, ValueError):
+        return None
+    if adx < 0:
+        return None
+    return adx
+
+
 def strong_trend_validation_reason(decision) -> str | None:
-    """Keep the existing STRONG-ADX guard as an additional final-order check."""
-    return None
+    """Fail closed for an unconfirmed ADX-driven strong trend."""
+    regime = str(getattr(decision, "regime", "")).upper().strip()
+    expected_direction = (
+        "BUY" if regime == "STRONG_TREND_BULL"
+        else "SELL" if regime == "STRONG_TREND_BEAR"
+        else "NEUTRAL"
+    )
+    if expected_direction == "NEUTRAL":
+        return None
+
+    adx = _decision_adx(decision)
+    if adx is None:
+        return (
+            "Strong Trend final validation blocked: ADX is missing or invalid "
+            f"for {regime}"
+        )
+    if adx < STRONG_ADX_TREND_THRESHOLD:
+        return None
+
+    direction = str(getattr(decision, "direction", "")).upper().strip()
+    if direction != expected_direction:
+        return (
+            "Strong Trend final validation blocked: decision direction "
+            f"{direction or 'UNKNOWN'} does not match regime direction "
+            f"{expected_direction}"
+        )
+
+    trend_direction = _trend_direction(getattr(decision, "trend", None))
+    if trend_direction == expected_direction:
+        return None
+
+    if _pa_has_structural_confirmation(
+        getattr(decision, "pa", None), expected_direction
+    ):
+        return None
+
+    return (
+        "Strong Trend final validation blocked: ADX "
+        f"{adx:.1f} >= {STRONG_ADX_TREND_THRESHOLD:.0f} for {regime}, "
+        f"but Trend Engine is {trend_direction} and no structural Price "
+        f"Action confirmation exists for {expected_direction}"
+    )
 
 
 def evaluate_active_entry(
@@ -103,7 +164,8 @@ def evaluate_active_entry(
         return ActiveEntryPolicyResult(
             False,
             ACTIVE_ENTRY_STRATEGY,
-            f"{ACTIVE_ENTRY_STRATEGY} blocked: regime {regime or 'UNKNOWN'} is not a directional XAUUSD scalp setup",
+            f"{ACTIVE_ENTRY_STRATEGY} blocked: regime {regime or 'UNKNOWN'} "
+            "is not a directional XAUUSD scalp setup",
         )
 
     direction = str(getattr(decision, "direction", "")).upper().strip()
@@ -114,30 +176,54 @@ def evaluate_active_entry(
             f"{ACTIVE_ENTRY_STRATEGY} blocked: direction is not BUY or SELL",
         )
 
+    adx = _decision_adx(decision)
+    if adx is None:
+        return ActiveEntryPolicyResult(
+            False,
+            ACTIVE_ENTRY_STRATEGY,
+            f"{ACTIVE_ENTRY_STRATEGY} blocked: ADX is missing or invalid",
+        )
+    if adx < MINIMUM_DIRECTIONAL_ADX:
+        return ActiveEntryPolicyResult(
+            False,
+            ACTIVE_ENTRY_STRATEGY,
+            f"{ACTIVE_ENTRY_STRATEGY} blocked: ADX {adx:.1f} is below "
+            f"minimum {MINIMUM_DIRECTIONAL_ADX:.1f}",
+        )
+
     entry_filter = getattr(decision, "entry_filter", None)
+    if entry_filter is None:
+        return ActiveEntryPolicyResult(
+            False,
+            ACTIVE_ENTRY_STRATEGY,
+            f"{ACTIVE_ENTRY_STRATEGY} blocked: entry confirmation data is missing",
+        )
+
     trend_confirmed = bool(getattr(entry_filter, "trend", False))
     pa_confirmed = bool(getattr(entry_filter, "price_action", False))
-
-    pa = getattr(decision, "pa", None)
-    pa_direction = str(getattr(pa, "pa_signal", "")).upper().strip()
-
     if not trend_confirmed or not pa_confirmed:
         return ActiveEntryPolicyResult(
             False,
             ACTIVE_ENTRY_STRATEGY,
-            f"{ACTIVE_ENTRY_STRATEGY} blocked: Trend and Price Action confirmation are both required",
+            f"{ACTIVE_ENTRY_STRATEGY} blocked: Trend and Price Action "
+            "confirmation are both required",
         )
+
+    pa = getattr(decision, "pa", None)
+    pa_direction = str(getattr(pa, "pa_signal", "")).upper().strip()
     if pa_direction != direction:
         return ActiveEntryPolicyResult(
             False,
             ACTIVE_ENTRY_STRATEGY,
-            f"{ACTIVE_ENTRY_STRATEGY} blocked: Price Action direction {pa_direction or 'NEUTRAL'} does not match {direction}",
+            f"{ACTIVE_ENTRY_STRATEGY} blocked: Price Action direction "
+            f"{pa_direction or 'NEUTRAL'} does not match {direction}",
         )
     if not _pa_has_structural_confirmation(pa, direction):
         return ActiveEntryPolicyResult(
             False,
             ACTIVE_ENTRY_STRATEGY,
-            f"{ACTIVE_ENTRY_STRATEGY} blocked: Price Action requires a closed breakout, inside-bar breakout, or pullback/reclaim",
+            f"{ACTIVE_ENTRY_STRATEGY} blocked: Price Action requires a "
+            "closed breakout, inside-bar breakout, or pullback/reclaim",
         )
 
     trend_direction = _trend_direction(getattr(decision, "trend", None))
@@ -145,7 +231,12 @@ def evaluate_active_entry(
         return ActiveEntryPolicyResult(
             False,
             ACTIVE_ENTRY_STRATEGY,
-            f"{ACTIVE_ENTRY_STRATEGY} blocked: Trend and entry direction disagree ({trend_direction} vs {direction})",
+            f"{ACTIVE_ENTRY_STRATEGY} blocked: Trend and entry direction "
+            f"disagree ({trend_direction} vs {direction})",
         )
+
+    strong_reason = strong_trend_validation_reason(decision)
+    if strong_reason is not None:
+        return ActiveEntryPolicyResult(False, ACTIVE_ENTRY_STRATEGY, strong_reason)
 
     return ActiveEntryPolicyResult(True, ACTIVE_ENTRY_STRATEGY)
