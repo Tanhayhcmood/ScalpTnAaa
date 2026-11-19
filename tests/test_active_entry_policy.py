@@ -5,7 +5,9 @@ import pytest
 from live_trading.signals.market_regime import REGIME_RULES
 from live_trading.trading.active_entry_policy import (
     ACTIVE_ENTRY_STRATEGY,
+    MINIMUM_DIRECTIONAL_ADX,
     evaluate_active_entry,
+    strong_trend_validation_reason,
 )
 
 
@@ -15,11 +17,15 @@ def _decision(**overrides):
         "direction": "BUY",
         "regime": "STRONG_TREND_BULL",
         "trend": SimpleNamespace(trend="BULLISH"),
+        "quality_filter": SimpleNamespace(adx=25.0),
         "pa": SimpleNamespace(
+            pa_signal="BUY",
             valid_bull_breakout=True,
             valid_bear_breakout=False,
             bullish_inside_breakout=False,
             bearish_inside_breakout=False,
+            bullish_pullback=False,
+            bearish_pullback=False,
         ),
         "entry_filter": SimpleNamespace(
             trend=True,
@@ -32,56 +38,45 @@ def _decision(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_only_active_strategy_can_pass_the_runtime_gate():
+def test_only_aligned_trend_pa_breakout_can_pass():
     result = evaluate_active_entry(
-        _decision(),
-        symbol="XAUUSD",
-        timeframe="5m",
+        _decision(), symbol="XAUUSD", timeframe="5m"
     )
-
     assert result.allowed is True
     assert result.strategy == ACTIVE_ENTRY_STRATEGY
 
 
-def test_range_entries_are_authorized_when_trend_confirms():
+def test_range_entries_are_blocked():
     result = evaluate_active_entry(
-        _decision(regime="RANGE"),
+        _decision(regime="RANGE"), symbol="XAUUSD", timeframe="5m"
+    )
+    assert result.allowed is False
+    assert "not a directional XAUUSD scalp setup" in result.reason
+
+
+def test_low_adx_entry_is_blocked():
+    result = evaluate_active_entry(
+        _decision(quality_filter=SimpleNamespace(adx=MINIMUM_DIRECTIONAL_ADX - 1)),
         symbol="XAUUSD",
         timeframe="5m",
     )
+    assert result.allowed is False
+    assert "ADX" in result.reason
 
-    assert result.allowed is True
-    assert result.strategy == ACTIVE_ENTRY_STRATEGY
 
-
-@pytest.mark.parametrize("regime", sorted(REGIME_RULES))
-def test_every_regime_rule_can_reach_the_active_entry_policy(regime):
-    rules = REGIME_RULES[regime]
-    direction = "BUY" if rules.allow_long else "SELL"
-    trend = "BULLISH" if direction == "BUY" else "BEARISH"
-
+def test_missing_adx_is_blocked():
     result = evaluate_active_entry(
-        _decision(
-            regime=regime,
-            direction=direction,
-            trend=SimpleNamespace(trend=trend),
-        ),
+        _decision(quality_filter=SimpleNamespace(adx=None)),
         symbol="XAUUSD",
         timeframe="5m",
     )
+    assert result.allowed is False
+    assert "ADX" in result.reason
 
-    assert result.allowed is True, result.reason
 
-
-def test_structural_price_action_reversal_is_allowed_against_trend():
+def test_standalone_price_action_is_blocked():
     result = evaluate_active_entry(
         _decision(
-            direction="BUY",
-            trend=SimpleNamespace(trend="BEARISH"),
-            pa=SimpleNamespace(
-                pa_signal="BUY",
-                valid_bull_breakout=True,
-            ),
             entry_filter=SimpleNamespace(
                 trend=False,
                 price_action=True,
@@ -92,49 +87,39 @@ def test_structural_price_action_reversal_is_allowed_against_trend():
         symbol="XAUUSD",
         timeframe="5m",
     )
+    assert result.allowed is False
+    assert "Trend and Price Action" in result.reason
 
-    assert result.allowed is True
 
-
-def test_countertrend_buy_from_candle_pattern_requires_structural_confirmation():
+def test_standalone_trend_is_blocked():
     result = evaluate_active_entry(
         _decision(
-            direction="BUY",
-            trend=SimpleNamespace(trend="BEARISH"),
-            pa=SimpleNamespace(
-                pa_signal="BUY",
-                valid_bull_breakout=False,
-                bullish_inside_breakout=False,
-                bullish_pullback=False,
-            ),
             entry_filter=SimpleNamespace(
-                trend=False,
-                price_action=True,
+                trend=True,
+                price_action=False,
                 smc=False,
                 wyckoff=False,
-            ),
+            )
         ),
         symbol="XAUUSD",
         timeframe="5m",
     )
-
     assert result.allowed is False
-    assert "standalone Price Action requires a closed breakout" in result.reason
 
 
-def test_countertrend_sell_from_candle_pattern_requires_structural_confirmation():
+def test_counter_trend_is_blocked():
     result = evaluate_active_entry(
         _decision(
             direction="SELL",
             trend=SimpleNamespace(trend="BULLISH"),
             pa=SimpleNamespace(
                 pa_signal="SELL",
-                valid_bear_breakout=False,
+                valid_bear_breakout=True,
                 bearish_inside_breakout=False,
                 bearish_pullback=False,
             ),
             entry_filter=SimpleNamespace(
-                trend=False,
+                trend=True,
                 price_action=True,
                 smc=False,
                 wyckoff=False,
@@ -143,141 +128,62 @@ def test_countertrend_sell_from_candle_pattern_requires_structural_confirmation(
         symbol="XAUUSD",
         timeframe="5m",
     )
-
     assert result.allowed is False
-    assert "standalone Price Action requires a closed breakout" in result.reason
 
 
-def test_standalone_price_action_requires_structure_even_when_trend_is_neutral():
+def test_strong_trend_guard_still_blocks_missing_structural_confirmation():
+    decision = _decision(
+        quality_filter=SimpleNamespace(adx=45.0),
+        trend=SimpleNamespace(trend="NEUTRAL"),
+        pa=SimpleNamespace(
+            pa_signal="BUY",
+            valid_bull_breakout=False,
+            bullish_inside_breakout=False,
+            bullish_pullback=False,
+        ),
+    )
+    reason = strong_trend_validation_reason(decision)
+    assert reason is not None
+    assert "final validation blocked" in reason
+
+
+def test_non_five_minute_execution_is_blocked():
     result = evaluate_active_entry(
-        _decision(
-            trend=SimpleNamespace(trend="NEUTRAL"),
-            pa=SimpleNamespace(
-                pa_signal="BUY",
-                valid_bull_breakout=False,
-                bullish_inside_breakout=False,
-                bullish_pullback=False,
-            ),
-            entry_filter=SimpleNamespace(
-                trend=False,
-                price_action=True,
-                smc=False,
-                wyckoff=False,
-            ),
-        ),
-        symbol="XAUUSD",
-        timeframe="5m",
+        _decision(), symbol="XAUUSD", timeframe="1m"
     )
-
     assert result.allowed is False
-    assert "standalone Price Action requires a closed breakout" in result.reason
 
 
-@pytest.mark.parametrize(
-    ("direction", "trend", "signal", "breakout_flag"),
-    [
-        ("BUY", "BEARISH", "BUY", "valid_bull_breakout"),
-        ("SELL", "BULLISH", "SELL", "valid_bear_breakout"),
-    ],
-)
-def test_closed_price_action_breakout_can_authorize_a_countertrend_reversal(
-    direction,
-    trend,
-    signal,
-    breakout_flag,
-):
-    pa_values = {
-        "pa_signal": signal,
-        "valid_bull_breakout": False,
-        "valid_bear_breakout": False,
-        "bullish_inside_breakout": False,
-        "bearish_inside_breakout": False,
-        "bullish_pullback": False,
-        "bearish_pullback": False,
+def test_only_supported_scalp_regimes_can_pass():
+    supported = {
+        "STRONG_TREND_BULL",
+        "STRONG_TREND_BEAR",
+        "WEAK_TREND_BULL",
+        "WEAK_TREND_BEAR",
+        "PULLBACK_BULL",
+        "PULLBACK_BEAR",
     }
-    pa_values[breakout_flag] = True
-    result = evaluate_active_entry(
-        _decision(
-            direction=direction,
-            trend=SimpleNamespace(trend=trend),
-            pa=SimpleNamespace(**pa_values),
-            entry_filter=SimpleNamespace(
-                trend=False,
-                price_action=True,
-                smc=False,
-                wyckoff=False,
-            ),
-        ),
-        symbol="XAUUSD",
-        timeframe="5m",
-    )
-
-    assert result.allowed is True
-
-
-def test_smc_and_wyckoff_cannot_authorize_entries_independently():
-    for engine in ("smc", "wyckoff"):
+    for regime in sorted(REGIME_RULES):
+        pa_direction = "BUY" if regime.endswith("BULL") else "SELL"
+        pa_fields = {
+            "pa_signal": pa_direction,
+            "valid_bull_breakout": pa_direction == "BUY",
+            "valid_bear_breakout": pa_direction == "SELL",
+            "bullish_inside_breakout": False,
+            "bearish_inside_breakout": False,
+            "bullish_pullout": False,
+            "bullish_pullback": False,
+            "bearish_pullback": False,
+        }
+        trend_direction = "BULLISH" if pa_direction == "BUY" else "BEARISH"
         result = evaluate_active_entry(
             _decision(
-                regime="RANGE",
-                entry_filter=SimpleNamespace(
-                    trend=False,
-                    price_action=False,
-                    smc=engine == "smc",
-                    wyckoff=engine == "wyckoff",
-                )
+                regime=regime,
+                direction=pa_direction,
+                trend=SimpleNamespace(trend=trend_direction),
+                pa=SimpleNamespace(**pa_fields),
             ),
             symbol="XAUUSD",
             timeframe="5m",
         )
-
-        assert result.allowed is False
-        assert "Trend or Price Action confirmation" in result.reason
-
-
-def test_counter_trend_entries_are_blocked():
-    result = evaluate_active_entry(
-        _decision(
-            direction="SELL",
-            trend=SimpleNamespace(trend="BULLISH"),
-        ),
-        symbol="XAUUSD",
-        timeframe="5m",
-    )
-
-    assert result.allowed is False
-    assert "counter-trend" in result.reason
-
-
-def test_trend_confirmation_does_not_require_a_price_action_breakout():
-    result = evaluate_active_entry(
-        _decision(
-            pa=SimpleNamespace(
-                valid_bull_breakout=False,
-                valid_bear_breakout=False,
-                bullish_inside_breakout=False,
-                bearish_inside_breakout=False,
-            ),
-            entry_filter=SimpleNamespace(
-                trend=True,
-                price_action=False,
-                smc=False,
-                wyckoff=False,
-            ),
-        ),
-        symbol="XAUUSD",
-        timeframe="5m",
-    )
-
-    assert result.allowed is True
-
-
-def test_non_five_minute_execution_is_blocked_without_changing_config():
-    result = evaluate_active_entry(
-        _decision(),
-        symbol="XAUUSD",
-        timeframe="1m",
-    )
-
-    assert result.allowed is False
-    assert "execution timeframe must remain 5m" in result.reason
+        assert result.allowed is (regime in supported), (regime, result.reason)

@@ -1,0 +1,7 @@
+# INTENTIONAL NON-RUNTIME PLACEHOLDER
+#
+# Strategy constants must be implemented through live_trading/config.py and
+# render.yaml, not by importing this orphan file.  It remains only to prevent
+# accidental test discovery of partial configuration snippets.
+
+ENTRY_CONFIRMATION_FLOOR = 2
