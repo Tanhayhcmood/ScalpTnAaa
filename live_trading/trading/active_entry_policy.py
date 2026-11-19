@@ -1,13 +1,9 @@
 """
-Authoritative live-entry policy for XAUUSD M5 directional scalp entries.
+Authoritative live-entry policy for XAUUSD M1 directional scalp entries.
 
-A live order requires:
-- XAUUSD and M5 execution;
-- a directional trend regime (not RANGE/choppy/low volatility);
-- aligned Trend and structural Price Action confirmation;
-- ADX and data quality strong enough for a directional M5 trade.
-
-Diagnostic engines (SMC/Wyckoff) remain excluded from authorization.
+A live order requires XAUUSD and M1 execution, a directional trend regime,
+aligned Trend and structural Price Action confirmation, and usable ADX data.
+SMC/Wyckoff remain diagnostic-only.
 """
 
 from dataclasses import dataclass
@@ -19,9 +15,9 @@ from live_trading.signals.market_regime import (
 from live_trading.utils import canonical_symbol
 
 
-ACTIVE_ENTRY_STRATEGY = "XAUUSD_M5_TREND_PA_SCALP"
+ACTIVE_ENTRY_STRATEGY = "XAUUSD_M1_TREND_PA_SCALP"
 ACTIVE_ENTRY_SYMBOL = "XAUUSD"
-ACTIVE_ENTRY_TIMEFRAME = "5m"
+ACTIVE_ENTRY_TIMEFRAME = "1m"
 MINIMUM_DIRECTIONAL_ADX = 18.0
 
 _ALLOWED_SCALP_REGIMES = frozenset({

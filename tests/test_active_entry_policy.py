@@ -1,10 +1,9 @@
 from types import SimpleNamespace
 
-import pytest
-
 from live_trading.signals.market_regime import REGIME_RULES
 from live_trading.trading.active_entry_policy import (
     ACTIVE_ENTRY_STRATEGY,
+    ACTIVE_ENTRY_TIMEFRAME,
     MINIMUM_DIRECTIONAL_ADX,
     evaluate_active_entry,
     strong_trend_validation_reason,
@@ -38,17 +37,26 @@ def _decision(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_only_aligned_trend_pa_breakout_can_pass():
+def test_active_entry_policy_is_m1():
+    assert ACTIVE_ENTRY_TIMEFRAME == "1m"
     result = evaluate_active_entry(
-        _decision(), symbol="XAUUSD", timeframe="5m"
+        _decision(), symbol="XAUUSD", timeframe="1m"
     )
     assert result.allowed is True
     assert result.strategy == ACTIVE_ENTRY_STRATEGY
 
 
+def test_old_m5_execution_is_blocked():
+    result = evaluate_active_entry(
+        _decision(), symbol="XAUUSD", timeframe="5m"
+    )
+    assert result.allowed is False
+    assert "execution timeframe must remain 1m" in result.reason
+
+
 def test_range_entries_are_blocked():
     result = evaluate_active_entry(
-        _decision(regime="RANGE"), symbol="XAUUSD", timeframe="5m"
+        _decision(regime="RANGE"), symbol="XAUUSD", timeframe="1m"
     )
     assert result.allowed is False
     assert "not a directional XAUUSD scalp setup" in result.reason
@@ -58,7 +66,7 @@ def test_low_adx_entry_is_blocked():
     result = evaluate_active_entry(
         _decision(quality_filter=SimpleNamespace(adx=MINIMUM_DIRECTIONAL_ADX - 1)),
         symbol="XAUUSD",
-        timeframe="5m",
+        timeframe="1m",
     )
     assert result.allowed is False
     assert "ADX" in result.reason
@@ -68,7 +76,7 @@ def test_missing_adx_is_blocked():
     result = evaluate_active_entry(
         _decision(quality_filter=SimpleNamespace(adx=None)),
         symbol="XAUUSD",
-        timeframe="5m",
+        timeframe="1m",
     )
     assert result.allowed is False
     assert "ADX" in result.reason
@@ -85,7 +93,7 @@ def test_standalone_price_action_is_blocked():
             )
         ),
         symbol="XAUUSD",
-        timeframe="5m",
+        timeframe="1m",
     )
     assert result.allowed is False
     assert "Trend and Price Action" in result.reason
@@ -102,7 +110,7 @@ def test_standalone_trend_is_blocked():
             )
         ),
         symbol="XAUUSD",
-        timeframe="5m",
+        timeframe="1m",
     )
     assert result.allowed is False
 
@@ -126,7 +134,7 @@ def test_counter_trend_is_blocked():
             ),
         ),
         symbol="XAUUSD",
-        timeframe="5m",
+        timeframe="1m",
     )
     assert result.allowed is False
 
@@ -147,13 +155,6 @@ def test_strong_trend_guard_still_blocks_missing_structural_confirmation():
     assert "final validation blocked" in reason
 
 
-def test_non_five_minute_execution_is_blocked():
-    result = evaluate_active_entry(
-        _decision(), symbol="XAUUSD", timeframe="1m"
-    )
-    assert result.allowed is False
-
-
 def test_only_supported_scalp_regimes_can_pass():
     supported = {
         "STRONG_TREND_BULL",
@@ -171,7 +172,6 @@ def test_only_supported_scalp_regimes_can_pass():
             "valid_bear_breakout": pa_direction == "SELL",
             "bullish_inside_breakout": False,
             "bearish_inside_breakout": False,
-            "bullish_pullout": False,
             "bullish_pullback": False,
             "bearish_pullback": False,
         }
@@ -184,6 +184,6 @@ def test_only_supported_scalp_regimes_can_pass():
                 pa=SimpleNamespace(**pa_fields),
             ),
             symbol="XAUUSD",
-            timeframe="5m",
+            timeframe="1m",
         )
         assert result.allowed is (regime in supported), (regime, result.reason)

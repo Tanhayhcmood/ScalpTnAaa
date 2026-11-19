@@ -10,7 +10,7 @@ services:
     region: singapore
     ipAllowList: []   # private — Render internal routing only; no public access
 
-  # ─── Trading robot ─────────────────────────────────────────────────────────
+  # ─── Trading robot ────────────────────────────────────────────────────────
   - type: web
     name: goldscalper-v4-robot-sg
     region: singapore
@@ -21,10 +21,6 @@ services:
     buildCommand: pip install -r live_trading/requirements.txt
     startCommand: python live_trading/server.py
     envVars:
-      # Render supplies RENDER_EXTERNAL_URL/RENDER_EXTERNAL_HOSTNAME for the
-      # current service. Do not hard-code a generated hostname here: when the
-      # service is renamed, a stale value makes the free-tier keepalive ping a
-      # different service and the robot can be suspended for inactivity.
       - key: MTAPI_URL
         value: "https://mt5.mtapi.io"
       - key: MT5_HOST
@@ -35,24 +31,20 @@ services:
         sync: false
       - key: MT5_PASSWORD
         sync: false
-      # FIX: broker reports gold as "XAUUSD", not "XAUUSDb" — the wrong
-      # symbol caused every candle/order request to fail silently, which was
-      # the real reason the robot never opened a trade.
       - key: SYMBOL
         value: XAUUSD
-      # FIX: TIMEFRAME and CANDLE_WINDOW are now env-configurable (fix #4).
+      # M1 is the entry/execution timeframe. Protective stop ATR remains on M15
+      # so one-minute noise does not make the initial stop artificially tight.
       - key: TIMEFRAME
-        value: "5m"
+        value: "1m"
+      - key: TRADE_TIMEFRAMES
+        value: "1m"
       - key: CANDLE_WINDOW
         value: "300"
-      # SL and TP distances use stable M15 protective ATR while entries run on M5.
       - key: SL_ATR_TIMEFRAME
         value: "M15"
       - key: SL_ATR_PERIOD
         value: "14"
-      # Signal freshness limits in signal-timeframe ATRs. Strong trends and
-      # HIGH_VOLATILITY use the strong-trend allowance; unlisted regimes keep
-      # the tight range limit.
       - key: ENTRY_SIGNAL_ATR_PERIOD
         value: "14"
       - key: STALENESS_LIMIT_STRONG_TREND
@@ -61,28 +53,20 @@ services:
         value: "1.0"
       - key: STALENESS_LIMIT_RANGE
         value: "0.75"
-      # Extra room required beyond the next equal high/low before a fixed-R
-      # target is considered reachable.
       - key: TARGET_ROOM_BUFFER_ATR
         value: "0.15"
-      # Option 2: keep the balanced 35% HTF confidence floor reproducible from the live Render environment.
       - key: OPTION_TWO_MIN_CONFIDENCE
         value: "25"
-      # Option 4: old BOS/CHoCH events cannot authorize live entries.
       - key: STRUCTURE_MAX_AGE_BARS
         value: "24"
       - key: RISK_PERCENT
         value: "1.0"
-      # Combined loss-to-SL exposure across all open positions, including the
-      # proposed order. Separate from the per-trade RISK_PERCENT sizing target.
       - key: MAX_TOTAL_RISK_PERCENT
         value: "2.0"
-      # The base policy floor is one; standalone checks still gate single-vote entries.
       - key: MIN_CONFIRMATIONS
         value: "1"
       - key: TREND_MIN_CONFIRMATIONS
         value: "1"
-      # Default SL is 2x protective ATR (bounded 1.5–3.5); low volatility adds 0.5x.
       - key: SL_ATR_BASE_MULTIPLIER
         value: "2.0"
       - key: LOW_VOLATILITY_SL_ATR_ADD
@@ -91,13 +75,8 @@ services:
         value: "1.5"
       - key: TP_MAX_ATR
         value: "4.0"
-      # Only Trend and Price Action can authorize live entries. SMC and
-      # Wyckoff remain available for diagnostics but cannot open trades.
       - key: ENABLED_STRATEGIES
         value: "trend,price_action"
-      # Dedicated RANGE playbook. The standalone PA path may authorize
-      # one PA vote, but all RANGE structural, confidence, R:R, and risk gates
-      # remain active.
       - key: RANGE_TRADING_ENABLED
         value: "true"
       - key: RANGE_MIN_CONFIRMATIONS
@@ -108,17 +87,12 @@ services:
         value: "0.25"
       - key: RANGE_RISK_PERCENT
         value: "0.25"
-      # RANGE protection: BUY entries must be at support and SELL entries must
-      # be at resistance, with a fresh same-direction sweep, a closed-candle
-      # reversal, and at least two aligned strategy confirmations.
       - key: RANGE_ENTRY_FILTERS_ENABLED
         value: "true"
-      # A clear directional Price Action signal may authorize an entry by itself.
       - key: PRICE_ACTION_STANDALONE
         value: "true"
       - key: PA_STANDALONE_MIN_SCORE
         value: "0.16"
-      # Trend-only entries require a strong, direction-aligned Trend score.
       - key: TREND_STANDALONE
         value: "true"
       - key: TREND_STANDALONE_MIN_SCORE
@@ -135,20 +109,12 @@ services:
         value: "0.5"
       - key: MAX_TRADE_MINUTES
         value: "240"
-      # Directional scalping is one-way by default. Opposite positions are
-      # blocked even when they would occupy different strategy slots.
       - key: ALLOW_HEDGED_POSITIONS
         value: "false"
-      # Bounded scale-in is allowed for current XVTB-tagged positions up to
-      # MAX_OPEN_TRADES. Legacy or untagged positions still fail closed.
-      # Price Action may authorize the strategy vote alone. All independent
-      # confidence, quality, regime, MTF, and risk gates stay active.
       - key: REQUIRE_PRICE_ACTION
         value: "false"
       - key: REQUIRE_SMC_PRICE_ACTION_WYCKOFF
         value: "false"
-      # Keep regime confidence requirements independent from the lowered hard
-      # floor; standalone paths still pass quality, R:R, and risk gates.
       - key: NORMAL_MIN_CONFIDENCE
         value: "40"
       - key: RANGE_MIN_CONFIDENCE
@@ -161,31 +127,20 @@ services:
         value: "8.0"
       - key: SLIPPAGE_POINTS
         value: "30"
-      # Trailing: buffered breakeven at 1R, lock +0.5R at 1.5R, then
-      # a 1.5x protective-timeframe ATR chandelier from the best price at 2R.
       - key: TRAIL_CHANDELIER_ATR_MULTIPLIER
         value: "1.5"
-      # Weak RANGE entries require a stronger strategy consensus.
       - key: RANGE_WEAK_MIN_CONFIRMATIONS
         value: "2"
-      # Use M5 as the sole live entry timeframe for scalping. The protective
-      # SL remains based on M15 volatility above.
-      - key: TRADE_TIMEFRAMES
-        value: "5m"
       - key: QUALITY_ADX_MIN
         value: "12"
       - key: BAR_CHECK_INTERVAL
-        value: "10"
-      # Historical candle calls are bounded and retried locally. They must not
-      # tear down a healthy MetaAPI session when the data endpoint has a brief
-      # timeout around a bar close.
+        value: "5"
       - key: HISTORICAL_RPC_CONCURRENCY
         value: "2"
       - key: HISTORICAL_RETRY_ATTEMPTS
         value: "2"
       - key: HISTORICAL_RETRY_BACKOFF
         value: "1.0"
-      # MTF is disabled so HTF alignment/opposition cannot block live entries.
       - key: MTF_ENABLED
         value: "false"
       - key: MTF_TIMEFRAME
@@ -215,7 +170,6 @@ services:
           type: redis
           name: ger-redis
           property: connectionString
-      # FIX #1: ROBOT_COMMAND_TOKEN enables HTTP command fallback from panel.
       - key: ROBOT_COMMAND_TOKEN
         sync: false
 
@@ -248,7 +202,6 @@ services:
         value: "redis"
       - key: ROBOT_STATE_PATH
         value: "/tmp/robot_state.json"
-      # FIX #1: ROBOT_BASE_URL and ROBOT_COMMAND_TOKEN enable HTTP fallback.
       - key: ROBOT_BASE_URL
         value: "https://goldscalper-v4-robot-sg.onrender.com"
       - key: ROBOT_COMMAND_TOKEN
